@@ -47,3 +47,36 @@ Filled backend and frontend Trellis guidelines from the ESP-IDF/LVGL project str
 
 - Review the spec docs, commit the documentation changes, then archive the
   bootstrap task when ready.
+
+
+## Session 2: Verify ESP-IDF build conflict
+
+**Date**: 2026-06-18
+**Task**: Verify ESP-IDF build conflict
+**Branch**: `main`
+
+### Summary
+
+Verified ESP-IDF reconfigure/build with Wi-Fi Remote enabled and archived the build-conflict task.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `56d1e48` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
