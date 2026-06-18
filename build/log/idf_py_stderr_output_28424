@@ -1,0 +1,4 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Users\seven\.espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=1 F:\ESP32\esp32p4-demo\esp-dev-kits-a88faa6\examples\esp32-p4-function-ev-board\examples\esp_brookesia_phone
+info: INFO: Symbol BSP_I2S_NUM defined in multiple locations (see below). Please check if this is a correct behavior or a random name match:
+    F:\ESP32\esp32p4-demo\esp-dev-kits-a88faa6\examples\esp32-p4-function-ev-board\examples\esp_brookesia_phone\managed_components\espressif__esp32_p4_function_ev_board_noglib\Kconfig:30
+    F:\ESP32\esp32p4-demo\esp-dev-kits-a88faa6\examples\esp32-p4-function-ev-board\examples\common_components\bsp_extra\Kconfig:2

@@ -36341,7 +36341,10 @@
                                 "help": "This config is used for setting Trs parameter. Trs means CS Latency Between Resume And Next Suspend.\nYou can refer to the chapter of AC CHARACTERISTICS of flash datasheet.\nFor high-performance scenarios, some flash chips allow this set value to be smaller than the\ngiven value in the datasheet without causing errors in the flash state machine.\nWhen you have any related needs, please contact espressif business team.",
                                 "id": "SPI_FLASH_SUSPEND_TRS_VAL_US",
                                 "name": "SPI_FLASH_SUSPEND_TRS_VAL_US",
-                                "range": null,
+                                "range": [
+                                    20,
+                                    200
+                                ],
                                 "title": "SPI flash tRS value (refer to chapter AC CHARACTERISTICS)",
                                 "type": "int"
                             },

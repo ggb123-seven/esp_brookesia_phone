@@ -7,6 +7,10 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4"
   },
+  "cmake.configureOnOpen": false,
+  "cmake.configureOnEdit": false,
+  "cmake.generator": "Ninja",
+  "C_Cpp.intelliSenseEngine": "disabled",
   "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
