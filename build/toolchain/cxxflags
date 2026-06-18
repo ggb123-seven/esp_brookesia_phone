@@ -1,0 +1,4 @@
+-Wno-deprecated-enum-enum-conversion
+-mabi=ilp32f
+-march=rv32imafc_zicsr_zifencei_xesppie
+-fno-rtti

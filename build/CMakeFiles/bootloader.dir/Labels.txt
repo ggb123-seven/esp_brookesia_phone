@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/CMakeFiles/bootloader
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/CMakeFiles/bootloader.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/CMakeFiles/bootloader-complete.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+F:/ESP32/esp32p4-demo/esp-dev-kits-a88faa6/examples/esp32-p4-function-ev-board/examples/esp_brookesia_phone/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

@@ -1,0 +1,18 @@
+{
+  "idf.currentSetup": "F:\\ESP32\\ESP-IDF-v5..5.4\\v5.5.4\\esp-idf",
+  "idf.portWin": "COM3",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=f:\\ESP32\\esp32p4-demo\\esp-dev-kits-a88faa6\\examples\\esp32-p4-function-ev-board\\examples\\esp_brookesia_phone\\build"
+  ],
+  "idf.flashType": "JTAG",
+  "idf.monitorPort": "COM3"
+}
