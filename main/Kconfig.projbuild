@@ -4,4 +4,18 @@ menu "Example Configurations"
         default n
         help 
             Enabling this option will initialize the SD card, so the SD card needs to be inserted into the slot. Additionally, if using the Video Player example, an MJPEG format video must be saved on the SD card.
+
+    config EXAMPLE_ENABLE_APP_CALCULATOR
+        bool "Enable Calculator App"
+        default n
+        help
+            Enabling this option will compile and install the Calculator app.
+            Keep it disabled to reduce the factory app partition usage.
+
+    config EXAMPLE_ENABLE_APP_GAME_2048
+        bool "Enable 2048 Game App"
+        default n
+        help
+            Enabling this option will compile and install the 2048 game app.
+            Keep it disabled to reduce the factory app partition usage.
 endmenu

@@ -86,9 +86,11 @@ extern "C" void app_main(void)
     assert(smart_gadget != nullptr && "Failed to create phone app squareline");
     assert((phone->installApp(smart_gadget) >= 0) && "Failed to install phone app squareline");
 
+#if CONFIG_EXAMPLE_ENABLE_APP_CALCULATOR
     Calculator *calculator = new Calculator();
     assert(calculator != nullptr && "Failed to create calculator");
     assert((phone->installApp(calculator) >= 0) && "Failed to begin calculator");
+#endif
 
     MusicPlayer *music_player = new MusicPlayer();
     assert(music_player != nullptr && "Failed to create music_player");
@@ -98,9 +100,11 @@ extern "C" void app_main(void)
     assert(app_settings != nullptr && "Failed to create app_settings");
     assert((phone->installApp(app_settings) >= 0) && "Failed to begin app_settings");
 
+#if CONFIG_EXAMPLE_ENABLE_APP_GAME_2048
     Game2048 *game_2048 = new Game2048();
     assert(game_2048 != nullptr && "Failed to create game_2048");
     assert((phone->installApp(game_2048) >= 0) && "Failed to begin game_2048");
+#endif
 
     Camera *camera = new Camera(1280, 720);
     assert(camera != nullptr && "Failed to create camera");
