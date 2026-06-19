@@ -59,12 +59,24 @@ menuconfig > Component config > Board Support Package
 
 若要体验视频播放功能，请将 MJPEG 格式的视频保存在 SD 卡上，并将 SD 卡插入 SD 卡槽。**目前仅支持 MJPEG 格式的视频**。视频格式转换方法如下：
 
-* 安装 ffmpeg.
+* 安装 ffmpeg。
+
+  Windows PowerShell:
+```
+    winget install Gyan.FFmpeg
+```
+  安装完成后请重新打开 PowerShell，再运行以下命令确认 ffmpeg 可用：
+```
+    ffmpeg -version
+```
+  如果提示无法识别 `ffmpeg` 命令，请将 ffmpeg 安装目录下的 `bin` 目录添加到系统 `PATH`。
+
+  Ubuntu/Linux:
 ```
     sudo apt update
     sudo apt install ffmpeg
 ```
-* 使用 ffmpeg 转换视频.
+* 使用 ffmpeg 转换视频。
 ```
    ffmpeg -i YOUR_INPUT_FILE_NAME.mp4 -vcodec mjpeg -q:v 2 -vf "scale=1024:600" -acodec copy YOUR_OUTPUT_FILE_NAME.mjpeg
 ```
