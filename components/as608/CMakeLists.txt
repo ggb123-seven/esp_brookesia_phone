@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "as608_port.c"
+        "as608_service.c"
+        "vendor/driver_as608.c"
+        "vendor/driver_as608_basic.c"
+    INCLUDE_DIRS
+        "include"
+        "vendor"
+    REQUIRES
+        esp_driver_uart
+)
