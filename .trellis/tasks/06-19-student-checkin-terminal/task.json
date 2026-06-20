@@ -1,0 +1,29 @@
+{
+  "id": "student-checkin-terminal",
+  "name": "student-checkin-terminal",
+  "title": "学生到校打卡终端",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "ZQYuan",
+  "assignee": "ZQYuan",
+  "createdAt": "2026-06-19",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "06-19-as608-hardware-validation",
+    "06-20-student-fingerprint-template-binding"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
