@@ -220,3 +220,36 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 规划学生指纹模板绑定接口
+
+**Date**: 2026-06-20
+**Task**: 规划学生指纹模板绑定接口
+**Branch**: `main`
+
+### Summary
+
+记录大学生打卡系统下一步规划：在 AGENTS.md 补充中文字体显示维护规则；创建学生指纹模板库绑定接口子任务，并在 PRD 中明确学生姓名、班级、学号与 AS608 模板 ID 的本地绑定关系，以及第一版通过 SPIFFS/SD 卡 JSON 或 CSV 导入学生名单。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `96aacfc` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
