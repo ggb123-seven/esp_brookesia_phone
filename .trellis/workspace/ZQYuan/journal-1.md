@@ -156,3 +156,67 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - Commit `README_CN.md` and this journal update when ready.
+
+
+## Session 3: AS608 最小移植与后续硬件验证规划
+
+**Date**: 2026-06-19
+**Task**: AS608 最小移植与后续硬件验证规划
+**Branch**: `main`
+
+### Summary
+
+完成 AS608 最小驱动组件移植：新增 components/as608，封装 UART 适配和 as608_service 录入、识别、对比 API；保留 docs/as608_research 资料；idf.py build 通过。补充 AGENTS.md 规则，默认忽略 build 生成物并清理临时文件。更新 backend 规范记录硬件驱动组件边界。创建后续子任务 06-19-as608-hardware-validation，用于真实 AS608 硬件录入、识别、未匹配和无手指路径验证。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 4: 修复 Fingerprint App 中文字体显示
+
+**Date**: 2026-06-20
+**Task**: 修复 Fingerprint App 中文字体显示
+**Branch**: `main`
+
+### Summary
+
+修复 Fingerprint App 中文乱码和缺字问题：新增本地 NotoSansSC LVGL 字体子集，将 app UI 和 Brookesia launcher stylesheet 切换到 fingerprint_font_20，并通过 idf.py build 与字体覆盖检查验证。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cbc4307` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

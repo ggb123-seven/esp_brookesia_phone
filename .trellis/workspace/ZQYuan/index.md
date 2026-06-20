@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 2
-- **Last Active**: 2026-06-18
+- **Total Sessions**: 4
+- **Last Active**: 2026-06-20
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~82 | Active |
+| `journal-1.md` | ~222 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,8 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-06-20 | 修复 Fingerprint App 中文字体显示 | `cbc4307` | `main` |
+| 3 | 2026-06-19 | AS608 最小移植与后续硬件验证规划 | - | `main` |
 | 2 | 2026-06-18 | Verify ESP-IDF build conflict | `56d1e48` | `main` |
 | 1 | 2026-06-18 | Bootstrap project guidelines | - | `main` |
 <!-- @@@/auto:session-history -->
