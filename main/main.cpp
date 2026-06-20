@@ -25,12 +25,30 @@
 #endif
 
 #include "esp_brookesia.hpp"
-#include "app_examples/phone/squareline/src/phone_app_squareline.hpp"
 #include "apps.h"
 
 static const char *TAG = "main";
 
 static esp_ldo_channel_handle_t sd_ldo_handle = NULL;
+
+#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+LV_FONT_DECLARE(fingerprint_font_20);
+
+static void use_fingerprint_launcher_font(ESP_Brookesia_PhoneStylesheet_t *stylesheet)
+{
+    if (stylesheet == NULL) {
+        return;
+    }
+
+    ESP_Brookesia_StyleFont_t *fonts = stylesheet->core.home.text.default_fonts;
+    for (int i = 0; i < stylesheet->core.home.text.default_fonts_num; ++i) {
+        if (fonts[i].size_px == 22) {
+            fonts[i].font_resource = &fingerprint_font_20;
+            return;
+        }
+    }
+}
+#endif
 
 static esp_err_t init_sd_ldo_only(void)
 {
@@ -88,19 +106,24 @@ extern "C" void app_main(void)
 
     ESP_Brookesia_PhoneStylesheet_t *phone_stylesheet = new ESP_Brookesia_PhoneStylesheet_t ESP_BROOKESIA_PHONE_1024_600_DARK_STYLESHEET();
     ESP_BROOKESIA_CHECK_NULL_EXIT(phone_stylesheet, "Create phone stylesheet failed");
+#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+    use_fingerprint_launcher_font(phone_stylesheet);
+#endif
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->addStylesheet(*phone_stylesheet), "Add phone stylesheet failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->activateStylesheet(*phone_stylesheet), "Activate phone stylesheet failed");
 
     assert(phone->begin() && "Failed to begin phone");
 
-    PhoneAppSquareline *smart_gadget = new PhoneAppSquareline();
-    assert(smart_gadget != nullptr && "Failed to create phone app squareline");
-    assert((phone->installApp(smart_gadget) >= 0) && "Failed to install phone app squareline");
-
 #if CONFIG_EXAMPLE_ENABLE_APP_CALCULATOR
     Calculator *calculator = new Calculator();
     assert(calculator != nullptr && "Failed to create calculator");
     assert((phone->installApp(calculator) >= 0) && "Failed to begin calculator");
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+    FingerprintApp *fingerprint = new FingerprintApp();
+    assert(fingerprint != nullptr && "Failed to create fingerprint app");
+    assert((phone->installApp(fingerprint) >= 0) && "Failed to begin fingerprint app");
 #endif
 
     MusicPlayer *music_player = new MusicPlayer();

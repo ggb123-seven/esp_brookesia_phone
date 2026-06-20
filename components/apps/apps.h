@@ -14,5 +14,9 @@
 #include "calculator/Calculator.hpp"
 #endif
 
+#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+#include "fingerprint/FingerprintApp.hpp"
+#endif
+
 #include "camera/Camera.hpp"
 #include "video_player/VideoPlayer.hpp"

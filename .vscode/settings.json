@@ -6,6 +6,8 @@
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4",
+    "IDF_TOOLS_PATH": "C:\\Users\\seven\\.espressif\\tools",
+    "OPENOCD_SCRIPTS": "C:\\Users\\seven\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts",
     "OPENOCD_USB_ADAPTER_LOCATION": "4-1"
   },
   "cmake.configureOnOpen": false,

@@ -19,14 +19,23 @@ menu "Example Configurations"
             Enabling this option will compile and install the 2048 game app.
             Keep it disabled to reduce the factory app partition usage.
 
+    config EXAMPLE_ENABLE_APP_FINGERPRINT
+        bool "Enable Fingerprint App"
+        default y
+        help
+            Enabling this option will compile and install the AS608 fingerprint app.
+            Disable it before enabling the temporary AS608 validation task.
+
     config EXAMPLE_ENABLE_AS608_VALIDATION
         bool "Enable AS608 hardware validation task"
+        depends on !EXAMPLE_ENABLE_APP_FINGERPRINT
         default n
         help
             Enabling this option starts a serial-log AS608 validation task at boot.
             Keep it disabled outside temporary fingerprint hardware validation.
+            Disable the Fingerprint app first because both paths use the same AS608 service.
 
-    if EXAMPLE_ENABLE_AS608_VALIDATION
+    if EXAMPLE_ENABLE_AS608_VALIDATION || EXAMPLE_ENABLE_APP_FINGERPRINT
         config EXAMPLE_AS608_UART_NUM
             int "AS608 UART port"
             range 1 4
@@ -63,7 +72,9 @@ menu "Example Configurations"
             default 300
             help
                 Per-read UART timeout used by the AS608 port adapter.
+    endif
 
+    if EXAMPLE_ENABLE_AS608_VALIDATION
         config EXAMPLE_AS608_VALIDATION_START_DELAY_MS
             int "AS608 validation start delay in milliseconds"
             default 5000

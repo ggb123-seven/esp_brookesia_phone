@@ -11,6 +11,30 @@ idf_component_register(
     INCLUDE_DIRS .
     REQUIRES ${MAIN_REQUIRES})
 
+idf_build_get_property(build_components BUILD_COMPONENTS)
+foreach(COMPONENT ${build_components})
+    if(COMPONENT MATCHES "esp-brookesia" OR COMPONENT MATCHES "espressif__esp-brookesia")
+        set(ESP_BROOKESIA_COMPONENT ${COMPONENT})
+        break()
+    endif()
+endforeach()
+
+if(ESP_BROOKESIA_COMPONENT)
+    idf_component_get_property(ESP_BROOKESIA_LIB ${ESP_BROOKESIA_COMPONENT} COMPONENT_LIB)
+    get_target_property(ESP_BROOKESIA_SRCS ${ESP_BROOKESIA_LIB} SOURCES)
+    if(ESP_BROOKESIA_SRCS)
+        # Keep the Brookesia core SquareLine helpers, but drop its unused demo app.
+        set(ESP_BROOKESIA_FILTERED_SRCS "")
+        foreach(SOURCE ${ESP_BROOKESIA_SRCS})
+            file(TO_CMAKE_PATH "${SOURCE}" SOURCE_PATH)
+            if(NOT SOURCE_PATH MATCHES "/src/app_examples/phone/squareline/")
+                list(APPEND ESP_BROOKESIA_FILTERED_SRCS "${SOURCE}")
+            endif()
+        endforeach()
+        set_property(TARGET ${ESP_BROOKESIA_LIB} PROPERTY SOURCES ${ESP_BROOKESIA_FILTERED_SRCS})
+    endif()
+endif()
+
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
 target_compile_options(
     ${LVGL_LIB} 
@@ -20,18 +44,8 @@ target_compile_options(
 )
 
 if(CONFIG_ESP_BROOKESIA_MEMORY_USE_CUSTOM)
-    idf_build_get_property(build_components BUILD_COMPONENTS)
-    foreach(COMPONENT ${build_components})
-        if(COMPONENT MATCHES "esp-brookesia" OR COMPONENT MATCHES "espressif__esp-brookesia")
-            set(TARGET_COMPONENT ${COMPONENT})
-            break()
-        endif()
-    endforeach()
-
-    if(TARGET_COMPONENT STREQUAL "")
+    if(NOT ESP_BROOKESIA_COMPONENT)
         message(FATAL_ERROR "Component 'esp-brookesia' not found.")
-    else()
-        idf_component_get_property(ESP_BROOKESIA_LIB ${TARGET_COMPONENT} COMPONENT_LIB)
     endif()
 
     target_compile_options(
