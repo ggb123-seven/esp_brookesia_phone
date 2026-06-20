@@ -42,6 +42,7 @@ esp_err_t as608_service_enroll(as608_service_enroll_cb_t callback,
 
 esp_err_t as608_service_identify(uint16_t *page_id, uint16_t *score, as608_status_t *status);
 esp_err_t as608_service_match(uint16_t *page_id, uint16_t *score, as608_status_t *status);
+esp_err_t as608_service_delete_template(uint16_t page_id, as608_status_t *status);
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,7 @@ static esp_err_t as608_service_status_to_err(as608_status_t status)
     case AS608_STATUS_OK:
         return ESP_OK;
     case AS608_STATUS_NO_FINGERPRINT:
+    case AS608_STATUS_NOT_MATCH:
     case AS608_STATUS_NOT_FOUND:
         return ESP_ERR_NOT_FOUND;
     case AS608_STATUS_LIB_FULL:
@@ -180,6 +181,22 @@ esp_err_t as608_service_match(uint16_t *page_id, uint16_t *score, as608_status_t
         *status = local_status;
     }
 
+    if (res != 0) {
+        return as608_service_status_to_err(local_status);
+    }
+
+    return as608_service_status_to_err(local_status);
+}
+
+esp_err_t as608_service_delete_template(uint16_t page_id, as608_status_t *status)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "AS608 service is not initialized");
+
+    as608_status_t local_status = AS608_STATUS_UNKNOWN;
+    uint8_t res = as608_basic_delete_fingerprint(page_id, &local_status);
+    if (status != NULL) {
+        *status = local_status;
+    }
     if (res != 0) {
         return as608_service_status_to_err(local_status);
     }

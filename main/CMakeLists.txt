@@ -1,6 +1,15 @@
+set(MAIN_SRCS main.cpp lvgl_adapter_init.c)
+set(MAIN_REQUIRES "")
+
+if(CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION)
+    list(APPEND MAIN_SRCS as608_validation.c)
+    list(APPEND MAIN_REQUIRES as608)
+endif()
+
 idf_component_register(
-    SRCS main.cpp lvgl_adapter_init.c
-    INCLUDE_DIRS .)
+    SRCS ${MAIN_SRCS}
+    INCLUDE_DIRS .
+    REQUIRES ${MAIN_REQUIRES})
 
 idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
 target_compile_options(

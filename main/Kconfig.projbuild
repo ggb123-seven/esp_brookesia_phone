@@ -18,4 +18,68 @@ menu "Example Configurations"
         help
             Enabling this option will compile and install the 2048 game app.
             Keep it disabled to reduce the factory app partition usage.
+
+    config EXAMPLE_ENABLE_AS608_VALIDATION
+        bool "Enable AS608 hardware validation task"
+        default n
+        help
+            Enabling this option starts a serial-log AS608 validation task at boot.
+            Keep it disabled outside temporary fingerprint hardware validation.
+
+    if EXAMPLE_ENABLE_AS608_VALIDATION
+        config EXAMPLE_AS608_UART_NUM
+            int "AS608 UART port"
+            range 1 4
+            default 1
+            help
+                UART0 is reserved for the console; use an available HP UART port for AS608.
+
+        config EXAMPLE_AS608_TX_GPIO
+            int "AS608 UART TX GPIO"
+            default 14
+            help
+                ESP32-P4 GPIO connected to AS608 RX.
+
+        config EXAMPLE_AS608_RX_GPIO
+            int "AS608 UART RX GPIO"
+            default 15
+            help
+                ESP32-P4 GPIO connected to AS608 TX.
+
+        config EXAMPLE_AS608_BAUD_RATE
+            int "AS608 UART baud rate"
+            default 57600
+            help
+                AS608 factory default is commonly 57600 bps.
+
+        config EXAMPLE_AS608_ADDRESS
+            hex "AS608 device address"
+            default 0xFFFFFFFF
+            help
+                AS608 factory default device address.
+
+        config EXAMPLE_AS608_READ_TIMEOUT_MS
+            int "AS608 UART read timeout in milliseconds"
+            default 300
+            help
+                Per-read UART timeout used by the AS608 port adapter.
+
+        config EXAMPLE_AS608_VALIDATION_START_DELAY_MS
+            int "AS608 validation start delay in milliseconds"
+            default 5000
+            help
+                Delay before the validation task starts, allowing boot logs to settle.
+
+        config EXAMPLE_AS608_VALIDATION_STEP_DELAY_MS
+            int "AS608 validation step delay in milliseconds"
+            default 3000
+            help
+                Delay before one-shot identify/match steps, giving the operator time to place or remove a finger.
+
+        config EXAMPLE_AS608_VALIDATION_DELETE_ENROLLED
+            bool "Delete enrolled template after validation"
+            default n
+            help
+                Delete the template page enrolled by this validation run after all checks complete.
+    endif
 endmenu

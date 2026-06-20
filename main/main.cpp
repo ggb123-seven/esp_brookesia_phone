@@ -20,6 +20,10 @@
 #include "lvgl_adapter_init.h"
 #include "esp_ldo_regulator.h"
 
+#if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
+#include "as608_validation.h"
+#endif
+
 #include "esp_brookesia.hpp"
 #include "app_examples/phone/squareline/src/phone_app_squareline.hpp"
 #include "apps.h"
@@ -57,6 +61,13 @@ extern "C" void app_main(void)
 #endif
 
     ESP_ERROR_CHECK(bsp_extra_codec_init());
+
+#if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
+    err = as608_validation_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start AS608 validation task: %s", esp_err_to_name(err));
+    }
+#endif
 
     bsp_display_cfg_t cfg = {
         .hw_cfg = {
