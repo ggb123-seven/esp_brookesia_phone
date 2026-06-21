@@ -211,10 +211,12 @@ uint8_t as608_basic_init(uint32_t addr)
  *             - 1 please put your finger on the sensor again
  *             - 2 generate feature success
  */
-uint8_t as608_basic_input_fingerprint(void (*callback)(int8_t status, const char *const fmt, ...),
-                                      uint16_t *score,
-                                      uint16_t *page_number,
-                                      as608_status_t *status)
+static uint8_t as608_basic_input_fingerprint_impl(void (*callback)(int8_t status, const char *const fmt, ...),
+                                                  uint16_t *score,
+                                                  uint16_t *page_number,
+                                                  as608_status_t *status,
+                                                  uint16_t target_page_number,
+                                                  uint8_t use_target_page_number)
 {
     uint8_t res;
     uint32_t timeout;
@@ -371,22 +373,29 @@ uint8_t as608_basic_input_fingerprint(void (*callback)(int8_t status, const char
         return 1;
     }
 
-    /* get valid template number */
-    res = as608_get_valid_template_number(&gs_handle, gs_addr, page_number, status);
-    if (res != 0)
+    if (use_target_page_number == 0)
     {
-        return 1;
-    }
-    if (*status != AS608_STATUS_OK)
-    {
-        /* run the callback */
-        if (callback != NULL)
+        /* get valid template number */
+        res = as608_get_valid_template_number(&gs_handle, gs_addr, page_number, status);
+        if (res != 0)
         {
-            /* output */
-            callback(-1, "error.\n");
+            return 1;
         }
+        if (*status != AS608_STATUS_OK)
+        {
+            /* run the callback */
+            if (callback != NULL)
+            {
+                /* output */
+                callback(-1, "error.\n");
+            }
 
-        return 1;
+            return 1;
+        }
+    }
+    else
+    {
+        *page_number = target_page_number;
     }
 
     /* store feature */
@@ -408,6 +417,68 @@ uint8_t as608_basic_input_fingerprint(void (*callback)(int8_t status, const char
     }
 
     return 0;
+}
+
+uint8_t as608_basic_input_fingerprint(void (*callback)(int8_t status, const char *const fmt, ...),
+                                      uint16_t *score,
+                                      uint16_t *page_number,
+                                      as608_status_t *status)
+{
+    return as608_basic_input_fingerprint_impl(callback, score, page_number, status, 0, 0);
+}
+
+uint8_t as608_basic_input_fingerprint_to_page(void (*callback)(int8_t status, const char *const fmt, ...),
+                                              uint16_t target_page_number,
+                                              uint16_t *score,
+                                              uint16_t *page_number,
+                                              as608_status_t *status)
+{
+    return as608_basic_input_fingerprint_impl(callback, score, page_number, status, target_page_number, 1);
+}
+
+/**
+ * @brief      basic example wait for a finger on the sensor
+ * @param[out] *status pointer to a status buffer
+ * @return     status code
+ *             - 0 success
+ *             - 1 wait finger failed
+ *             - 2 timeout
+ * @note       none
+ */
+uint8_t as608_basic_wait_fingerprint(as608_status_t *status)
+{
+    uint8_t res;
+    uint32_t timeout;
+
+    /* max default time */
+    timeout = AS608_BASIC_DEFAULT_TIMEOUT;
+
+    /* wait your finger */
+    while (timeout != 0)
+    {
+        /* get image */
+        res = as608_get_image(&gs_handle, gs_addr, status);
+        if (res != 0)
+        {
+            return 1;
+        }
+        if (*status == AS608_STATUS_OK)
+        {
+            return 0;
+        }
+        if (*status != AS608_STATUS_NO_FINGERPRINT)
+        {
+            return 1;
+        }
+
+        /* delay 1000ms */
+        as608_interface_delay_ms(1000);
+
+        /* timeout-- */
+        timeout--;
+    }
+
+    return 2;
 }
 
 /**

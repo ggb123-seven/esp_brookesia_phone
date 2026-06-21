@@ -86,8 +86,11 @@ private:
     void setResultText(const char *text, uint32_t color);
     void showResult(const OperationResult &result);
     void updateFromWorker(const OperationResult &result);
+    void updateIdentifyHint(void);
     void updateEnrollHint(as608_service_enroll_event_t event);
     void loadStudentsForList(void);
+    esp_err_t allocateEnrollPageId(uint16_t *page_id, student_store_status_t *status) const;
+    void setKeyboardVisible(bool visible);
 
     static void workerTask(void *arg);
     static void openEnrollEventCb(lv_event_t *e);
@@ -99,6 +102,7 @@ private:
     static void startDeleteEventCb(lv_event_t *e);
     static void studentRowEventCb(lv_event_t *e);
     static void filterEventCb(lv_event_t *e);
+    static void filterFocusEventCb(lv_event_t *e);
     static void keyboardEventCb(lv_event_t *e);
     static void enrollStatusCb(as608_service_enroll_event_t event, void *user_ctx);
     static const char *statusToText(as608_status_t status);

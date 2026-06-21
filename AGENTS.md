@@ -28,6 +28,12 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 - Delete temporary research, download, or experiment files after use unless
   they are intentionally kept as project documentation or source inputs.
 
+## Trellis 任务命名与记录语言
+
+- 后续新建或更新 Trellis task 时，任务标题、PRD 标题、journal/session 标题和面向用户的任务说明优先使用简体中文。
+- 任务目录 slug、命令参数、代码标识符和已有英文专有名词可以保留英文；需要展示给用户时，同时给出清晰的中文名称。
+- 现有英文 task 名称在汇报时按中文含义表达，例如 `00-bootstrap-guidelines` 写作“初始化项目开发规范”。
+
 ## 中文 UI 文本显示
 
 - 简体中文 UI 文本必须使用包含对应字形的 LVGL 字体渲染。不要依赖

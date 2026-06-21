@@ -120,6 +120,40 @@ uint8_t as608_basic_input_fingerprint(void (*callback)(int8_t status, const char
                                       as608_status_t *status);
 
 /**
+ * @brief      basic example input fingerprint to a specified page
+ * @param[out] *callback pointer to a callback function
+ * @param[in]  target_page_number target page number
+ * @param[out] *score pointer to a score buffer
+ * @param[out] *page_number pointer to a page number buffer
+ * @param[out] *status pointer to a status buffer
+ * @return     status code
+ *             - 0 success
+ *             - 1 input fingerprint failed
+ *             - 2 timeout
+ * @note       callback status
+ *             - -1 error
+ *             - 0 please put your finger on the sensor
+ *             - 1 please put your finger on the sensor again
+ *             - 2 generate feature success
+ */
+uint8_t as608_basic_input_fingerprint_to_page(void (*callback)(int8_t status, const char *const fmt, ...),
+                                              uint16_t target_page_number,
+                                              uint16_t *score,
+                                              uint16_t *page_number,
+                                              as608_status_t *status);
+
+/**
+ * @brief      basic example wait for a finger on the sensor
+ * @param[out] *status pointer to a status buffer
+ * @return     status code
+ *             - 0 success
+ *             - 1 wait finger failed
+ *             - 2 timeout
+ * @note       none
+ */
+uint8_t as608_basic_wait_fingerprint(as608_status_t *status);
+
+/**
  * @brief      basic example verify
  * @param[out] *found_page pointer to a found page buffer
  * @param[out] *score pointer to a score buffer

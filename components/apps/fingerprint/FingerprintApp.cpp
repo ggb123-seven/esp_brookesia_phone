@@ -5,6 +5,7 @@
  */
 #include "FingerprintApp.hpp"
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -461,7 +462,7 @@ void FingerprintApp::showIdentifyPage(void)
     lv_obj_set_style_text_color(_status_label, lv_color_hex(FINGERPRINT_COLOR_PRIMARY), 0);
 
     _detail_label = lv_label_create(status_panel);
-    lv_label_set_text(_detail_label, "点击开始识别后，再把手指放到 AS608 指纹模块上。");
+    lv_label_set_text(_detail_label, "点击开始后，请先把手指放到 AS608 指纹模块上，检测到手指后开始识别。");
     lv_obj_set_width(_detail_label, LV_PCT(100));
     lv_label_set_long_mode(_detail_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(_detail_label, FINGERPRINT_FONT_CN, 0);
@@ -511,6 +512,7 @@ void FingerprintApp::createStudentFlowPage(const char *title, bool bound_records
     lv_textarea_set_placeholder_text(_filter_ta, "输入学生姓名筛选");
     lv_obj_set_style_text_font(_filter_ta, FINGERPRINT_FONT_CN, 0);
     lv_obj_add_event_cb(_filter_ta, filterEventCb, LV_EVENT_VALUE_CHANGED, this);
+    lv_obj_add_event_cb(_filter_ta, filterFocusEventCb, LV_EVENT_CLICKED, this);
 
     lv_obj_t *content = lv_obj_create(_root);
     lv_obj_set_width(content, LV_PCT(100));
@@ -557,6 +559,7 @@ void FingerprintApp::createStudentFlowPage(const char *title, bool bound_records
     lv_obj_set_height(_keyboard, 180);
     lv_keyboard_set_textarea(_keyboard, _filter_ta);
     lv_obj_add_event_cb(_keyboard, keyboardEventCb, LV_EVENT_CLICKED, this);
+    lv_obj_add_flag(_keyboard, LV_OBJ_FLAG_HIDDEN);
 
     refreshStudentList(bound_records);
 }
@@ -576,6 +579,58 @@ void FingerprintApp::loadStudentsForList(void)
         return;
     }
     _student_count = (count > STUDENT_STORE_MAX_RECORDS) ? STUDENT_STORE_MAX_RECORDS : count;
+}
+
+esp_err_t FingerprintApp::allocateEnrollPageId(uint16_t *page_id, student_store_status_t *status) const
+{
+    if (page_id == NULL) {
+        if (status != NULL) {
+            *status = STUDENT_STORE_STATUS_PARSE_ERROR;
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    student_store_record_t *records = static_cast<student_store_record_t *>(
+        calloc(STUDENT_STORE_MAX_RECORDS, sizeof(records[0])));
+    if (records == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate student list for page selection");
+        if (status != NULL) {
+            *status = STUDENT_STORE_STATUS_STORAGE_ERROR;
+        }
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t count = 0;
+    esp_err_t err = student_store_list(records, STUDENT_STORE_MAX_RECORDS, &count, status);
+    if (err != ESP_OK) {
+        free(records);
+        return err;
+    }
+
+    bool used_pages[STUDENT_STORE_PAGE_ID_MAX + 1] = {false};
+    size_t copy_count = (count > STUDENT_STORE_MAX_RECORDS) ? STUDENT_STORE_MAX_RECORDS : count;
+    for (size_t i = 0; i < copy_count; ++i) {
+        uint16_t record_page_id = records[i].fingerprint_page_id;
+        if (record_page_id != STUDENT_STORE_NO_PAGE_ID && record_page_id <= STUDENT_STORE_PAGE_ID_MAX) {
+            used_pages[record_page_id] = true;
+        }
+    }
+    free(records);
+
+    for (uint16_t candidate = 0; candidate <= STUDENT_STORE_PAGE_ID_MAX; ++candidate) {
+        if (!used_pages[candidate]) {
+            *page_id = candidate;
+            if (status != NULL) {
+                *status = STUDENT_STORE_STATUS_OK;
+            }
+            return ESP_OK;
+        }
+    }
+
+    if (status != NULL) {
+        *status = STUDENT_STORE_STATUS_STORE_FULL;
+    }
+    return ESP_ERR_INVALID_STATE;
 }
 
 bool FingerprintApp::recordMatchesFilter(const student_store_record_t &record, bool bound_records,
@@ -724,6 +779,20 @@ void FingerprintApp::setResultText(const char *text, uint32_t color)
     }
 }
 
+void FingerprintApp::setKeyboardVisible(bool visible)
+{
+    if (_keyboard != NULL) {
+        if (visible) {
+            lv_obj_clear_flag(_keyboard, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (!visible && _filter_ta != NULL) {
+        lv_obj_clear_state(_filter_ta, LV_STATE_FOCUSED);
+    }
+}
+
 void FingerprintApp::showResult(const OperationResult &result)
 {
     char detail[192];
@@ -812,6 +881,23 @@ void FingerprintApp::updateFromWorker(const OperationResult &result)
     esp_lv_adapter_unlock();
 }
 
+void FingerprintApp::updateIdentifyHint(void)
+{
+    if (_closing || _root == NULL) {
+        return;
+    }
+
+    if (esp_lv_adapter_lock(pdMS_TO_TICKS(FINGERPRINT_UI_LOCK_WAIT_MS)) != ESP_OK) {
+        ESP_LOGW(TAG, "Skip identify hint because LVGL lock timed out");
+        return;
+    }
+
+    setStatusText("正在识别", "已检测到手指，正在匹配学生档案。", FINGERPRINT_COLOR_WARN);
+    setResultText("已检测到手指，正在识别。", FINGERPRINT_COLOR_MUTED);
+    lv_refr_now(NULL);
+    esp_lv_adapter_unlock();
+}
+
 void FingerprintApp::updateEnrollHint(as608_service_enroll_event_t event)
 {
     if (_closing || _root == NULL) {
@@ -866,26 +952,87 @@ void FingerprintApp::workerTask(void *arg)
 
         switch (command.type) {
         case COMMAND_IDENTIFY:
+            result.err = as608_service_wait_finger(&result.status);
+            if (result.err != ESP_OK) {
+                break;
+            }
+
+            app->updateIdentifyHint();
             result.err = as608_service_identify(&result.page_id, &result.score, &result.status);
             if (result.err == ESP_OK) {
                 result.store_err = student_store_get_by_page_id(result.page_id, &result.record,
                                                                 &result.store_status);
-                result.has_record = result.store_err == ESP_OK;
+                result.has_record = result.store_err == ESP_OK && result.record.enabled;
+                if (result.store_err == ESP_OK && !result.record.enabled) {
+                    result.store_status = STUDENT_STORE_STATUS_PAGE_ID_UNBOUND;
+                    ESP_LOGW(TAG, "Matched disabled student record: page_id=%u",
+                             (unsigned)result.page_id);
+                }
             }
             break;
-        case COMMAND_ENROLL:
-            result.err = as608_service_enroll(enrollStatusCb, app, &result.page_id, &result.score,
-                                              &result.status);
+        case COMMAND_ENROLL: {
+            if (command.page_id > STUDENT_STORE_PAGE_ID_MAX) {
+                result.err = ESP_ERR_INVALID_ARG;
+                result.store_err = ESP_ERR_INVALID_ARG;
+                result.store_status = STUDENT_STORE_STATUS_PARSE_ERROR;
+                break;
+            }
+
+            student_store_record_t occupied_record = {};
+            result.store_err = student_store_get_by_page_id(command.page_id, &occupied_record,
+                                                            &result.store_status);
+            if (result.store_err == ESP_OK) {
+                result.err = ESP_ERR_INVALID_STATE;
+                result.store_err = ESP_ERR_INVALID_STATE;
+                result.store_status = STUDENT_STORE_STATUS_PAGE_ID_OCCUPIED;
+                ESP_LOGW(TAG, "Refuse to enroll over occupied page: page_id=%u student_id=%s",
+                         (unsigned)command.page_id, occupied_record.student_id);
+                break;
+            }
+            if (result.store_err != ESP_ERR_NOT_FOUND) {
+                result.err = result.store_err;
+                ESP_LOGE(TAG, "Failed to check target page before enroll: page_id=%u err=%s store_status=%d",
+                         (unsigned)command.page_id, esp_err_to_name(result.store_err),
+                         (int)result.store_status);
+                break;
+            }
+
+            result.store_err = ESP_OK;
+            result.store_status = STUDENT_STORE_STATUS_OK;
+            ESP_LOGI(TAG, "Enroll target page selected: student_id=%s page_id=%u",
+                     command.student_id, (unsigned)command.page_id);
+            result.err = as608_service_enroll_to_page(enrollStatusCb, app, command.page_id,
+                                                      &result.page_id, &result.score,
+                                                      &result.status);
+            ESP_LOGI(TAG, "Enroll result: err=%s status=0x%02x target_page=%u result_page=%u score=%u",
+                     esp_err_to_name(result.err), (unsigned)result.status,
+                     (unsigned)command.page_id, (unsigned)result.page_id,
+                     (unsigned)result.score);
             if (result.err == ESP_OK) {
-                result.store_err = student_store_bind_page_id(command.student_id, result.page_id,
+                if (result.page_id != command.page_id) {
+                    ESP_LOGE(TAG, "Enroll page mismatch: target=%u actual=%u",
+                             (unsigned)command.page_id, (unsigned)result.page_id);
+                    result.err = ESP_FAIL;
+                    break;
+                }
+
+                result.store_err = student_store_bind_page_id(command.student_id, command.page_id,
                                                               &result.store_status);
                 if (result.store_err == ESP_OK) {
                     result.store_err = student_store_get_by_id(command.student_id, &result.record,
                                                                &result.store_status);
                     result.has_record = result.store_err == ESP_OK;
+                } else {
+                    as608_status_t delete_status = AS608_STATUS_UNKNOWN;
+                    esp_err_t delete_err = as608_service_delete_template(command.page_id, &delete_status);
+                    ESP_LOGE(TAG,
+                             "Failed to bind enrolled page; rollback delete err=%s status=0x%02x page_id=%u store_status=%d",
+                             esp_err_to_name(delete_err), (unsigned)delete_status,
+                             (unsigned)command.page_id, (int)result.store_status);
                 }
             }
             break;
+        }
         case COMMAND_DELETE:
             result.store_err = student_store_get_by_id(command.student_id, &result.record, &result.store_status);
             result.has_record = result.store_err == ESP_OK;
@@ -940,25 +1087,38 @@ void FingerprintApp::backEventCb(lv_event_t *e)
 void FingerprintApp::startIdentifyEventCb(lv_event_t *e)
 {
     FingerprintApp *app = static_cast<FingerprintApp *>(lv_event_get_user_data(e));
-    if (app == NULL) {
+    if (app == NULL || app->_busy) {
         return;
     }
 
-    app->setStatusText("正在识别", "请把手指放到 AS608 指纹模块上。", FINGERPRINT_COLOR_WARN);
-    app->setResultText("正在等待指纹。", FINGERPRINT_COLOR_MUTED);
+    app->setStatusText("等待手指", "请把手指放到 AS608 指纹模块上，检测到手指后开始识别。", FINGERPRINT_COLOR_WARN);
+    app->setResultText("正在等待检测手指。", FINGERPRINT_COLOR_MUTED);
     app->postCommand(COMMAND_IDENTIFY, 0, NULL);
 }
 
 void FingerprintApp::startEnrollEventCb(lv_event_t *e)
 {
     FingerprintApp *app = static_cast<FingerprintApp *>(lv_event_get_user_data(e));
-    if (app == NULL || !app->_has_selected_student) {
+    if (app == NULL || !app->_has_selected_student || app->_busy) {
+        return;
+    }
+
+    uint16_t target_page_id = 0;
+    student_store_status_t store_status = STUDENT_STORE_STATUS_OK;
+    esp_err_t err = app->allocateEnrollPageId(&target_page_id, &store_status);
+    if (err != ESP_OK) {
+        char detail[128];
+        snprintf(detail, sizeof(detail), "No free fingerprint page: %s", store_status_to_text(store_status));
+        ESP_LOGE(TAG, "Failed to allocate enroll page: %s (%s)",
+                 esp_err_to_name(err), store_status_to_text(store_status));
+        app->setStatusText("Page full", detail, FINGERPRINT_COLOR_ERROR);
+        app->setResultText(detail, FINGERPRINT_COLOR_ERROR);
         return;
     }
 
     app->setStatusText("准备录入", "请按提示连续放置同一个手指两次。", FINGERPRINT_COLOR_WARN);
     app->setResultText("正在准备录入。", FINGERPRINT_COLOR_MUTED);
-    app->postCommand(COMMAND_ENROLL, 0, app->_selected_student.student_id);
+    app->postCommand(COMMAND_ENROLL, target_page_id, app->_selected_student.student_id);
 }
 
 void FingerprintApp::startDeleteEventCb(lv_event_t *e)
@@ -1001,6 +1161,17 @@ void FingerprintApp::filterEventCb(lv_event_t *e)
     }
 }
 
+void FingerprintApp::filterFocusEventCb(lv_event_t *e)
+{
+    FingerprintApp *app = static_cast<FingerprintApp *>(lv_event_get_user_data(e));
+    if (app == NULL || app->_keyboard == NULL) {
+        return;
+    }
+
+    bool keyboard_hidden = lv_obj_has_flag(app->_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app->setKeyboardVisible(keyboard_hidden);
+}
+
 void FingerprintApp::keyboardEventCb(lv_event_t *e)
 {
     FingerprintApp *app = static_cast<FingerprintApp *>(lv_event_get_user_data(e));
@@ -1011,7 +1182,7 @@ void FingerprintApp::keyboardEventCb(lv_event_t *e)
 
     lv_keyboard_set_textarea(target, app->_filter_ta);
     if (lv_keyboard_get_selected_btn(target) == 39) {
-        lv_obj_clear_state(app->_filter_ta, LV_STATE_FOCUSED);
+        app->setKeyboardVisible(false);
     }
 }
 

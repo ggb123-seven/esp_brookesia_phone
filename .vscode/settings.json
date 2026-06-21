@@ -6,8 +6,9 @@
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4",
-    "IDF_TOOLS_PATH": "C:\\Users\\seven\\.espressif\\tools",
-    "OPENOCD_SCRIPTS": "C:\\Users\\seven\\.espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts",
+    "IDF_TOOLS_PATH": "C:\\Espressif",
+    "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\tools\\python\\v5.5.4\\venv",
+    "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts",
     "OPENOCD_USB_ADAPTER_LOCATION": "4-1"
   },
   "cmake.configureOnOpen": false,
@@ -21,5 +22,11 @@
     "--compile-commands-dir=f:\\ESP32\\esp32p4-demo\\esp-dev-kits-a88faa6\\examples\\esp32-p4-function-ev-board\\examples\\esp_brookesia_phone\\build"
   ],
   "idf.flashType": "JTAG",
+  "idf.jtagFlashCommandExtraArgs": [
+    "verify",
+    "compress",
+    "reset",
+    "skip_loaded"
+  ],
   "idf.monitorPort": "COM3"
 }

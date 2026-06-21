@@ -40,6 +40,14 @@ esp_err_t as608_service_enroll(as608_service_enroll_cb_t callback,
                                uint16_t *score,
                                as608_status_t *status);
 
+esp_err_t as608_service_enroll_to_page(as608_service_enroll_cb_t callback,
+                                       void *user_ctx,
+                                       uint16_t target_page_id,
+                                       uint16_t *page_id,
+                                       uint16_t *score,
+                                       as608_status_t *status);
+
+esp_err_t as608_service_wait_finger(as608_status_t *status);
 esp_err_t as608_service_identify(uint16_t *page_id, uint16_t *score, as608_status_t *status);
 esp_err_t as608_service_match(uint16_t *page_id, uint16_t *score, as608_status_t *status);
 esp_err_t as608_service_delete_template(uint16_t page_id, as608_status_t *status);

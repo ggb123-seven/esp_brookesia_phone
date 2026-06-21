@@ -411,10 +411,6 @@ esp_err_t student_store_init(const char *path)
         if (err != ESP_OK) {
             return err;
         }
-        if (file_exists(STUDENT_STORE_SDCARD_IMPORT_PATH)) {
-            ESP_LOGI(TAG, "Updating student store from %s", STUDENT_STORE_SDCARD_IMPORT_PATH);
-            return student_store_import_csv_merge(STUDENT_STORE_SDCARD_IMPORT_PATH, &status);
-        }
         return ESP_OK;
     }
 
@@ -445,14 +441,22 @@ esp_err_t student_store_reload(student_store_status_t *status)
         return err;
     }
 
-    student_store_record_t loaded[STUDENT_STORE_MAX_RECORDS];
+    student_store_record_t *loaded = calloc(STUDENT_STORE_MAX_RECORDS, sizeof(loaded[0]));
+    if (loaded == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate reload buffer");
+        set_status(status, STUDENT_STORE_STATUS_STORAGE_ERROR);
+        return ESP_ERR_NO_MEM;
+    }
+
     size_t loaded_count = 0;
     err = load_csv_file(s_path, loaded, STUDENT_STORE_MAX_RECORDS, &loaded_count, status);
     if (err != ESP_OK) {
+        free(loaded);
         return err;
     }
 
     memcpy(s_records, loaded, sizeof(loaded[0]) * loaded_count);
+    free(loaded);
     s_record_count = loaded_count;
     set_status(status, STUDENT_STORE_STATUS_OK);
     return ESP_OK;
@@ -490,7 +494,14 @@ esp_err_t student_store_import_csv_merge(const char *path, student_store_status_
         return ESP_FAIL;
     }
 
-    student_store_record_t imported[STUDENT_STORE_MAX_RECORDS];
+    student_store_record_t *imported = calloc(STUDENT_STORE_MAX_RECORDS, sizeof(imported[0]));
+    if (imported == NULL) {
+        fclose(file);
+        ESP_LOGE(TAG, "Failed to allocate import buffer");
+        set_status(status, STUDENT_STORE_STATUS_STORAGE_ERROR);
+        return ESP_ERR_NO_MEM;
+    }
+
     size_t imported_count = 0;
     char line[STUDENT_STORE_LINE_LEN];
     bool first_line = true;
@@ -508,6 +519,7 @@ esp_err_t student_store_import_csv_merge(const char *path, student_store_status_
 
         if (imported_count >= STUDENT_STORE_MAX_RECORDS) {
             fclose(file);
+            free(imported);
             set_status(status, STUDENT_STORE_STATUS_STORE_FULL);
             return ESP_ERR_INVALID_STATE;
         }
@@ -515,6 +527,7 @@ esp_err_t student_store_import_csv_merge(const char *path, student_store_status_
         parsed_record_t parsed;
         if (!parse_record_line(text, &parsed)) {
             fclose(file);
+            free(imported);
             set_status(status, STUDENT_STORE_STATUS_PARSE_ERROR);
             return ESP_ERR_INVALID_ARG;
         }
@@ -530,10 +543,12 @@ esp_err_t student_store_import_csv_merge(const char *path, student_store_status_
 
     err = validate_records(imported, imported_count, status);
     if (err != ESP_OK) {
+        free(imported);
         return err;
     }
 
     memcpy(s_records, imported, sizeof(imported[0]) * imported_count);
+    free(imported);
     s_record_count = imported_count;
     return save_current(status);
 }

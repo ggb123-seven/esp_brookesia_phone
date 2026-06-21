@@ -136,6 +136,72 @@ esp_err_t as608_service_enroll(as608_service_enroll_cb_t callback,
     return as608_service_status_to_err(local_status);
 }
 
+esp_err_t as608_service_enroll_to_page(as608_service_enroll_cb_t callback,
+                                       void *user_ctx,
+                                       uint16_t target_page_id,
+                                       uint16_t *page_id,
+                                       uint16_t *score,
+                                       as608_status_t *status)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "AS608 service is not initialized");
+
+    uint16_t local_page_id = target_page_id;
+    uint16_t local_score = 0;
+    as608_status_t local_status = AS608_STATUS_UNKNOWN;
+
+    s_enroll_callback = callback;
+    s_enroll_user_ctx = user_ctx;
+
+    uint8_t res = as608_basic_input_fingerprint_to_page(as608_service_enroll_bridge,
+                                                        target_page_id,
+                                                        &local_score,
+                                                        &local_page_id,
+                                                        &local_status);
+
+    s_enroll_callback = NULL;
+    s_enroll_user_ctx = NULL;
+
+    if (page_id != NULL) {
+        *page_id = local_page_id;
+    }
+    if (score != NULL) {
+        *score = local_score;
+    }
+    if (status != NULL) {
+        *status = local_status;
+    }
+
+    if (res == 2) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (res != 0) {
+        return as608_service_status_to_err(local_status);
+    }
+
+    return as608_service_status_to_err(local_status);
+}
+
+esp_err_t as608_service_wait_finger(as608_status_t *status)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "AS608 service is not initialized");
+
+    as608_status_t local_status = AS608_STATUS_UNKNOWN;
+
+    uint8_t res = as608_basic_wait_fingerprint(&local_status);
+    if (status != NULL) {
+        *status = local_status;
+    }
+
+    if (res == 2) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (res != 0) {
+        return as608_service_status_to_err(local_status);
+    }
+
+    return as608_service_status_to_err(local_status);
+}
+
 esp_err_t as608_service_identify(uint16_t *page_id, uint16_t *score, as608_status_t *status)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "AS608 service is not initialized");
