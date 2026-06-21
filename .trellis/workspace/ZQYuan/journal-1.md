@@ -328,9 +328,15 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 - [OK] 字体覆盖检查通过：Fingerprint App、示例名单和 launcher 相关中文字符 175 个，缺失 `NONE`。
 - [OK] `git diff --check` 通过；只打印 CRLF 换行提示。
 
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3d52b75` | feat: 实现学生指纹模板绑定 |
+
 ### Status
 
-[OK] **实现和验证完成；待提交**
+[OK] **Completed**
 
 ### Next Steps
 
