@@ -82,6 +82,50 @@ Verified ESP-IDF reconfigure/build with Wi-Fi Remote enabled and archived the bu
 - None - task complete
 
 
+## Session 6: 细化学生指纹 App 子页面与图标规划
+
+**Date**: 2026-06-21
+**Task**: 学生指纹模板库绑定接口
+**Branch**: `main`
+
+### Summary
+
+根据用户新要求，补充 Fingerprint App UI 规划：主页面只保留 `导入学生指纹`、`识别学生指纹`、`删除学生指纹` 三个入口，点击后分别进入独立子页面；子页面 UI 要简约、大气，并复用 Setting App 的 LVGL 26 键 keyboard + textarea 模式输入学生姓名。另补充 launcher 图标重构要求：指纹 App 图标改为 app-local 静态 PNG/LVGL 资源，视觉风格对齐现有本地 App 图标。
+
+### Main Changes
+
+- 更新 `.trellis/tasks/06-20-student-fingerprint-template-binding/prd.md` 的需求与验收标准。
+- 更新该任务的 `design.md`，记录主页面、三个子页面和 launcher 图标资产方案。
+- 更新该任务的 `implement.md`，补充子页面实现和 `img_app_fingerprint` 静态图标清单。
+
+### Testing
+
+- [OK] 使用 `rg --hidden --no-ignore` 核对新 UI 与图标规划已写入任务文档。
+
+### Status
+
+[OK] **Planning updated**
+
+### Follow-up
+
+- 用户确认学生姓名输入第一版只用于筛选/定位已导入名单，不支持现场新建学生；已同步关闭任务文档中的开放问题。
+
+### Implementation
+
+- 新增 `components/student_store`，提供学生档案、CSV 持久化、名单导入合并、模板绑定/解绑/查询 API。
+- Fingerprint App 改为主页面三入口，加 `导入学生指纹`、`识别学生指纹`、`删除学生指纹` 三个子页面。
+- 导入和删除子页面使用学生列表 + 姓名筛选 + LVGL keyboard/textarea，筛选仅针对已导入名单。
+- 识别成功后按模板 ID 查询学生姓名、班级、学号；录入成功后自动绑定选中学生；删除成功后清理本地绑定。
+- 指纹 App launcher 图标改为 `img_app_fingerprint.png/.c` 静态资产，移除运行时绘制图标逻辑。
+- 重新生成 `fingerprint_font_20.c`，覆盖新增 UI 文案和示例名单中文字符。
+
+### Verification
+
+- [OK] `idf.py build`
+- [OK] `compile_commands.json` 包含 `student_store.c`、`fingerprint_font_20.c`、`img_app_fingerprint.c`
+- [OK] 字体覆盖检查：175 个中文/标点字符，缺失 `NONE`
+
+
 ## Session 3: Optional app trim and ESP32-P4 ECO2 verification
 
 **Date**: 2026-06-18
@@ -253,3 +297,41 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: 学生指纹模板绑定接口实现与 SD 卡名单修正
+
+**Date**: 2026-06-21
+**Task**: 学生指纹模板绑定接口
+**Branch**: `main`
+
+### Summary
+
+实现学生档案与 AS608 指纹模板 ID 的本地绑定服务，接入 Fingerprint App 三个独立子页面，并按用户确认修正名单工作流：老师维护的工作表放 SD 卡根目录 `/sdcard/students.csv`，设备内部 `/spiffs/students.csv` 只保存运行时学生档案和模板绑定，SPIFFS 示例名单仅作兜底初始化。
+
+### Main Changes
+
+- 新增 `components/student_store`，支持 CSV 导入、持久化、按学号/模板 ID 查询、绑定、解绑和删除。
+- Fingerprint App 改成 `导入学生指纹`、`识别学生指纹`、`删除学生指纹` 三个入口和三个子页面。
+- 导入页面向学生名单筛选和录入，不再让老师直接管理模板编号；姓名输入沿用 LVGL `textarea + keyboard`。
+- 识别页只在点击开始识别后提示放置手指，识别成功后显示学生姓名、班级、学号和模板 ID。
+- 删除页面向已绑定学生列表，删除 AS608 模板成功后同步解除本地绑定。
+- Fingerprint App launcher 图标改为本地静态 PNG/LVGL 资源，并同步更新中文字体子集。
+- SD 卡名单优先级修正：开机先加载 SPIFFS 运行时主表，再发现 `/sdcard/students.csv` 时合并导入并保留同学号已有模板绑定；主表不存在时优先用 SD 卡工作表初始化，再用 SPIFFS 示例名单兜底。
+- 默认启用 `CONFIG_EXAMPLE_ENABLE_SD_CARD=y`；SD 卡挂载失败只跳过 SD 名单导入和 Video Player，不阻断核心 App 启动。
+
+### Testing
+
+- [OK] `idf.py build` 通过，生成 `build/esp_brookesia_demo.bin` 和 `build/storage.bin`。
+- [OK] SD 卡修正后再次 `idf.py build` 通过；app binary `0x5fcae0`，factory app 分区剩余 `0x303520` 字节（33%）。
+- [OK] `build/compile_commands.json` 包含 `main.cpp`、`student_store.c`、`img_app_fingerprint.c`、`fingerprint_font_20.c`。
+- [OK] 字体覆盖检查通过：Fingerprint App、示例名单和 launcher 相关中文字符 175 个，缺失 `NONE`。
+- [OK] `git diff --check` 通过；只打印 CRLF 换行提示。
+
+### Status
+
+[OK] **实现和验证完成；待提交**
+
+### Next Steps
+
+- 在真实 ESP32-P4 板卡上插入包含 `/sdcard/students.csv` 的 SD 卡，验证 SD 挂载、名单合并导入、录入、识别和删除流程。

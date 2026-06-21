@@ -14,6 +14,7 @@
 #include "lvgl.h"
 #include "esp_brookesia.hpp"
 #include "as608_service.h"
+#include "student_store.h"
 
 class FingerprintApp: public ESP_Brookesia_PhoneApp {
 public:
@@ -27,6 +28,13 @@ public:
 
 private:
     typedef enum {
+        PAGE_MAIN,
+        PAGE_ENROLL,
+        PAGE_IDENTIFY,
+        PAGE_DELETE,
+    } PageMode;
+
+    typedef enum {
         COMMAND_IDENTIFY,
         COMMAND_ENROLL,
         COMMAND_DELETE,
@@ -36,54 +44,86 @@ private:
     typedef struct {
         CommandType type;
         uint16_t page_id;
+        char student_id[STUDENT_STORE_STUDENT_ID_LEN];
     } Command;
 
     typedef struct {
         CommandType type;
         esp_err_t err;
+        esp_err_t store_err;
         uint16_t page_id;
         uint16_t score;
         as608_status_t status;
+        student_store_status_t store_status;
+        student_store_record_t record;
+        bool has_record;
     } OperationResult;
 
     bool initService(void);
+    bool initStudentStore(void);
     bool startWorker(void);
     bool stopWorker(void);
-    bool postCommand(CommandType type, uint16_t page_id);
+    bool postCommand(CommandType type, uint16_t page_id, const char *student_id);
+
     void buildUi(void);
-    void setButtonsEnabled(bool enabled);
+    void clearPage(void);
+    void showMainPage(void);
+    void showEnrollPage(void);
+    void showIdentifyPage(void);
+    void showDeletePage(void);
+    void createHeader(const char *title, bool show_back);
+    lv_obj_t *createButton(lv_obj_t *parent, const char *text, lv_event_cb_t cb, lv_coord_t width,
+                           lv_coord_t height);
+    lv_obj_t *createPanel(lv_obj_t *parent, lv_coord_t height);
+    void createStudentFlowPage(const char *title, bool bound_records);
+    void refreshStudentList(bool bound_records);
+    void selectStudent(size_t index);
+    void refreshSelectedPanel(void);
+    bool recordMatchesFilter(const student_store_record_t &record, bool bound_records, const char *filter) const;
+    void setControlsEnabled(bool enabled);
+    void setObjectTreeEnabled(lv_obj_t *obj, bool enabled);
     void setStatusText(const char *state, const char *detail, uint32_t color);
+    void setResultText(const char *text, uint32_t color);
     void showResult(const OperationResult &result);
     void updateFromWorker(const OperationResult &result);
     void updateEnrollHint(as608_service_enroll_event_t event);
+    void loadStudentsForList(void);
 
     static void workerTask(void *arg);
-    static void identifyEventCb(lv_event_t *e);
-    static void enrollEventCb(lv_event_t *e);
-    static void deleteEventCb(lv_event_t *e);
-    static void spinboxIncrementEventCb(lv_event_t *e);
-    static void spinboxDecrementEventCb(lv_event_t *e);
+    static void openEnrollEventCb(lv_event_t *e);
+    static void openIdentifyEventCb(lv_event_t *e);
+    static void openDeleteEventCb(lv_event_t *e);
+    static void backEventCb(lv_event_t *e);
+    static void startIdentifyEventCb(lv_event_t *e);
+    static void startEnrollEventCb(lv_event_t *e);
+    static void startDeleteEventCb(lv_event_t *e);
+    static void studentRowEventCb(lv_event_t *e);
+    static void filterEventCb(lv_event_t *e);
+    static void keyboardEventCb(lv_event_t *e);
     static void enrollStatusCb(as608_service_enroll_event_t event, void *user_ctx);
     static const char *statusToText(as608_status_t status);
-    static const lv_img_dsc_t *getLauncherIcon(void);
 
     volatile bool _busy;
     volatile bool _closing;
     bool _service_ready;
+    bool _store_ready;
     QueueHandle_t _command_queue;
     SemaphoreHandle_t _worker_done;
     TaskHandle_t _worker_task;
 
+    PageMode _page;
+    student_store_record_t _students[STUDENT_STORE_MAX_RECORDS];
+    size_t _student_count;
+    student_store_record_t _selected_student;
+    bool _has_selected_student;
+
     lv_obj_t *_root;
     lv_obj_t *_status_label;
     lv_obj_t *_detail_label;
-    lv_obj_t *_page_label;
-    lv_obj_t *_score_label;
-    lv_obj_t *_as608_status_label;
-    lv_obj_t *_spinbox;
-    lv_obj_t *_identify_btn;
-    lv_obj_t *_enroll_btn;
-    lv_obj_t *_delete_btn;
-    lv_obj_t *_inc_btn;
-    lv_obj_t *_dec_btn;
+    lv_obj_t *_result_label;
+    lv_obj_t *_student_list;
+    lv_obj_t *_selected_label;
+    lv_obj_t *_action_btn;
+    lv_obj_t *_filter_ta;
+    lv_obj_t *_keyboard;
 };

@@ -29,7 +29,12 @@
 
 static const char *TAG = "main";
 
+#if !CONFIG_EXAMPLE_ENABLE_SD_CARD
 static esp_ldo_channel_handle_t sd_ldo_handle = NULL;
+#endif
+#if CONFIG_EXAMPLE_ENABLE_SD_CARD
+static bool s_sdcard_mounted = false;
+#endif
 
 #if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
 LV_FONT_DECLARE(fingerprint_font_20);
@@ -50,6 +55,7 @@ static void use_fingerprint_launcher_font(ESP_Brookesia_PhoneStylesheet_t *style
 }
 #endif
 
+#if !CONFIG_EXAMPLE_ENABLE_SD_CARD
 static esp_err_t init_sd_ldo_only(void)
 {
     esp_ldo_channel_config_t ldo_cfg = {
@@ -58,6 +64,7 @@ static esp_err_t init_sd_ldo_only(void)
     };
     return esp_ldo_acquire_channel(&ldo_cfg, &sd_ldo_handle);
 }
+#endif
 
 extern "C" void app_main(void)
 {
@@ -72,8 +79,14 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "SPIFFS mount successfully");
 
 #if CONFIG_EXAMPLE_ENABLE_SD_CARD
-    ESP_ERROR_CHECK(bsp_sdcard_mount());
-    ESP_LOGI(TAG, "SD card mount successfully");
+    err = bsp_sdcard_mount();
+    if (err == ESP_OK) {
+        s_sdcard_mounted = true;
+        ESP_LOGI(TAG, "SD card mount successfully");
+    } else {
+        ESP_LOGW(TAG, "SD card mount failed: %s; SD roster import and Video Player are unavailable",
+                 esp_err_to_name(err));
+    }
 #else
     ESP_ERROR_CHECK(init_sd_ldo_only());
 #endif
@@ -145,10 +158,12 @@ extern "C" void app_main(void)
     assert((phone->installApp(camera) >= 0) && "Failed to begin camera");
 
 #if CONFIG_EXAMPLE_ENABLE_SD_CARD
-    ESP_LOGW(TAG, "Using Video Player example requires inserting the SD card in advance and saving an MJPEG format video on the SD card");
-    AppVideoPlayer *app_video_player = new AppVideoPlayer();
-    assert(app_video_player != nullptr && "Failed to create app_video_player");
-    assert((phone->installApp(app_video_player) >= 0) && "Failed to begin app_video_player");
+    if (s_sdcard_mounted) {
+        ESP_LOGW(TAG, "Using Video Player example requires inserting the SD card in advance and saving an MJPEG format video on the SD card");
+        AppVideoPlayer *app_video_player = new AppVideoPlayer();
+        assert(app_video_player != nullptr && "Failed to create app_video_player");
+        assert((phone->installApp(app_video_player) >= 0) && "Failed to begin app_video_player");
+    }
 #endif
 
     esp_lv_adapter_unlock();

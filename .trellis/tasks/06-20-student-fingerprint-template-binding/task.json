@@ -3,7 +3,7 @@
   "name": "student-fingerprint-template-binding",
   "title": "学生指纹模板库绑定接口",
   "description": "为大学生打卡系统设计并实现学生姓名、班级、学号与 AS608 指纹模板 ID 的本地绑定接口。",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": null,
   "scope": null,
   "package": null,
