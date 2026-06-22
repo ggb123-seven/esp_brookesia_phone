@@ -18,5 +18,9 @@
 #include "fingerprint/FingerprintApp.hpp"
 #endif
 
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+#include "environment_monitor/EnvironmentMonitorApp.hpp"
+#endif
+
 #include "camera/Camera.hpp"
 #include "video_player/VideoPlayer.hpp"

@@ -26,6 +26,13 @@ menu "Example Configurations"
             Enabling this option will compile and install the AS608 fingerprint app.
             Disable it before enabling the temporary AS608 validation task.
 
+    config EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+        bool "Enable Environment Monitor App"
+        default y
+        help
+            Enabling this option will compile and install the Environment Monitor app.
+            The app displays DHT11 and MQ-2 service snapshots on the device screen.
+
     config EXAMPLE_ENABLE_AS608_VALIDATION
         bool "Enable AS608 hardware validation task"
         depends on !EXAMPLE_ENABLE_APP_FINGERPRINT

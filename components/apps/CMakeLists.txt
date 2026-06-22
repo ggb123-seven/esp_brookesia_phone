@@ -1,6 +1,6 @@
 set(APPS_DIR ./)
 # ESP-IDF resolves component requirements before CONFIG-gated source filtering is reliable.
-set(APPS_REQUIRES lvgl__lvgl esp_lvgl_adapter esp_event esp_wifi nvs_flash esp_driver_jpeg esp_mm esp-brookesia bsp_extra esp32_p4_function_ev_board_noglib esp_video pedestrian_detect human_face_detect espressif__esp_lcd_touch_gt911 as608 student_store)
+set(APPS_REQUIRES lvgl__lvgl esp_lvgl_adapter esp_event esp_wifi nvs_flash esp_driver_jpeg esp_mm esp-brookesia bsp_extra esp32_p4_function_ev_board_noglib esp_video pedestrian_detect human_face_detect espressif__esp_lcd_touch_gt911 as608 student_store dht11 mq2)
 file(GLOB_RECURSE APPS_C_SRCS ${APPS_DIR}/*.c)
 file(GLOB_RECURSE APPS_CPP_SRCS ${APPS_DIR}/*.cpp)
 
@@ -28,6 +28,11 @@ endif()
 if(NOT CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT)
     exclude_app_sources(APPS_C_SRCS "fingerprint")
     exclude_app_sources(APPS_CPP_SRCS "fingerprint")
+endif()
+
+if(NOT CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR)
+    exclude_app_sources(APPS_C_SRCS "environment_monitor")
+    exclude_app_sources(APPS_CPP_SRCS "environment_monitor")
 endif()
 
 idf_component_register(

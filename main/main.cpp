@@ -44,19 +44,31 @@ static esp_ldo_channel_handle_t sd_ldo_handle = NULL;
 static bool s_sdcard_mounted = false;
 #endif
 
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+LV_FONT_DECLARE(environment_font_20);
+#endif
+
 #if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
 LV_FONT_DECLARE(fingerprint_font_20);
+#endif
 
-static void use_fingerprint_launcher_font(ESP_Brookesia_PhoneStylesheet_t *stylesheet)
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+static void use_chinese_launcher_font(ESP_Brookesia_PhoneStylesheet_t *stylesheet)
 {
     if (stylesheet == NULL) {
         return;
     }
 
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+    const lv_font_t *launcher_font = &environment_font_20;
+#else
+    const lv_font_t *launcher_font = &fingerprint_font_20;
+#endif
+
     ESP_Brookesia_StyleFont_t *fonts = stylesheet->core.home.text.default_fonts;
     for (int i = 0; i < stylesheet->core.home.text.default_fonts_num; ++i) {
         if (fonts[i].size_px == 22) {
-            fonts[i].font_resource = &fingerprint_font_20;
+            fonts[i].font_resource = launcher_font;
             return;
         }
     }
@@ -157,8 +169,8 @@ extern "C" void app_main(void)
 
     ESP_Brookesia_PhoneStylesheet_t *phone_stylesheet = new ESP_Brookesia_PhoneStylesheet_t ESP_BROOKESIA_PHONE_1024_600_DARK_STYLESHEET();
     ESP_BROOKESIA_CHECK_NULL_EXIT(phone_stylesheet, "Create phone stylesheet failed");
-#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
-    use_fingerprint_launcher_font(phone_stylesheet);
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+    use_chinese_launcher_font(phone_stylesheet);
 #endif
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->addStylesheet(*phone_stylesheet), "Add phone stylesheet failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->activateStylesheet(*phone_stylesheet), "Activate phone stylesheet failed");
@@ -175,6 +187,12 @@ extern "C" void app_main(void)
     FingerprintApp *fingerprint = new FingerprintApp();
     assert(fingerprint != nullptr && "Failed to create fingerprint app");
     assert((phone->installApp(fingerprint) >= 0) && "Failed to begin fingerprint app");
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+    EnvironmentMonitorApp *environment_monitor = new EnvironmentMonitorApp();
+    assert(environment_monitor != nullptr && "Failed to create environment monitor app");
+    assert((phone->installApp(environment_monitor) >= 0) && "Failed to begin environment monitor app");
 #endif
 
     MusicPlayer *music_player = new MusicPlayer();

@@ -6,12 +6,15 @@
 #include "dht11_service.h"
 
 #include <inttypes.h>
+#include <string.h>
 
-#include "dht.h"
+#include "driver/rmt_rx.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "soc/gpio_num.h"
@@ -19,6 +22,14 @@
 #define DHT11_TASK_NAME           "dht11"
 #define DHT11_STOP_WAIT_MS        (2500U)
 #define DHT11_STOP_POLL_MS        (100U)
+#define DHT11_RMT_RESOLUTION_HZ   (1000000U)
+#define DHT11_RMT_SYMBOLS         (64U)
+#define DHT11_RMT_QUEUE_LENGTH    (1U)
+#define DHT11_START_SIGNAL_US     (20000U)
+#define DHT11_READ_TIMEOUT_MS     (100U)
+#define DHT11_DATA_BITS           (40U)
+#define DHT11_DATA_BYTES          (5U)
+#define DHT11_BIT_ONE_THRESHOLD_US (50U)
 
 static const char *TAG = "DHT11Service";
 
@@ -26,9 +37,17 @@ static dht11_service_config_t s_config;
 static dht11_service_snapshot_t s_snapshot;
 static TaskHandle_t s_task_handle;
 static SemaphoreHandle_t s_done_sem;
+static QueueHandle_t s_rmt_rx_queue;
+static rmt_channel_handle_t s_rmt_rx_channel;
+static rmt_symbol_word_t s_rmt_symbols[DHT11_RMT_SYMBOLS];
 static portMUX_TYPE s_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_stop_requested;
 static bool s_initialized;
+
+typedef struct {
+    uint8_t level;
+    uint16_t duration_us;
+} dht11_rmt_segment_t;
 
 static const char *dht11_status_to_name(dht11_service_status_t status)
 {
@@ -80,10 +99,138 @@ static dht11_service_status_t dht11_err_to_status(esp_err_t err)
     return DHT11_SERVICE_STATUS_IO_ERROR;
 }
 
+static bool dht11_rmt_rx_done_callback(rmt_channel_handle_t channel,
+                                       const rmt_rx_done_event_data_t *edata,
+                                       void *user_data)
+{
+    (void)channel;
+    BaseType_t high_task_wakeup = pdFALSE;
+    xQueueSendFromISR((QueueHandle_t)user_data, edata, &high_task_wakeup);
+    return high_task_wakeup == pdTRUE;
+}
+
+static size_t dht11_append_segment(dht11_rmt_segment_t *segments,
+                                   size_t max_segments,
+                                   size_t count,
+                                   uint8_t level,
+                                   uint16_t duration_us)
+{
+    if (duration_us == 0 || count >= max_segments) {
+        return count;
+    }
+
+    segments[count].level = level;
+    segments[count].duration_us = duration_us;
+    return count + 1;
+}
+
+static bool dht11_is_response_header(uint16_t low_us, uint16_t high_us)
+{
+    return (low_us >= 60U) && (low_us <= 110U) && (high_us >= 60U) && (high_us <= 110U);
+}
+
+static bool dht11_is_data_bit(uint16_t low_us, uint16_t high_us)
+{
+    return (low_us >= 30U) && (low_us <= 80U) && (high_us >= 15U) && (high_us <= 95U);
+}
+
+static esp_err_t dht11_parse_rmt_symbols(const rmt_symbol_word_t *symbols,
+                                         size_t symbol_count,
+                                         float *temperature_c,
+                                         float *humidity_percent)
+{
+    dht11_rmt_segment_t segments[DHT11_RMT_SYMBOLS * 2] = {0};
+    size_t segment_count = 0;
+    for (size_t i = 0; i < symbol_count; ++i) {
+        segment_count = dht11_append_segment(segments, DHT11_RMT_SYMBOLS * 2, segment_count,
+                                             symbols[i].level0, symbols[i].duration0);
+        segment_count = dht11_append_segment(segments, DHT11_RMT_SYMBOLS * 2, segment_count,
+                                             symbols[i].level1, symbols[i].duration1);
+    }
+
+    uint8_t data[DHT11_DATA_BYTES] = {0};
+    size_t bit_count = 0;
+    bool response_seen = false;
+
+    for (size_t i = 0; (i + 1U) < segment_count; ++i) {
+        if (segments[i].level != 0 || segments[i + 1U].level != 1) {
+            continue;
+        }
+
+        const uint16_t low_us = segments[i].duration_us;
+        const uint16_t high_us = segments[i + 1U].duration_us;
+        if (!response_seen) {
+            if (dht11_is_response_header(low_us, high_us)) {
+                response_seen = true;
+            }
+            continue;
+        }
+
+        if (!dht11_is_data_bit(low_us, high_us)) {
+            continue;
+        }
+
+        const size_t byte_index = bit_count / 8U;
+        data[byte_index] <<= 1;
+        if (high_us > DHT11_BIT_ONE_THRESHOLD_US) {
+            data[byte_index] |= 1U;
+        }
+
+        bit_count++;
+        if (bit_count == DHT11_DATA_BITS) {
+            break;
+        }
+    }
+
+    ESP_RETURN_ON_FALSE(response_seen, ESP_ERR_TIMEOUT, TAG, "DHT11 response header not found");
+    ESP_RETURN_ON_FALSE(bit_count == DHT11_DATA_BITS, ESP_ERR_TIMEOUT, TAG,
+                        "DHT11 received only %u/%u bits", (unsigned)bit_count, (unsigned)DHT11_DATA_BITS);
+
+    const uint8_t checksum = (uint8_t)(data[0] + data[1] + data[2] + data[3]);
+    ESP_RETURN_ON_FALSE(data[4] == checksum, ESP_ERR_INVALID_CRC, TAG,
+                        "DHT11 checksum failed: data=%02x %02x %02x %02x %02x checksum=%02x",
+                        data[0], data[1], data[2], data[3], data[4], checksum);
+
+    *humidity_percent = (float)data[0] + ((float)data[1] / 10.0f);
+    *temperature_c = (float)data[2] + ((float)data[3] / 10.0f);
+    return ESP_OK;
+}
+
+static esp_err_t dht11_start_rmt_rx(void)
+{
+    memset(s_rmt_symbols, 0, sizeof(s_rmt_symbols));
+    xQueueReset(s_rmt_rx_queue);
+
+    const rmt_receive_config_t rx_config = {
+        .signal_range_min_ns = 1000,
+        .signal_range_max_ns = 1000000,
+    };
+    return rmt_receive(s_rmt_rx_channel, s_rmt_symbols, sizeof(s_rmt_symbols), &rx_config);
+}
+
 static esp_err_t dht11_read_once(float *temperature_c, float *humidity_percent, dht11_service_status_t *status)
 {
-    esp_err_t err = dht_read_float_data(DHT_TYPE_DHT11, s_config.data_gpio,
-                                        humidity_percent, temperature_c);
+    gpio_set_direction(s_config.data_gpio, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level(s_config.data_gpio, 0);
+    esp_rom_delay_us(DHT11_START_SIGNAL_US);
+
+    esp_err_t err = dht11_start_rmt_rx();
+    if (err == ESP_OK) {
+        gpio_set_level(s_config.data_gpio, 1);
+        gpio_set_direction(s_config.data_gpio, GPIO_MODE_INPUT);
+
+        rmt_rx_done_event_data_t rx_data = {0};
+        if (xQueueReceive(s_rmt_rx_queue, &rx_data, pdMS_TO_TICKS(DHT11_READ_TIMEOUT_MS)) == pdTRUE) {
+            err = dht11_parse_rmt_symbols(rx_data.received_symbols, rx_data.num_symbols,
+                                          temperature_c, humidity_percent);
+        } else {
+            err = ESP_ERR_TIMEOUT;
+        }
+    } else {
+        gpio_set_level(s_config.data_gpio, 1);
+        gpio_set_direction(s_config.data_gpio, GPIO_MODE_INPUT);
+    }
+
     *status = dht11_err_to_status(err);
 
     return err;
@@ -184,8 +331,53 @@ esp_err_t dht11_service_init(const dht11_service_config_t *config)
     esp_err_t err = gpio_config(&io_conf);
     ESP_RETURN_ON_ERROR(err, TAG, "Failed to configure DHT11 data GPIO");
 
+    s_rmt_rx_queue = xQueueCreate(DHT11_RMT_QUEUE_LENGTH, sizeof(rmt_rx_done_event_data_t));
+    ESP_RETURN_ON_FALSE(s_rmt_rx_queue != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create DHT11 RMT RX queue");
+
+    const rmt_rx_channel_config_t rmt_rx_config = {
+        .gpio_num = s_config.data_gpio,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = DHT11_RMT_RESOLUTION_HZ,
+        .mem_block_symbols = DHT11_RMT_SYMBOLS,
+    };
+    err = rmt_new_rx_channel(&rmt_rx_config, &s_rmt_rx_channel);
+    if (err != ESP_OK) {
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to create DHT11 RMT RX channel");
+    }
+
+    const rmt_rx_event_callbacks_t rmt_callbacks = {
+        .on_recv_done = dht11_rmt_rx_done_callback,
+    };
+    err = rmt_rx_register_event_callbacks(s_rmt_rx_channel, &rmt_callbacks, s_rmt_rx_queue);
+    if (err != ESP_OK) {
+        rmt_del_channel(s_rmt_rx_channel);
+        s_rmt_rx_channel = NULL;
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to register DHT11 RMT RX callback");
+    }
+
+    err = rmt_enable(s_rmt_rx_channel);
+    if (err != ESP_OK) {
+        rmt_del_channel(s_rmt_rx_channel);
+        s_rmt_rx_channel = NULL;
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
+        ESP_RETURN_ON_ERROR(err, TAG, "Failed to enable DHT11 RMT RX channel");
+    }
+
     s_done_sem = xSemaphoreCreateBinary();
-    ESP_RETURN_ON_FALSE(s_done_sem != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create DHT11 done semaphore");
+    if (s_done_sem == NULL) {
+        rmt_disable(s_rmt_rx_channel);
+        rmt_del_channel(s_rmt_rx_channel);
+        s_rmt_rx_channel = NULL;
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
+        ESP_LOGE(TAG, "Failed to create DHT11 done semaphore");
+        return ESP_ERR_NO_MEM;
+    }
 
     BaseType_t ret = xTaskCreate(dht11_sample_task,
                                  DHT11_TASK_NAME,
@@ -196,6 +388,11 @@ esp_err_t dht11_service_init(const dht11_service_config_t *config)
     if (ret != pdPASS) {
         vSemaphoreDelete(s_done_sem);
         s_done_sem = NULL;
+        rmt_disable(s_rmt_rx_channel);
+        rmt_del_channel(s_rmt_rx_channel);
+        s_rmt_rx_channel = NULL;
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -223,6 +420,16 @@ esp_err_t dht11_service_deinit(void)
     if (s_done_sem != NULL) {
         vSemaphoreDelete(s_done_sem);
         s_done_sem = NULL;
+    }
+
+    if (s_rmt_rx_channel != NULL) {
+        rmt_disable(s_rmt_rx_channel);
+        rmt_del_channel(s_rmt_rx_channel);
+        s_rmt_rx_channel = NULL;
+    }
+    if (s_rmt_rx_queue != NULL) {
+        vQueueDelete(s_rmt_rx_queue);
+        s_rmt_rx_queue = NULL;
     }
 
     (void)gpio_set_direction(s_config.data_gpio, GPIO_MODE_INPUT);
