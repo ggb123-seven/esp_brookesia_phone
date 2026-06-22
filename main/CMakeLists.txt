@@ -1,5 +1,16 @@
 set(MAIN_SRCS main.cpp lvgl_adapter_init.c)
-set(MAIN_REQUIRES "")
+set(MAIN_REQUIRES
+    apps
+    bsp_extra
+    dht11
+    esp-brookesia
+    esp32_p4_function_ev_board_noglib
+    esp_hw_support
+    esp_lvgl_adapter
+    heap
+    lvgl__lvgl
+    mq2
+    nvs_flash)
 
 if(CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION)
     list(APPEND MAIN_SRCS as608_validation.c)

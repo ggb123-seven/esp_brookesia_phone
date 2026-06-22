@@ -341,3 +341,35 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - 在真实 ESP32-P4 板卡上插入包含 `/sdcard/students.csv` 的 SD 卡，验证 SD 挂载、名单合并导入、录入、识别和删除流程。
+
+## Session 7: 接入 MQ-2 烟雾与可燃气体检测
+**Date**: 2026-06-22
+**Task**: 接入 MQ-2 烟雾与可燃气体检测
+**Branch**: `main`
+
+### Summary
+
+完成 MQ-2 模块的 ESP-IDF 原生移植，第一版按已确认范围仅接入 `DO` 数字告警输出，不引入 Arduino 依赖，也不提前做 `AO` 模拟量和 ppm 标定。实现了独立 `mq2` 组件、启动配置和轮询采样服务，并在真机上通过拧电位器验证了 `NORMAL` / `ALARM` 状态切换与防抖效果。
+
+### Main Changes
+
+- 新增 `components/mq2` 组件，提供 `mq2_service_init()`、`mq2_service_deinit()` 和 `mq2_service_get_snapshot()`。
+- 增加 MQ-2 运行配置：`DO GPIO`、告警有效电平、预热时间、确认采样次数、采样周期和任务栈大小。
+- 在 `main/main.cpp` 中按 `Kconfig` 开关启动 MQ-2 服务，并把默认配置写入 `sdkconfig.defaults`。
+- 采用 3 次连续采样确认切换状态，避免阈值附近抖动导致的频繁误切换。
+- 查阅并参考了 GitHub 上的 MQ-2 Arduino 库思路，但移植实现保持为 ESP-IDF 风格服务。
+
+### Testing
+
+- [OK] `idf.py build` 通过，`mq2` 组件成功进入构建并完成链接。
+- [OK] 真机串口日志验证通过：预热结束后可输出 `NORMAL` / `ALARM` 状态切换日志。
+- [OK] 通过调节 MQ-2 电位器，确认阈值附近会抖动，防抖后状态能稳定回落到 `NORMAL`。
+- [OK] DHT11 真机硬件验证通过，串口日志稳定输出温湿度采样，例如 `temperature=27.0C humidity=51.0%`。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 后续如需接入更精细的烟雾/气体识别，再扩展 `AO` 模拟量采样和标定流程。

@@ -20,6 +20,14 @@
 #include "lvgl_adapter_init.h"
 #include "esp_ldo_regulator.h"
 
+#if CONFIG_EXAMPLE_ENABLE_DHT11_SERVICE
+#include "dht11_service.h"
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_MQ2_SERVICE
+#include "mq2_service.h"
+#endif
+
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
 #include "as608_validation.h"
 #endif
@@ -92,6 +100,36 @@ extern "C" void app_main(void)
 #endif
 
     ESP_ERROR_CHECK(bsp_extra_codec_init());
+
+#if CONFIG_EXAMPLE_ENABLE_DHT11_SERVICE
+    dht11_service_config_t dht11_config = {
+        .data_gpio = (gpio_num_t)CONFIG_EXAMPLE_DHT11_DATA_GPIO,
+        .sample_period_ms = CONFIG_EXAMPLE_DHT11_SAMPLE_PERIOD_MS,
+        .max_consecutive_failures = CONFIG_EXAMPLE_DHT11_MAX_CONSECUTIVE_FAILURES,
+        .task_stack_size = CONFIG_EXAMPLE_DHT11_TASK_STACK_SIZE,
+        .task_priority = CONFIG_EXAMPLE_DHT11_TASK_PRIORITY,
+    };
+    err = dht11_service_init(&dht11_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start DHT11 service: %s", esp_err_to_name(err));
+    }
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_MQ2_SERVICE
+    mq2_service_config_t mq2_config = {
+        .do_gpio = (gpio_num_t)CONFIG_EXAMPLE_MQ2_DO_GPIO,
+        .alarm_level = CONFIG_EXAMPLE_MQ2_ALARM_LEVEL,
+        .sample_period_ms = CONFIG_EXAMPLE_MQ2_SAMPLE_PERIOD_MS,
+        .warmup_ms = CONFIG_EXAMPLE_MQ2_WARMUP_MS,
+        .confirm_samples = CONFIG_EXAMPLE_MQ2_CONFIRM_SAMPLES,
+        .task_stack_size = CONFIG_EXAMPLE_MQ2_TASK_STACK_SIZE,
+        .task_priority = CONFIG_EXAMPLE_MQ2_TASK_PRIORITY,
+    };
+    err = mq2_service_init(&mq2_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start MQ-2 service: %s", esp_err_to_name(err));
+    }
+#endif
 
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
     err = as608_validation_start();

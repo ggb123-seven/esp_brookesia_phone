@@ -35,6 +35,112 @@ menu "Example Configurations"
             Keep it disabled outside temporary fingerprint hardware validation.
             Disable the Fingerprint app first because both paths use the same AS608 service.
 
+    config EXAMPLE_ENABLE_DHT11_SERVICE
+        bool "Enable DHT11 temperature and humidity service"
+        default y
+        help
+            Enabling this option starts the DHT11 periodic sampling service at boot.
+            The first version only logs samples and exposes a snapshot query API.
+
+    if EXAMPLE_ENABLE_DHT11_SERVICE
+        config EXAMPLE_DHT11_DATA_GPIO
+            int "DHT11 DATA GPIO"
+            range 0 54
+            default 32
+            help
+                ESP32-P4 GPIO connected to DHT11 DATA. Use an external 4.7k-10k pull-up to 3.3V.
+
+        config EXAMPLE_DHT11_SAMPLE_PERIOD_MS
+            int "DHT11 sample period in milliseconds"
+            range 2000 60000
+            default 2000
+            help
+                DHT11 should not be sampled faster than once every 2 seconds.
+
+        config EXAMPLE_DHT11_MAX_CONSECUTIVE_FAILURES
+            int "DHT11 consecutive failure threshold"
+            range 1 20
+            default 3
+            help
+                Log an error after this many consecutive sample failures.
+
+        config EXAMPLE_DHT11_TASK_STACK_SIZE
+            int "DHT11 task stack size"
+            range 2048 8192
+            default 3072
+            help
+                Stack size for the DHT11 periodic sampling task.
+
+        config EXAMPLE_DHT11_TASK_PRIORITY
+            int "DHT11 task priority"
+            range 1 10
+            default 4
+            help
+                FreeRTOS priority for the DHT11 periodic sampling task.
+    endif
+
+    config EXAMPLE_ENABLE_MQ2_SERVICE
+        bool "Enable MQ-2 gas alarm service"
+        default y
+        help
+            Enabling this option starts the MQ-2 digital alarm sampling service at boot.
+            The first version reads the module DO threshold output only; AO analog
+            sampling is reserved for a later calibrated extension.
+
+    if EXAMPLE_ENABLE_MQ2_SERVICE
+        config EXAMPLE_MQ2_DO_GPIO
+            int "MQ-2 DO GPIO"
+            range 0 54
+            default 33
+            help
+                ESP32-P4 GPIO connected to MQ-2 DO. Confirm the module output level
+                is safe for the ESP32-P4 input before wiring.
+
+        config EXAMPLE_MQ2_ALARM_LEVEL
+            int "MQ-2 alarm active level"
+            range 0 1
+            default 0
+            help
+                Digital level treated as alarm. Many MQ-2 modules drive DO low when
+                the comparator threshold is exceeded, but module boards can differ.
+
+        config EXAMPLE_MQ2_SAMPLE_PERIOD_MS
+            int "MQ-2 sample period in milliseconds"
+            range 100 60000
+            default 500
+            help
+                Period for reading the MQ-2 DO level.
+
+        config EXAMPLE_MQ2_WARMUP_MS
+            int "MQ-2 warmup period in milliseconds"
+            range 0 600000
+            default 30000
+            help
+                Ignore alarm output during sensor warmup. MQ-2 sensors need a warmup
+                period after power-on, and production deployments may need a longer value.
+
+        config EXAMPLE_MQ2_CONFIRM_SAMPLES
+            int "MQ-2 debounce confirmation samples"
+            range 1 100
+            default 3
+            help
+                Number of consecutive samples required before entering or leaving alarm state.
+
+        config EXAMPLE_MQ2_TASK_STACK_SIZE
+            int "MQ-2 task stack size"
+            range 2048 8192
+            default 3072
+            help
+                Stack size for the MQ-2 periodic sampling task.
+
+        config EXAMPLE_MQ2_TASK_PRIORITY
+            int "MQ-2 task priority"
+            range 1 10
+            default 4
+            help
+                FreeRTOS priority for the MQ-2 periodic sampling task.
+    endif
+
     if EXAMPLE_ENABLE_AS608_VALIDATION || EXAMPLE_ENABLE_APP_FINGERPRINT
         config EXAMPLE_AS608_UART_NUM
             int "AS608 UART port"
