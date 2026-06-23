@@ -19,6 +19,21 @@ menu "Example Configurations"
             Enabling this option will compile and install the 2048 game app.
             Keep it disabled to reduce the factory app partition usage.
 
+    config EXAMPLE_ENABLE_APP_MUSIC_PLAYER
+        bool "Enable Music Player App"
+        default n
+        help
+            Enabling this option will compile and install the Music Player app.
+            Keep it disabled when the launcher should only show classroom apps.
+
+    config EXAMPLE_ENABLE_APP_VIDEO_PLAYER
+        bool "Enable Video Player App"
+        depends on EXAMPLE_ENABLE_SD_CARD
+        default n
+        help
+            Enabling this option will compile and install the Video Player app.
+            It also requires an inserted SD card with an MJPEG video file.
+
     config EXAMPLE_ENABLE_APP_FINGERPRINT
         bool "Enable Fingerprint App"
         default y
@@ -32,6 +47,57 @@ menu "Example Configurations"
         help
             Enabling this option will compile and install the Environment Monitor app.
             The app displays DHT11 and MQ-2 service snapshots on the device screen.
+
+    config EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
+        bool "Enable Classroom Schedule App"
+        default y
+        help
+            Enabling this option will compile and install the classroom schedule app.
+            The app fetches today's schedule from a user-provided HTTP JSON endpoint.
+
+    if EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
+        config EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST
+            string "Classroom schedule server host"
+            default "192.168.1.100"
+            help
+                Server IP or host name. Do not include http:// or a path.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT
+            int "Classroom schedule server port"
+            range 1 65535
+            default 8080
+            help
+                HTTP port used by the classroom schedule server.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_API_PATH
+            string "Classroom schedule API path"
+            default "/classroom-schedule/today"
+            help
+                Path for the schedule JSON endpoint. The app appends classroom,
+                date, and token query parameters.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_TOKEN
+            string "Classroom schedule API token"
+            default "change-me"
+            help
+                Shared access token sent to the schedule server. Replace this in
+                menuconfig or sdkconfig before real deployment. Do not commit a
+                real token.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_REFRESH_MS
+            int "Classroom schedule auto refresh period in milliseconds"
+            range 60000 3600000
+            default 600000
+            help
+                Auto refresh period while the app is open. Default is 10 minutes.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_REQUEST_TIMEOUT_MS
+            int "Classroom schedule request timeout in milliseconds"
+            range 1000 30000
+            default 8000
+            help
+                HTTP request timeout for one schedule refresh.
+    endif
 
     config EXAMPLE_ENABLE_AS608_VALIDATION
         bool "Enable AS608 hardware validation task"

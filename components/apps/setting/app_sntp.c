@@ -128,8 +128,12 @@ static void initialize_sntp(void)
     ESP_LOGI(TAG, "Initializing SNTP");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, SERVER_NAME_0);
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 1
     esp_sntp_setservername(1, SERVER_NAME_1);
+#endif
+#if CONFIG_LWIP_SNTP_MAX_SERVERS > 2
     esp_sntp_setservername(2, SERVER_NAME_2);
+#endif
     esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
 #ifdef CONFIG_SNTP_TIME_SYNC_METHOD_SMOOTH
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);

@@ -308,8 +308,13 @@ void AppSettings::extraUiInit(void)
     lv_textarea_set_password_mode(ui_TextAreaScreenSettingVerificationPassword, true);
     // lv_obj_set_size(ui_KeyboardScreenSettingVerification, lv_pct(100), lv_pct(UI_WIFI_KEYBOARD_H_PERCENT));
     // lv_obj_align(ui_KeyboardScreenSettingVerification, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(ui_KeyboardScreenSettingVerification, ui_TextAreaScreenSettingVerificationPassword);
+    lv_obj_add_event_cb(ui_TextAreaScreenSettingVerificationPassword,
+                        onTextAreaScreenSettingVerificationPasswordClickedEventCallback,
+                        LV_EVENT_CLICKED, this);
     lv_obj_add_event_cb(ui_KeyboardScreenSettingVerification, onKeyboardScreenSettingVerificationClickedEventCallback,
                         LV_EVENT_CLICKED, this);
+    setVerificationKeyboardVisible(false);
     // Record the screen index and install the screen loaded event callback
     lv_obj_add_flag(ui_ButtonScreenSettingBLEReturn, LV_OBJ_FLAG_HIDDEN);
     _screen_list[UI_WIFI_SCAN_INDEX] = ui_ScreenSettingWiFi;
@@ -732,20 +737,37 @@ void AppSettings::wifiConnectTask(void *arg)
 {
     AppSettings *app = (AppSettings *)arg;
     wifi_config_t wifi_config = { 0 };
+    esp_err_t ret = ESP_OK;
 
     esp_wifi_disconnect();
-    app->status_bar->setWifiIconState(0);
 
-    memcpy(st_wifi_ssid, lv_label_get_text(ui_LabelScreenSettingVerificationSSID), sizeof(wifi_config.sta.ssid));
-    memcpy(st_wifi_password, lv_textarea_get_text(ui_TextAreaScreenSettingVerificationPassword), sizeof(wifi_config.sta.ssid));
+    if (!app->_is_ui_del) {
+        esp_lv_adapter_lock(-1);
+        app->status_bar->setWifiIconState(0);
+        esp_lv_adapter_unlock();
+    }
 
-    memcpy(wifi_config.sta.ssid, st_wifi_ssid, sizeof(wifi_config.sta.ssid));
-    memcpy(wifi_config.sta.password, st_wifi_password, sizeof(wifi_config.sta.password));
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", st_wifi_ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", st_wifi_password);
 
-    ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Start Wi-Fi before connect returned %s", esp_err_to_name(ret));
+    }
 
-    ESP_LOGI(TAG, "SSID:%s, password:%s.", wifi_config.sta.ssid, wifi_config.sta.password);
+    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Set Wi-Fi config failed: %s", esp_err_to_name(ret));
+        if (!app->_is_ui_del) {
+            esp_lv_adapter_lock(-1);
+            app->processWifiConnect(WIFI_CONNECT_FAIL);
+            esp_lv_adapter_unlock();
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Connecting to SSID:%s.", wifi_config.sta.ssid);
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
@@ -810,10 +832,10 @@ void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
-        ESP_LOGI(TAG, "connected to ap SSID:%s, password:%s.", st_wifi_ssid, st_wifi_password);
+        ESP_LOGI(TAG, "connected to ap SSID:%s.", st_wifi_ssid);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
-        ESP_LOGI(TAG, "disconnected from ap SSID:%s, password:%s.", st_wifi_ssid, st_wifi_password);
+        ESP_LOGI(TAG, "disconnected from ap SSID:%s.", st_wifi_ssid);
         memset(st_wifi_ssid, 0, sizeof(st_wifi_ssid));
 
         // app->back();
@@ -832,16 +854,61 @@ void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32
     }
 }
 
+void AppSettings::setVerificationKeyboardVisible(bool visible)
+{
+    if (ui_KeyboardScreenSettingVerification != NULL) {
+        if (visible) {
+            lv_obj_clear_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (!visible && ui_TextAreaScreenSettingVerificationPassword != NULL) {
+        lv_obj_clear_state(ui_TextAreaScreenSettingVerificationPassword, LV_STATE_FOCUSED);
+    }
+}
+
+void AppSettings::onTextAreaScreenSettingVerificationPasswordClickedEventCallback(lv_event_t *e)
+{
+    AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
+    bool keyboard_hidden = false;
+
+    ESP_BROOKESIA_CHECK_NULL_GOTO(app, end, "Invalid app pointer");
+
+    if (ui_KeyboardScreenSettingVerification == NULL ||
+        ui_TextAreaScreenSettingVerificationPassword == NULL) {
+        goto end;
+    }
+
+    lv_keyboard_set_textarea(ui_KeyboardScreenSettingVerification, ui_TextAreaScreenSettingVerificationPassword);
+    keyboard_hidden = lv_obj_has_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
+    app->setVerificationKeyboardVisible(keyboard_hidden);
+
+end:
+    return;
+}
+
 void AppSettings::onKeyboardScreenSettingVerificationClickedEventCallback(lv_event_t *e)
 {
     AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
     lv_obj_t *target = lv_event_get_target(e);
 
     ESP_BROOKESIA_CHECK_NULL_GOTO(app, end, "Invalid app pointer");
+    ESP_BROOKESIA_CHECK_NULL_GOTO(target, end, "Invalid target pointer");
+
+    if (ui_TextAreaScreenSettingVerificationPassword == NULL) {
+        goto end;
+    }
 
     lv_keyboard_set_textarea(target, ui_TextAreaScreenSettingVerificationPassword);
 
     if(lv_keyboard_get_selected_btn(target) == 39) {
+        const char *ssid = lv_label_get_text(ui_LabelScreenSettingVerificationSSID);
+        const char *password = lv_textarea_get_text(ui_TextAreaScreenSettingVerificationPassword);
+        snprintf(st_wifi_ssid, sizeof(st_wifi_ssid), "%s", ssid ? ssid : "");
+        snprintf(st_wifi_password, sizeof(st_wifi_password), "%s", password ? password : "");
+
+        app->setVerificationKeyboardVisible(false);
         app->processWifiConnect(WIFI_CONNECT_RUNNING);
         // lv_obj_add_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
 

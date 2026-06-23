@@ -86,6 +86,7 @@ private:
     // WiFi
     static void onSwitchPanelScreenSettingWiFiSwitchValueChangeEventCallback( lv_event_t * e);
     static void onButtonWifiListClickedEventCallback(lv_event_t * e);
+    static void onTextAreaScreenSettingVerificationPasswordClickedEventCallback(lv_event_t *e);
     static void onKeyboardScreenSettingVerificationClickedEventCallback(lv_event_t *e);
     // Bluetooth
     static void onSwitchPanelScreenSettingBLESwitchValueChangeEventCallback( lv_event_t * e);
@@ -103,6 +104,8 @@ private:
     lv_obj_t *_img_wifi_connect;
     std::array<lv_obj_t *, UI_MAX_INDEX> _screen_list;
     std::map<std::string, int32_t> _nvs_param_map;
+
+    void setVerificationKeyboardVisible(bool visible);
     const ESP_Brookesia_StatusBar *status_bar; 
     const ESP_Brookesia_RecentsScreen *backstage;
 };

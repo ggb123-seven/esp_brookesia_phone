@@ -52,17 +52,23 @@ LV_FONT_DECLARE(environment_font_20);
 LV_FONT_DECLARE(fingerprint_font_20);
 #endif
 
-#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+#if CONFIG_EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
+LV_FONT_DECLARE(classroom_schedule_font_20);
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT || CONFIG_EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
 static void use_chinese_launcher_font(ESP_Brookesia_PhoneStylesheet_t *stylesheet)
 {
     if (stylesheet == NULL) {
         return;
     }
 
-#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
+#if CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+    const lv_font_t *launcher_font = &fingerprint_font_20;
+#elif CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR
     const lv_font_t *launcher_font = &environment_font_20;
 #else
-    const lv_font_t *launcher_font = &fingerprint_font_20;
+    const lv_font_t *launcher_font = &classroom_schedule_font_20;
 #endif
 
     ESP_Brookesia_StyleFont_t *fonts = stylesheet->core.home.text.default_fonts;
@@ -104,7 +110,7 @@ extern "C" void app_main(void)
         s_sdcard_mounted = true;
         ESP_LOGI(TAG, "SD card mount successfully");
     } else {
-        ESP_LOGW(TAG, "SD card mount failed: %s; SD roster import and Video Player are unavailable",
+        ESP_LOGW(TAG, "SD card mount failed: %s; SD roster import is unavailable",
                  esp_err_to_name(err));
     }
 #else
@@ -169,7 +175,7 @@ extern "C" void app_main(void)
 
     ESP_Brookesia_PhoneStylesheet_t *phone_stylesheet = new ESP_Brookesia_PhoneStylesheet_t ESP_BROOKESIA_PHONE_1024_600_DARK_STYLESHEET();
     ESP_BROOKESIA_CHECK_NULL_EXIT(phone_stylesheet, "Create phone stylesheet failed");
-#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT
+#if CONFIG_EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR || CONFIG_EXAMPLE_ENABLE_APP_FINGERPRINT || CONFIG_EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
     use_chinese_launcher_font(phone_stylesheet);
 #endif
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->addStylesheet(*phone_stylesheet), "Add phone stylesheet failed");
@@ -195,9 +201,17 @@ extern "C" void app_main(void)
     assert((phone->installApp(environment_monitor) >= 0) && "Failed to begin environment monitor app");
 #endif
 
+#if CONFIG_EXAMPLE_ENABLE_APP_CLASSROOM_SCHEDULE
+    ClassroomScheduleApp *classroom_schedule = new ClassroomScheduleApp();
+    assert(classroom_schedule != nullptr && "Failed to create classroom schedule app");
+    assert((phone->installApp(classroom_schedule) >= 0) && "Failed to begin classroom schedule app");
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_APP_MUSIC_PLAYER
     MusicPlayer *music_player = new MusicPlayer();
     assert(music_player != nullptr && "Failed to create music_player");
     assert((phone->installApp(music_player) >= 0) && "Failed to begin music_player");
+#endif
 
     AppSettings *app_settings = new AppSettings();
     assert(app_settings != nullptr && "Failed to create app_settings");
@@ -213,7 +227,7 @@ extern "C" void app_main(void)
     assert(camera != nullptr && "Failed to create camera");
     assert((phone->installApp(camera) >= 0) && "Failed to begin camera");
 
-#if CONFIG_EXAMPLE_ENABLE_SD_CARD
+#if CONFIG_EXAMPLE_ENABLE_SD_CARD && CONFIG_EXAMPLE_ENABLE_APP_VIDEO_PLAYER
     if (s_sdcard_mounted) {
         ESP_LOGW(TAG, "Using Video Player example requires inserting the SD card in advance and saving an MJPEG format video on the SD card");
         AppVideoPlayer *app_video_player = new AppVideoPlayer();
