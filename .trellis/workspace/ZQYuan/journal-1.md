@@ -81,7 +81,6 @@ Verified ESP-IDF reconfigure/build with Wi-Fi Remote enabled and archived the bu
 
 - None - task complete
 
-
 ## Session 6: 细化学生指纹 App 子页面与图标规划
 
 **Date**: 2026-06-21
@@ -231,7 +230,6 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
-
 
 ## Session 4: 修复 Fingerprint App 中文字体显示
 
@@ -413,6 +411,91 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Testing
 
 - [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 8: 闪屏原因补充：DHT11 旧读取路径阻塞显示刷新
+
+**Date**: 2026-06-22
+**Task**: 闪屏原因补充：DHT11 旧读取路径阻塞显示刷新
+**Branch**: `main`
+
+### Summary
+
+补充记录环境检测页面偶发闪蓝屏根因：旧 DHT11 vendor 读取在 critical section 内忙等 GPIO，干扰 LVGL/MIPI 显示刷新；已改用 RMT RX。
+
+### Main Changes
+
+本条补充记录环境检测页面偶发闪蓝屏的排查结论。
+
+闪屏原因：
+- 问题最终定位到 DHT11 旧读取路径，不是 MQ-2，也不是 DHT11 供电异常。
+- 旧实现调用 vendor `dht_read_float_data()`，读取 DHT11 40 bit 数据时在 critical section 内用 `esp_rom_delay_us()` 忙等 GPIO 电平变化。
+- 这会在采样期间短时间关中断/禁止抢占，容易干扰 LVGL/MIPI 显示刷新链路，因此页面表现为偶发闪蓝屏。
+
+排查依据：
+- 关闭 MQ-2 后问题仍可疑。
+- 打开 MQ-2、关闭 DHT11 后蓝屏消失，因此 MQ-2 服务基本排除。
+- DHT11 供电确认无问题，根因集中在旧 DHT11 GPIO 忙等读取时序实现。
+
+处理方案：
+- 将 DHT11 读取改为 ESP-IDF RMT RX 捕获脉冲宽度。
+- RMT 由硬件记录高低电平持续时间，CPU 只解析采样结果，不再用全局临界区忙等 GPIO。
+- 该方案保留 DHT11 与 MQ-2 同时启用，并减少对显示刷新链路的干扰。
+
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 9: 完善课堂课表与设置应用交互
+
+**Date**: 2026-06-23
+**Task**: 完善课堂课表与设置应用交互
+**Branch**: `main`
+
+### Summary
+
+新增教室课表应用与专用图标，修复中文 launcher 字体覆盖；统一课堂课表和设置页键盘悬浮逻辑；修复设置页 Wi-Fi 连接成功后 SNTP 越界和后台任务访问 LVGL 的重启问题；默认关闭 Music 和 Video app，并完成构建与刷机验证。
+
+### Main Changes
+
+- 新增教室课表 App，补齐专用 launcher 图标与中文字体子集。
+- 统一课堂课表与设置页的悬浮键盘交互，输入框点击切换显示/隐藏，完成键收起键盘。
+- 修复设置页 Wi-Fi 连接成功后的 SNTP 越界和后台任务直接访问 LVGL 导致的重启。
+- 默认关闭 Music Player 和 Video Player，并保留可选开关。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6f17c13` | (see git log) |
+
+### Testing
+
+- [OK] `idf.py build`
+- [OK] `idf.py -p COM3 flash`
+- [OK] 设备端已成功烧录并硬复位
 
 ### Status
 

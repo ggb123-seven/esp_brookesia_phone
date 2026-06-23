@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
-- **Last Active**: 2026-06-22
+- **Total Sessions**: 9
+- **Last Active**: 2026-06-23
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~423 | Active |
+| `journal-1.md` | ~501 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,8 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-06-23 | 完善课堂课表与设置应用交互 | `6f17c13` | `main` |
+| 8 | 2026-06-22 | 闪屏原因补充：DHT11 旧读取路径阻塞显示刷新 | - | `main` |
 | 7 | 2026-06-22 | 环境检测 App 与 DHT11 RMT 完工检查 | - | `main` |
 | 6 | 2026-06-21 | 学生指纹模板绑定接口实现 | `3d52b75` | `main` |
 | 5 | 2026-06-20 | 规划学生指纹模板绑定接口 | `96aacfc` | `main` |
