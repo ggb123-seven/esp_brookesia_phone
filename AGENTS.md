@@ -28,6 +28,21 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 - Delete temporary research, download, or experiment files after use unless
   they are intentionally kept as project documentation or source inputs.
 
+## 固件验证与提交流程
+
+- 每次完成代码修改并确认 `idf.py build` 构建验证无误后，直接执行刷机更新固件。
+- 刷机完成后询问用户设备现象是否正常；用户确认正常后，再简要总结本次改动。
+- 用户确认现象正常后，将本次改动提交到本地 Git，并继续推送到 GitHub。
+- 如果推送到 GitHub 失败，自动重试推送，最多重试 10 次；若 10 次后仍失败，明确告知失败原因和本地提交状态。
+
+## 新模块与外设移植规则
+
+- 每次向当前代码框架移植新的模块或外设前，先在 GitHub 搜索相关优秀实现或官方/社区示例；优先下载到临时位置研究，使用后删除临时文件，除非用户要求保留为项目资料。
+- 若找到的代码可以直接适配 ESP-IDF 和当前项目结构，则在理解其许可证和接口后再移植；若无法直接移植，则只借鉴初始化流程、时序处理、错误恢复和测试方法等思路。
+- 每移植一个外设，都需要同步编写一个最小测试函数或验证入口，用于独立确认硬件通信、初始化和关键读写路径；通常采用串口日志或串口命令协议暴露测试结果。
+- 涉及 UART/SPI/I2C 等持续收发、较大数据搬运或高频数据流时，优先采用 DMA 或驱动层异步机制，避免长时间忙等阻塞 UI 和系统任务。
+- 涉及脉冲宽度、单总线时序、红外/超声波/温湿度类时序采集或输出时，优先采用 ESP-IDF RMT 外设；如果该场景可结合 Ringbuffer，则优先使用 RMT + Ringbuffer；不要用长时间关中断或 busy-wait GPIO 的方式实现关键时序。
+
 ## Trellis 任务命名与记录语言
 
 - 后续新建或更新 Trellis task 时，任务标题、PRD 标题、journal/session 标题和面向用户的任务说明优先使用简体中文。
