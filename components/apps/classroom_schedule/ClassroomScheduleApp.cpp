@@ -16,19 +16,22 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
+#include "esp_netif.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
-#define CLASSROOM_SCHEDULE_WORKER_STACK_SIZE       (12288)
+#define CLASSROOM_SCHEDULE_WORKER_STACK_SIZE       (20480)
 #define CLASSROOM_SCHEDULE_WORKER_PRIORITY         (5)
 #define CLASSROOM_SCHEDULE_WORKER_CORE             (0)
 #define CLASSROOM_SCHEDULE_CLOSE_WAIT_MS           (CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_REQUEST_TIMEOUT_MS + 2000)
 #define CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS         (200)
+#define CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS   (1000)
 #define CLASSROOM_SCHEDULE_JSON_MAX_LEN            (8192)
 #define CLASSROOM_SCHEDULE_URL_MAX_LEN             (512)
 #define CLASSROOM_SCHEDULE_NVS_NAMESPACE           "class_sched"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CLASSROOM       "classroom"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_UPDATED   "cache_updated"
+#define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON      "cache_json"
 #define CLASSROOM_SCHEDULE_CACHE_PATH              "/spiffs/class_schedule.json"
 
 #define CLASSROOM_SCHEDULE_COLOR_BG                0x111827
@@ -49,6 +52,18 @@ LV_FONT_DECLARE(classroom_schedule_font_20);
 LV_IMG_DECLARE(img_app_classroom_schedule);
 
 static const char *TAG = "ClassroomSchedule";
+
+static bool hasNetworkIp(void)
+{
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif == NULL) {
+        return false;
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    esp_err_t err = esp_netif_get_ip_info(sta_netif, &ip_info);
+    return err == ESP_OK && ip_info.ip.addr != 0;
+}
 
 typedef struct {
     char *data;
@@ -164,6 +179,7 @@ bool ClassroomScheduleApp::run(void)
     if (_classroom[0] == '\0') {
         setViewState(VIEW_NO_CLASSROOM, "未设置教室", "请输入学校系统中的教室标识，然后保存。", CLASSROOM_SCHEDULE_COLOR_WARN);
     } else {
+        updateClassroomLabel();
         startRefresh();
     }
 
@@ -332,6 +348,20 @@ esp_err_t ClassroomScheduleApp::loadCacheJson(char *buffer, size_t buffer_size, 
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t err = loadCacheJsonFromNvs(buffer, buffer_size, json_len);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    return loadCacheJsonFromSpiffs(buffer, buffer_size, json_len);
+}
+
+esp_err_t ClassroomScheduleApp::loadCacheJsonFromSpiffs(char *buffer, size_t buffer_size, size_t *json_len)
+{
+    if (buffer == NULL || buffer_size == 0 || json_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     FILE *file = fopen(CLASSROOM_SCHEDULE_CACHE_PATH, "rb");
     if (file == NULL) {
         return ESP_ERR_NOT_FOUND;
@@ -365,10 +395,15 @@ esp_err_t ClassroomScheduleApp::saveCacheJson(const char *json)
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t nvs_err = saveCacheJsonToNvs(json);
+    if (nvs_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save schedule cache to NVS: %s", esp_err_to_name(nvs_err));
+    }
+
     FILE *file = fopen(CLASSROOM_SCHEDULE_CACHE_PATH, "wb");
     if (file == NULL) {
         ESP_LOGE(TAG, "Failed to open schedule cache for write: errno=%d", errno);
-        return ESP_FAIL;
+        return nvs_err == ESP_OK ? ESP_OK : ESP_FAIL;
     }
 
     const size_t json_len = strlen(json);
@@ -376,16 +411,73 @@ esp_err_t ClassroomScheduleApp::saveCacheJson(const char *json)
     fclose(file);
     if (written != json_len) {
         ESP_LOGE(TAG, "Failed to write schedule cache");
-        return ESP_FAIL;
+        return nvs_err == ESP_OK ? ESP_OK : ESP_FAIL;
     }
 
     return ESP_OK;
+}
+
+esp_err_t ClassroomScheduleApp::loadCacheJsonFromNvs(char *buffer, size_t buffer_size, size_t *json_len)
+{
+    if (buffer == NULL || buffer_size == 0 || json_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(CLASSROOM_SCHEDULE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t required_size = 0;
+    err = nvs_get_blob(handle, CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON, NULL, &required_size);
+    if (err == ESP_OK && (required_size == 0 || required_size >= buffer_size)) {
+        err = ESP_ERR_INVALID_SIZE;
+    }
+    if (err == ESP_OK) {
+        err = nvs_get_blob(handle, CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON, buffer, &required_size);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    buffer[required_size] = '\0';
+    *json_len = required_size;
+    return ESP_OK;
+}
+
+esp_err_t ClassroomScheduleApp::saveCacheJsonToNvs(const char *json)
+{
+    if (json == NULL || json[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(CLASSROOM_SCHEDULE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_blob(handle, CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON, json, strlen(json));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    return err;
 }
 
 esp_err_t ClassroomScheduleApp::fetchScheduleJson(char *buffer, size_t buffer_size, size_t *json_len, int *http_status)
 {
     if (buffer == NULL || buffer_size == 0 || json_len == NULL || http_status == NULL) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!hasNetworkIp()) {
+        ESP_LOGW(TAG, "Skip schedule request because Wi-Fi has no IP address yet");
+        return ESP_ERR_INVALID_STATE;
     }
 
     char date[16];
@@ -448,30 +540,38 @@ esp_err_t ClassroomScheduleApp::parseScheduleJson(const char *json, size_t json_
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ScheduleData parsed = {};
-    bool ok = copy_json_string(root, "date", parsed.date, sizeof(parsed.date), true) &&
-              copy_json_string(root, "classroom", parsed.classroom, sizeof(parsed.classroom), true) &&
-              copy_json_string(root, "classroom_name", parsed.classroom_name, sizeof(parsed.classroom_name), false) &&
-              copy_json_string(root, "updated_at", parsed.updated_at, sizeof(parsed.updated_at), false);
+    ScheduleData *parsed = static_cast<ScheduleData *>(calloc(1, sizeof(ScheduleData)));
+    if (parsed == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool ok = copy_json_string(root, "date", parsed->date, sizeof(parsed->date), true) &&
+              copy_json_string(root, "classroom", parsed->classroom, sizeof(parsed->classroom), true) &&
+              copy_json_string(root, "classroom_name", parsed->classroom_name, sizeof(parsed->classroom_name), false) &&
+              copy_json_string(root, "updated_at", parsed->updated_at, sizeof(parsed->updated_at), false);
 
     cJSON *courses = cJSON_GetObjectItemCaseSensitive(root, "courses");
     if (!ok || !cJSON_IsArray(courses)) {
+        free(parsed);
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     const int course_count = cJSON_GetArraySize(courses);
     if (course_count < 0) {
+        free(parsed);
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    parsed.course_count = 0;
-    const int max_count = (course_count > (int)(sizeof(parsed.courses) / sizeof(parsed.courses[0]))) ?
-                          (int)(sizeof(parsed.courses) / sizeof(parsed.courses[0])) : course_count;
+    parsed->course_count = 0;
+    const int max_count = (course_count > (int)(sizeof(parsed->courses) / sizeof(parsed->courses[0]))) ?
+                          (int)(sizeof(parsed->courses) / sizeof(parsed->courses[0])) : course_count;
     for (int i = 0; i < max_count; ++i) {
         cJSON *item = cJSON_GetArrayItem(courses, i);
         if (!cJSON_IsObject(item)) {
+            free(parsed);
             cJSON_Delete(root);
             return ESP_ERR_INVALID_RESPONSE;
         }
@@ -482,20 +582,22 @@ esp_err_t ClassroomScheduleApp::parseScheduleJson(const char *json, size_t json_
             !copy_json_string(item, "name", course.name, sizeof(course.name), true) ||
             !copy_json_string(item, "teacher", course.teacher, sizeof(course.teacher), false) ||
             !copy_json_string(item, "group", course.group, sizeof(course.group), false)) {
+            free(parsed);
             cJSON_Delete(root);
             return ESP_ERR_INVALID_RESPONSE;
         }
-        parsed.courses[parsed.course_count++] = course;
+        parsed->courses[parsed->course_count++] = course;
     }
 
-    if (parsed.updated_at[0] == '\0') {
-        copy_string(parsed.updated_at, sizeof(parsed.updated_at), parsed.date);
+    if (parsed->updated_at[0] == '\0') {
+        copy_string(parsed->updated_at, sizeof(parsed->updated_at), parsed->date);
     }
-    if (parsed.classroom_name[0] == '\0') {
-        copy_string(parsed.classroom_name, sizeof(parsed.classroom_name), parsed.classroom);
+    if (parsed->classroom_name[0] == '\0') {
+        copy_string(parsed->classroom_name, sizeof(parsed->classroom_name), parsed->classroom);
     }
 
-    *data = parsed;
+    *data = *parsed;
+    free(parsed);
     cJSON_Delete(root);
     return ESP_OK;
 }
@@ -512,20 +614,46 @@ esp_err_t ClassroomScheduleApp::loadCachedSchedule(ScheduleData *data)
     }
 
     size_t json_len = 0;
-    esp_err_t err = loadCacheJson(json, CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1, &json_len);
+    esp_err_t err = loadCacheJsonFromNvs(json, CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1, &json_len);
     if (err == ESP_OK) {
-        err = parseScheduleJson(json, json_len, data);
+        err = parseCachedScheduleJson(json, json_len, data);
         if (err == ESP_OK) {
-            data->from_cache = true;
-            char cached_updated[sizeof(data->updated_at)];
-            if (loadCacheUpdatedAt(cached_updated, sizeof(cached_updated))) {
-                copy_string(data->updated_at, sizeof(data->updated_at), cached_updated);
-            }
+            free(json);
+            return ESP_OK;
+        }
+    }
+
+    esp_err_t fallback_err = loadCacheJsonFromSpiffs(json, CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1, &json_len);
+    if (fallback_err == ESP_OK) {
+        fallback_err = parseCachedScheduleJson(json, json_len, data);
+        if (fallback_err == ESP_OK) {
+            free(json);
+            return ESP_OK;
         }
     }
 
     free(json);
-    return err;
+    return err != ESP_OK ? err : fallback_err;
+}
+
+esp_err_t ClassroomScheduleApp::parseCachedScheduleJson(const char *json, size_t json_len, ScheduleData *data)
+{
+    esp_err_t err = parseScheduleJson(json, json_len, data);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (_classroom[0] != '\0' && strcmp(data->classroom, _classroom) != 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    data->from_cache = true;
+    char cached_updated[sizeof(data->updated_at)];
+    if (loadCacheUpdatedAt(cached_updated, sizeof(cached_updated))) {
+        copy_string(data->updated_at, sizeof(data->updated_at), cached_updated);
+    }
+
+    return ESP_OK;
 }
 
 void ClassroomScheduleApp::getToday(char *date, size_t date_size) const
@@ -1067,7 +1195,11 @@ void ClassroomScheduleApp::updateFromWorker(const RefreshResult &result)
         return;
     }
 
-    if (esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS)) != ESP_OK) {
+    esp_err_t lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS));
+    if (lock_err != ESP_OK && !_closing) {
+        lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS));
+    }
+    if (lock_err != ESP_OK) {
         ESP_LOGW(TAG, "Skip schedule UI update because LVGL lock timed out");
         return;
     }
@@ -1136,6 +1268,8 @@ void ClassroomScheduleApp::refreshTask(void *arg)
                 result.data = cached;
                 result.used_cache = true;
                 result.has_data = true;
+                ESP_LOGW(TAG, "Using schedule cache after request failed: request=%s, http=%d",
+                         esp_err_to_name(result.err), result.http_status);
             } else if (result.http_status == 401 || result.http_status == 403) {
                 copy_string(result.detail, sizeof(result.detail), "服务器拒绝访问，请检查 token 配置。");
             } else if (result.err == ESP_ERR_INVALID_SIZE) {
@@ -1143,7 +1277,9 @@ void ClassroomScheduleApp::refreshTask(void *arg)
             } else if (result.err == ESP_ERR_INVALID_RESPONSE) {
                 copy_string(result.detail, sizeof(result.detail), "服务器响应异常，请检查接口格式。");
             } else {
-                copy_string(result.detail, sizeof(result.detail), "无法获取课表，且本地没有可用缓存。");
+                ESP_LOGW(TAG, "No usable schedule cache: request=%s, cache=%s, http=%d",
+                         esp_err_to_name(result.err), esp_err_to_name(cache_err), result.http_status);
+                copy_string(result.detail, sizeof(result.detail), "无法获取课表，暂无缓存。请检查网络或服务器后重试。");
             }
         }
 
@@ -1197,7 +1333,11 @@ void ClassroomScheduleApp::saveClassroomEventCb(lv_event_t *e)
     }
 
     app->setKeyboardVisible(false);
+    app->_schedule = {};
+    app->_has_schedule = false;
+    app->clearCourseList();
     app->updateClassroomLabel();
+    app->setViewState(VIEW_IDLE, "教室已保存", "正在刷新今天的课表。", CLASSROOM_SCHEDULE_COLOR_PRIMARY);
     app->startRefresh();
 }
 

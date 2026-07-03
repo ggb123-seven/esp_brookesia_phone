@@ -68,9 +68,13 @@ private:
     bool loadCacheUpdatedAt(char *updated_at, size_t updated_at_size);
     bool saveCacheUpdatedAt(const char *updated_at);
     esp_err_t loadCacheJson(char *buffer, size_t buffer_size, size_t *json_len);
+    esp_err_t loadCacheJsonFromSpiffs(char *buffer, size_t buffer_size, size_t *json_len);
     esp_err_t saveCacheJson(const char *json);
+    esp_err_t loadCacheJsonFromNvs(char *buffer, size_t buffer_size, size_t *json_len);
+    esp_err_t saveCacheJsonToNvs(const char *json);
     esp_err_t fetchScheduleJson(char *buffer, size_t buffer_size, size_t *json_len, int *http_status);
     esp_err_t parseScheduleJson(const char *json, size_t json_len, ScheduleData *data);
+    esp_err_t parseCachedScheduleJson(const char *json, size_t json_len, ScheduleData *data);
     esp_err_t loadCachedSchedule(ScheduleData *data);
     void getToday(char *date, size_t date_size) const;
     void getNowText(char *text, size_t text_size) const;

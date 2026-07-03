@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_check.h"
 #include "esp_memory_utils.h"
@@ -78,6 +79,8 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static char st_wifi_ssid[32];
 static char st_wifi_password[64];
+static TaskHandle_t s_sntp_task = NULL;
+static bool s_sntp_done = false;
 
 static uint8_t base_mac_addr[6] = {0};
 static char mac_str[18] = {0};
@@ -99,7 +102,7 @@ LV_IMG_DECLARE(img_wifi_connect_success);
 LV_IMG_DECLARE(img_wifi_connect_fail);
 
 typedef enum {
-    WIFI_EVENT_CONNECTED = BIT(0),
+    WIFI_EVENT_GOT_IP = BIT(0),
     WIFI_EVENT_INIT_DONE = BIT(1),
     WIFI_EVENT_UI_INIT_DONE = BIT(2),
     WIFI_EVENT_SCANING = BIT(3)
@@ -111,6 +114,15 @@ extern lv_obj_t *ui_Hour;
 extern lv_obj_t *ui_Sec;
 extern lv_obj_t *ui_Date;
 extern lv_obj_t *ui_Clock_Number;
+
+static void sntpInitTask(void *arg)
+{
+    (void)arg;
+    app_sntp_init();
+    s_sntp_done = true;
+    s_sntp_task = NULL;
+    vTaskDelete(NULL);
+}
 
 AppSettings::AppSettings():
     ESP_Brookesia_PhoneApp("Settings", &img_app_setting, false),                  // auto_resize_visual_area
@@ -480,7 +492,7 @@ void AppSettings::updateUiByNvsParam(void)
 esp_err_t AppSettings::initWifi()
 {
     s_wifi_event_group = xEventGroupCreate();
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_SCANING);
     if(!(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_UI_INIT_DONE)) {
@@ -500,6 +512,12 @@ esp_err_t AppSettings::initWifi()
                                                         &wifiEventHandler,
                                                         this,
                                                         &instance_any_id));
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifiEventHandler,
+                                                        this,
+                                                        &instance_got_ip));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -533,10 +551,25 @@ void AppSettings::scanWifiAndUpdateUi(void)
     uint16_t ap_count = 0;
     memset(ap_info, 0, sizeof(ap_info));
 
-    esp_wifi_start();
-    esp_wifi_scan_start(NULL, true);
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
-    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
+    esp_err_t ret = esp_wifi_start();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "Start Wi-Fi before scan returned %s", esp_err_to_name(ret));
+    }
+    ret = esp_wifi_scan_start(NULL, true);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_wifi_scan_get_ap_num(&ap_count);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Get Wi-Fi AP count failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_wifi_scan_get_ap_records(&number, ap_info);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Get Wi-Fi AP records failed: %s", esp_err_to_name(ret));
+        return;
+    }
 #if ENABLE_DEBUG_LOG
     ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
 #endif
@@ -647,8 +680,15 @@ void AppSettings::euiRefresTask(void *arg)
         esp_lv_adapter_unlock();
 
         // Update WiFi icon state
-        if((xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_CONNECTED)) {
-            app_sntp_init();
+        if((xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_GOT_IP)) {
+            if (!s_sntp_done && s_sntp_task == NULL) {
+                BaseType_t ret = xTaskCreate(sntpInitTask, "SNTP Init", WIFI_CONNECT_TASK_STACK_SIZE, NULL,
+                                             WIFI_CONNECT_TASK_PRIORITY, &s_sntp_task);
+                if (ret != pdPASS) {
+                    ESP_LOGW(TAG, "Failed to create SNTP init task");
+                    s_sntp_task = NULL;
+                }
+            }
 
             esp_lv_adapter_lock(-1);
             if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_NONE) {
@@ -716,7 +756,9 @@ void AppSettings::wifiScanTask(void *arg)
     while (true) {
         if((xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_INIT_DONE) &&
            (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_UI_INIT_DONE)){
+            esp_lv_adapter_lock(-1);
             lv_obj_add_flag(ui_SwitchPanelScreenSettingWiFiSwitch, LV_OBJ_FLAG_CLICKABLE);
+            esp_lv_adapter_unlock();
             xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
             xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_UI_INIT_DONE);
         }
@@ -771,12 +813,12 @@ void AppSettings::wifiConnectTask(void *arg)
     esp_wifi_connect();
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_EVENT_CONNECTED,
+            WIFI_EVENT_GOT_IP,
             pdFALSE,
             pdFALSE,
             pdMS_TO_TICKS(WIFI_CONNECT_RET_WAIT_TIME_MS));
 
-    if (bits & WIFI_EVENT_CONNECTED) {
+    if (bits & WIFI_EVENT_GOT_IP) {
         ESP_LOGI(TAG, "Connected successfully");
 
         if (!app->_is_ui_del) {
@@ -831,14 +873,19 @@ void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32
     AppSettings *app = (AppSettings *)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
         ESP_LOGI(TAG, "connected to ap SSID:%s.", st_wifi_ssid);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
         ESP_LOGI(TAG, "disconnected from ap SSID:%s.", st_wifi_ssid);
         memset(st_wifi_ssid, 0, sizeof(st_wifi_ssid));
 
         // app->back();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
+        ESP_LOGI(TAG, "got IP address for SSID:%s.", st_wifi_ssid);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
+        ESP_LOGW(TAG, "lost IP address for SSID:%s.", st_wifi_ssid);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
         if(lv_obj_has_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN) &&
            xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
@@ -965,7 +1012,7 @@ void AppSettings::onSwitchPanelScreenSettingWiFiSwitchValueChangeEventCallback( 
         app->setNvsParam(NVS_KEY_WIFI_ENABLE, 0);
         if (app->_screen_index == UI_WIFI_SCAN_INDEX) {
             app->stopWifiScan();
-            if (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_CONNECTED) {
+            if (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_GOT_IP) {
                 ESP_ERROR_CHECK(esp_wifi_disconnect());
                 app->status_bar->setWifiIconState(0);
             }
