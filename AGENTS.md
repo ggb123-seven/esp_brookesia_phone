@@ -61,3 +61,22 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
   launcher/app 注册代码时要保留这个覆盖逻辑。
 - 新增或修改中文文案时，需要同步更新或重新生成 fingerprint 字体子集，确保每个新增
   中文字符都被包含；完工前用 `idf.py build` 和字体覆盖检查验证。
+
+## 教室课表 App 调试记录
+
+- 课表 App 当前是 ESP32 显示客户端；`tools/mock_classroom_schedule_server.py`
+  只返回测试课表，不是真实学校课表。真实课表需要后续服务器中间层登录/访问
+  WebVPN/EAMS，并按固件约定的 JSON 合同输出。
+- 课表 App 使用应用本地字体
+  `components/apps/classroom_schedule/classroom_schedule_font_20.c`。如果接口返回新的中文
+  课程名、教师名、班级名或教室名，必须重新生成该字体子集；否则 LVGL 会把缺字显示成
+  空格、方框或乱码。完工前至少检查源码文案和 mock/接口样例中的中文缺字数为 0。
+- Wi-Fi 显示“已连接”不等于网络请求一定可用。课表请求前需要确认 STA 已拿到 IP；
+  Settings App 连接成功状态应以 `IP_EVENT_STA_GOT_IP` 为准，而不是仅以
+  `WIFI_EVENT_STA_CONNECTED` 为准。
+- 课表后台任务解析 JSON 时不要把较大的 `ScheduleData`、响应缓冲或整表临时数组放在任务栈上。
+  曾出现 `ClassSchedule` 任务 `Stack protection fault` 蓝屏；修复方式是加大任务栈并把较大的解析
+  临时结构放到堆上，所有分配都要检查并在失败路径释放。
+- 调试“连上 Wi-Fi 但无课表”时，先确认三件事：设备 IP、服务器监听地址/端口、mock 接口
+  `A101` 是否能用 `curl` 返回 JSON；再看串口是否有 `Skip schedule request because Wi-Fi has no IP address yet`
+  或 HTTP/JSON 解析错误。

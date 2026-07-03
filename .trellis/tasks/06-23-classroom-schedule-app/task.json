@@ -1,0 +1,47 @@
+{
+  "id": "classroom-schedule-app",
+  "name": "classroom-schedule-app",
+  "title": "教室今日课程联网展示 App",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "ZQYuan",
+  "assignee": "ZQYuan",
+  "createdAt": "2026-06-23",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": "06d2fbc",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "components/apps/classroom_schedule/ClassroomScheduleApp.cpp",
+    "components/apps/classroom_schedule/ClassroomScheduleApp.hpp",
+    "components/apps/classroom_schedule/classroom_schedule_font_20.c",
+    "components/apps/setting/Setting.cpp",
+    "tools/mock_classroom_schedule_server.py",
+    "sdkconfig.defaults"
+  ],
+  "notes": "2026-07-03: 已完成课表 App 联网链路的 mock 验证并提交本地 Git。当前显示的是 mock 测试课表，不是真实学校课表；下一步需要实现服务器中间层访问 WebVPN/EAMS 并输出约定 JSON。今日修复了 Wi-Fi 已连接但未必拿到 IP、课表 JSON 解析任务栈溢出、中文字体缺字、缓存回退和 mock 服务器配置等问题。",
+  "meta": {
+    "lastValidatedAt": "2026-07-03",
+    "lastWorkCommit": "06d2fbc",
+    "validation": [
+      "idf.py build",
+      "idf.py -p COM3 flash",
+      "curl mock schedule endpoint",
+      "serial monitor confirmed Wi-Fi got IP and no repeated Guru Meditation after stack fix"
+    ],
+    "nextSteps": [
+      "实现真实课表服务器中间层，负责 WebVPN/EAMS 登录、会话维护和课表解析",
+      "将服务器输出保持为当前固件约定 JSON: date, classroom, classroom_name, updated_at, courses[]",
+      "真实接口返回新中文字段时重新生成 classroom_schedule_font_20.c"
+    ]
+  }
+}

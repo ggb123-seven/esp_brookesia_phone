@@ -1,0 +1,5 @@
+{"date":"2026-07-03","type":"quality-check","status":"pass","checks":["读取 Trellis 任务上下文和 frontend/backend 规范。","确认 LVGL 后台任务 UI 更新仍通过 esp_lv_adapter_lock。","确认新增 mock server 不依赖第三方包。","确认课表中文字体覆盖源码与 mock server 当前中文，missing=0。"],"commit":"06d2fbc"}
+{"date":"2026-07-03","type":"build","status":"pass","command":"idf.py build","result":"Project build complete; esp_brookesia_demo.bin size 0x59b8d0, app partition free 0x364730 (38%).","commit":"06d2fbc"}
+{"date":"2026-07-03","type":"flash","status":"pass","command":"idf.py -p COM3 flash","result":"Flash completed, hash verified, hard reset done.","commit":"06d2fbc"}
+{"date":"2026-07-03","type":"hardware-observation","status":"partial","result":"串口确认 Wi-Fi 子系统启动、STA 获取 IP 10.34.88.188，修复版未再复现 ClassSchedule 栈保护崩溃。用户仍需最终确认课表 UI 缺字是否完全消失。","commit":"06d2fbc"}
+{"date":"2026-07-03","type":"known-limit","status":"open","result":"当前课表数据来自 tools/mock_classroom_schedule_server.py 的固定测试数据，不是真实学校课表。真实课表接入需要后续服务器中间层。"}
