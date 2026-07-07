@@ -8,8 +8,7 @@
     "IDF_TARGET": "esp32p4",
     "IDF_TOOLS_PATH": "C:\\Espressif",
     "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\tools\\python\\v5.5.4\\venv",
-    "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts",
-    "OPENOCD_USB_ADAPTER_LOCATION": "4-1"
+    "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts"
   },
   "cmake.configureOnOpen": false,
   "cmake.configureOnEdit": false,

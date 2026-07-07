@@ -504,3 +504,104 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: 真实课表服务器中间层接入真实 EAMS 教室占用
+
+**Date**: 2026-07-05
+**Task**: 真实课表服务器中间层
+**Branch**: `main`
+
+### Summary
+
+完成本地 Python 课表中间层的真实 EAMS 教室资源 provider 验证。服务端可通过人工登录后的未提交会话配置访问 WebVPN/EAMS 教室资源页面，解析指定教室当天占用节次，并按 ESP32 课表 App 现有 JSON 合同输出。
+
+### Main Changes
+
+- 新增 `tools/real_classroom_schedule_server.py`，支持 `/health`、`/classroom-schedule/today`、token 校验、缓存降级、fixture provider、manual-session provider 和 `eams-room-occupancy` provider。
+- 新增脱敏 fixture：`tools/fixtures/classroom_schedule_fixture.json`。
+- 新增运行说明：`tools/real_classroom_schedule_server.txt`，记录本地运行、自测、人工会话导入和真实 EAMS provider 用法。
+- 已确认真实 EAMS 页面可解析 `尔雅103` 在 `2026-07-05` 的占用节次，当前输出为“占用节次”，不是课程名/教师名明细。
+- 私密配置保存在 `.local-secrets/eams-session.json`，不提交账号、密码、Cookie、JSESSIONID、token 或完整 WebVPN 会话 URL。
+
+### Testing
+
+- [OK] `python -m py_compile tools/real_classroom_schedule_server.py`
+- [OK] `python tools/real_classroom_schedule_server.py --self-test --fixture tools/fixtures/classroom_schedule_fixture.json`
+- [OK] `python tools/real_classroom_schedule_server.py --probe-eams-provider --eams-login-file .local-secrets/eams-login.json --session-file .local-secrets/eams-session.json --upstream-timeout-seconds 12`
+- [OK] 本地 HTTP 服务 `eams-room-occupancy` provider：`/health` 返回 200，`/classroom-schedule/today` 返回真实占用 JSON，错误 token 返回 401。
+- [OK] `git diff --check`
+
+### Status
+
+[OK] **Implementation verified**
+
+### Next Steps
+
+- 如需课程名、教师名和班级明细，需要继续寻找 EAMS 对应课程排课明细入口；当前教室资源页只能稳定提供占用节次。
+
+
+## Session 11: 真实 EAMS 课程明细解析与占用降级
+
+**Date**: 2026-07-05
+**Task**: 真实课表服务器中间层
+**Branch**: `main`
+
+### Summary
+
+补充真实 EAMS `stdSyllabus!search.action` 全校开课查询解析：当目标教室和日期能在全校开课结果中匹配到课程排课时，服务输出课程名、教师和教学班；若只有教室资源占用表有记录，则继续降级输出占用节次。
+
+### Main Changes
+
+- `eams-room-occupancy` provider 现在优先分页读取全校开课查询，解析 `contents[lessonId]` 中的教师、星期、节次、周次和教室。
+- 新增课程明细解析逻辑，将全校开课表格中的课程名和教学班映射为固件 JSON 的 `name` 和 `group`。
+- 保留教室资源占用表兜底，覆盖 EAMS 无课程明细但教室确实被占用的情况。
+- 新增 `stdSyllabus` 解析自测，覆盖 HTML 属性顺序、周次匹配、单双周和无明细降级边界。
+
+### Testing
+
+- [OK] `python -m py_compile tools/real_classroom_schedule_server.py`
+- [OK] `尔雅103` / `2026-06-29` 真实 probe 返回课程明细：`组织行为学`、`符萌萌`、`班级:会计25-3 会计25-4 会计25-5`。
+- [OK] `尔雅103` / `2026-07-05` 真实 probe 降级返回 `第5-7节占用`；已确认教室占用页单元格无详情链接、tooltip 或隐藏明细。
+
+### Status
+
+[OK] **Course detail support added with occupancy fallback**
+
+### Next Steps
+
+- 如后续需要解释非课程占用来源，需要继续寻找 EAMS 的考试、临时借用或活动占用明细入口；当前学生侧菜单未暴露可解析的对应详情接口。
+
+
+## Session 12: 真实课表中间层完工检查与云服务器暂停点
+
+**Date**: 2026-07-05
+**Task**: 真实课表服务器中间层
+**Branch**: `main`
+
+### Summary
+
+完成真实课表服务器中间层的本地完工检查，并定位 ESP32 联网后仍显示“离线缓存”的原因：设备已联网，但固件默认请求 `10.34.88.246:8080`，该地址当前 `/health` 与课表接口访问超时，导致课表 App 按设计回退到本地缓存。
+
+### Main Changes
+
+- 复查课表 App 刷新逻辑：`hasNetworkIp()` 只判断 STA 是否拿到 IP；HTTP 请求失败时会调用 `loadCachedSchedule()` 并显示“离线缓存”。
+- 确认当前固件默认配置仍为 `CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST="10.34.88.246"`、端口 `8080`、token `change-me`。
+- 从本机访问 `http://10.34.88.246:8080/health` 和 `/classroom-schedule/today` 均超时，说明当前问题是服务器地址/公网访问/端口放行未完成，不是 JSON 合同或本地缓存逻辑错误。
+- 清理 `python -m py_compile` 生成的 `tools/__pycache__`，避免提交临时产物。
+
+### Testing
+
+- [OK] `python -B -X utf8 tools/real_classroom_schedule_server.py --self-test --fixture tools/fixtures/classroom_schedule_fixture.json`
+- [OK] `git diff --check`
+- [OK] `git status --short --untracked-files=all` 确认仅剩任务相关新增文件、journal 更新和既有 `.vscode/settings.json` 本地改动。
+
+### Status
+
+[OK] **Local implementation verified; cloud deployment remains**
+
+### Next Steps
+
+- 明天在云服务器上以 `--host 0.0.0.0 --port 8080` 启动真实课表服务，并确认安全组/防火墙放行 TCP 8080。
+- 用云服务器公网 IP 或域名从本机验证 `/health` 和 `/classroom-schedule/today`。
+- 将固件课表服务器 host/token 配置切到云服务器公网地址和一致 token，重新构建、刷机，并确认 ESP32 不再回退“离线缓存”。

@@ -28,6 +28,10 @@
 #include "mq2_service.h"
 #endif
 
+#if CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
+#include "parent_call_alert_service.h"
+#endif
+
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
 #include "as608_validation.h"
 #endif
@@ -147,6 +151,47 @@ extern "C" void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start MQ-2 service: %s", esp_err_to_name(err));
     }
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
+    parent_call_alert_service_config_t parent_call_config = {
+        .server_host = CONFIG_EXAMPLE_PARENT_CALL_ALERT_SERVER_HOST,
+        .server_port = CONFIG_EXAMPLE_PARENT_CALL_ALERT_SERVER_PORT,
+        .api_path = CONFIG_EXAMPLE_PARENT_CALL_ALERT_API_PATH,
+        .token = CONFIG_EXAMPLE_PARENT_CALL_ALERT_TOKEN,
+        .cooldown_ms = CONFIG_EXAMPLE_PARENT_CALL_ALERT_COOLDOWN_MS,
+        .http_timeout_ms = CONFIG_EXAMPLE_PARENT_CALL_ALERT_REQUEST_TIMEOUT_MS,
+        .air780e_phone_number = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_PHONE_NUMBER,
+        .air780e_uart_num = (uart_port_t)CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_UART_NUM,
+        .air780e_tx_gpio = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_TX_GPIO,
+        .air780e_rx_gpio = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_RX_GPIO,
+        .air780e_baud_rate = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_BAUD_RATE,
+        .air780e_command_timeout_ms = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_COMMAND_TIMEOUT_MS,
+        .air780e_call_hold_ms = CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_CALL_HOLD_MS,
+        .task_stack_size = CONFIG_EXAMPLE_PARENT_CALL_ALERT_TASK_STACK_SIZE,
+        .task_priority = CONFIG_EXAMPLE_PARENT_CALL_ALERT_TASK_PRIORITY,
+        .queue_length = CONFIG_EXAMPLE_PARENT_CALL_ALERT_QUEUE_LENGTH,
+        .enabled = true,
+#if CONFIG_EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_HTTP
+        .transport = PARENT_CALL_ALERT_TRANSPORT_HTTP,
+#elif CONFIG_EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT
+        .transport = PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT,
+#else
+        .transport = PARENT_CALL_ALERT_TRANSPORT_MOCK,
+#endif
+    };
+    err = parent_call_alert_service_init(&parent_call_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start parent call alert service: %s", esp_err_to_name(err));
+    }
+#if CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_SELF_TEST_ON_BOOT
+    else {
+        err = parent_call_alert_service_air780e_self_test();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Air780E self-test failed: %s", esp_err_to_name(err));
+        }
+    }
+#endif
 #endif
 
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION

@@ -1,0 +1,226 @@
+# 真实课表服务器中间层运行说明
+
+`tools/real_classroom_schedule_server.py` 是给 ESP32-P4 教室课表 App 使用的服务器中间层。它对设备保持现有 HTTP JSON 合同，同时把 WebVPN/EAMS 登录、会话维护、页面/API 解析和缓存降级留在服务器侧。
+
+首版 MVP 使用 Python 标准库实现，默认运行 `fixture` provider；真实学校系统接入以 `manual-session` provider 边界预留，等待人工会话材料或后续登录流程确认。
+
+## 配置
+
+环境变量示例：
+
+```bash
+export SCHEDULE_HOST=0.0.0.0
+export SCHEDULE_PORT=8080
+export SCHEDULE_API_PATH=/classroom-schedule/today
+export SCHEDULE_API_TOKEN=change-me-local-only
+export SCHEDULE_PROVIDER=fixture
+export SCHEDULE_FIXTURE=tools/fixtures/classroom_schedule_fixture.json
+export SCHEDULE_CACHE_TTL_SECONDS=600
+export SCHEDULE_UPSTREAM_TIMEOUT_SECONDS=10
+```
+
+不要把真实 `SCHEDULE_API_TOKEN`、学校账号、密码、Cookie、JSESSIONID 或 WebVPN 会话 URL 写入 Git。云服务器上建议把这些值放在 shell profile、systemd environment file、Docker/进程管理器 secret，或其它未提交配置中。
+
+## 本地运行
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --token change-me-local-only \
+  --fixture tools/fixtures/classroom_schedule_fixture.json
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+课表查询：
+
+```bash
+curl "http://127.0.0.1:8080/classroom-schedule/today?classroom=A101&date=2026-07-05&token=change-me-local-only"
+```
+
+无课样例：
+
+```bash
+curl "http://127.0.0.1:8080/classroom-schedule/today?classroom=EMPTY&date=2026-07-05&token=change-me-local-only"
+```
+
+token 错误：
+
+```bash
+curl -i "http://127.0.0.1:8080/classroom-schedule/today?classroom=A101&token=wrong"
+```
+
+## 自测
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --self-test \
+  --fixture tools/fixtures/classroom_schedule_fixture.json
+```
+
+自测会验证：
+
+- fixture 能输出固件兼容 JSON。
+- 课程按开始时间排序。
+- `EMPTY` 返回空 `courses` 数组。
+- 未知教室返回空课表而不是解析失败。
+- 非法日期会被拒绝。
+- 未知路径返回 `404 not_found`。
+- 上游失败且缓存可用时返回带 `cached: true` 的缓存课表。
+- `manual-session` provider 可通过假上游解析 JSON 响应和 HTML 内嵌 JSON 响应。
+
+## 脱敏探测 WebVPN/EAMS
+
+真实接入前，可以用 `--probe-eams` 检查本地私密配置是否已经足够访问上游。该命令只输出脱敏摘要，不打印账号、密码、Cookie、JSESSIONID、token、完整 query 或完整 HTML：
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --probe-eams \
+  --eams-login-file .local-secrets/eams-login.json \
+  --session-file .local-secrets/eams-session.json \
+  --upstream-timeout-seconds 15
+```
+
+当前已确认辽宁工程技术大学统一身份认证页面包含 CAS 字段和密码加密盐，并且对已配置账号返回 `need_captcha: true`。因此不能在服务器后台直接绕过验证码做账号密码自动登录；需要先在浏览器人工完成验证码/滑块登录，再把最小必要的 WebVPN/EAMS 查询地址和 Cookie 写入未提交的 `eams-session.json`。
+
+探测输出里常见状态含义：
+
+- `login.need_captcha: true`：统一身份认证要求人工验证码/滑块。
+- `session.status: placeholder_upstream_url`：`eams-session.json` 的 `upstream_url` 仍是占位文本，还没有填浏览器登录后的真实 EAMS 查询地址。
+- `session.status: placeholder_headers`：`headers.Cookie` 仍是占位文本，还没有填人工导出的 Cookie。
+- `session.looks_like_login: true`：会话已失效或 Cookie 不完整，上游又跳回统一认证页。
+- `session.looks_like_eams: true`：会话能进入 EAMS 页面，可以继续根据 `links_sample`、`forms` 和 `interesting_lines` 定位真实教室课表查询入口。
+
+## 真实 EAMS 教室 Provider
+
+在用户人工通过 WebVPN/统一身份认证验证码后，可以使用 `eams-room-occupancy` provider 读取真实 EAMS 数据，并转换为固件兼容的 `courses[]`。
+
+该 provider 当前采用两级数据源：
+
+1. 优先读取 EAMS “全校开课查询” `stdSyllabus!search.action`，解析课程名、教师、教学班、星期、节次、周次和教室，输出与 fixture/mock 一样的课程明细字段。
+2. 如果目标日期/教室在全校开课查询中没有课程明细，则降级读取 EAMS “教室资源查询”占用表，只输出占用节次；例如 `第5-7节占用`。
+
+已验证示例：
+
+- `尔雅103` / `2026-06-29`：可返回课程名、教师、班级明细，例如 `组织行为学`、`符萌萌`、`班级:会计25-3 会计25-4 会计25-5`。
+- `尔雅103` / `2026-07-05`：教室资源表显示第 5-7 节占用，但全校开课查询无对应课程明细，且占用表单元格没有链接、tooltip 或隐藏详情字段；因此只能返回占用节次。
+
+先用脱敏探测验证本地会话能访问 EAMS：
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --probe-eams \
+  --eams-login-file .local-secrets/eams-login.json \
+  --session-file .local-secrets/eams-session.json \
+  --upstream-timeout-seconds 15
+```
+
+再用真实 provider 拉取一次样例结果：
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --probe-eams-provider \
+  --eams-login-file .local-secrets/eams-login.json \
+  --session-file .local-secrets/eams-session.json \
+  --upstream-timeout-seconds 12
+```
+
+启动真实 EAMS provider：
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --provider eams-room-occupancy \
+  --session-file .local-secrets/eams-session.json \
+  --token "$SCHEDULE_API_TOKEN" \
+  --upstream-timeout-seconds 12
+```
+
+`eams-session.json` 仍然必须放在未提交目录。除 `upstream_url` 和 `headers.Cookie` 外，真实占用 provider 支持这些非敏感配置：
+
+```json
+{
+  "first_week_start": "2026-03-02",
+  "buildings": {
+    "尔雅楼": "20"
+  },
+  "building_prefixes": {
+    "尔雅": "尔雅楼",
+    "尔雅楼": "尔雅楼"
+  }
+}
+```
+
+- `first_week_start`: EAMS 当前学期第 1 周周一日期，用于按查询日期计算 `iWeek`。
+- `buildings`: EAMS 楼宇名称到 `room.building.id` 的映射。当前已确认 `尔雅楼` 为 `20`。
+- `building_prefixes`: 将设备传入的短教室名映射为 EAMS 教室名；例如 `尔雅103` 会规范化为 `尔雅楼103`。
+- `semesterId` / `semester_id`: EAMS 学期 ID，当前验证为 `723`。
+- `projectId` / `project_id`: 全校开课查询项目 ID，当前验证为 `1`。
+- `syllabus_page_size`: 全校开课查询分页大小；默认 `500`，用于减少分页请求次数。
+
+## ESP32 固件配置
+
+固件端保持当前配置方式：
+
+- host: 云服务器公网 IP 或局域网 IP
+- port: `8080`
+- path: `/classroom-schedule/today`
+- token: 与服务器 `SCHEDULE_API_TOKEN` 一致
+
+MVP 可先用 `HTTP + IP:端口 + token` 跑通。后续有域名和证书后，再把传输层升级到 HTTPS 或反向代理。
+
+## 真实 WebVPN/EAMS 接入限制
+
+当前仓库已经确认 WebVPN/EAMS 人工会话、全校开课查询和教室资源查询链路。仍需注意以下限制：
+
+- 统一身份认证需要验证码，当前不绕过验证码；会话仍依赖人工浏览器登录后导入 Cookie。
+- 全校开课查询可以提供课程名、教师、教学班等明细，但并不覆盖所有教室占用。
+- 教室资源查询可以稳定提供占用节次，但页面单元格只含节次数字，没有课程名、教师、班级、链接或隐藏详情。
+- 因此某些占用可能只能显示为“第 N-M 节占用”，例如考试、临时借用、活动或非普通教学排课。
+
+因此 `manual-session` provider 当前采用“人工会话文件导入”的安全边界：
+
+```bash
+python tools/real_classroom_schedule_server.py \
+  --provider manual-session \
+  --session-file /opt/classroom-schedule/eams-session.json \
+  --upstream-timeout-seconds 10 \
+  --token "$SCHEDULE_API_TOKEN"
+```
+
+`eams-session.json` 必须放在未提交路径中。当前支持的最小格式：
+
+```json
+{
+  "upstream_url": "https://example.invalid/eams/classroom-schedule",
+  "query": {
+    "room": "{classroom}",
+    "day": "{date}"
+  },
+  "headers": {
+    "Cookie": "<browser-cookie-header>"
+  }
+}
+```
+
+- `upstream_url`: 浏览器人工登录后确认的 WebVPN/EAMS 查询地址。
+- `query`: 可选查询参数模板；`{classroom}` 和 `{date}` 会替换为 ESP32 请求传入的教室和日期。
+- `headers`: 可选上游请求头，通常用于人工导出的 Cookie；不要提交该文件。
+
+上游响应支持两种最小输入：
+
+- JSON：根对象直接包含 `classroom_name` 和 `courses`，或包在 `data` / `schedule` 对象中。
+- HTML：页面内包含 `<script id="classroom-schedule-json" type="application/json">...</script>`，脚本内容为上述 JSON。
+
+后续真实接入时建议先用浏览器人工登录 WebVPN/EAMS，导出最小必要会话材料到服务器本地配置，再根据学校页面实际结构补专用解析器，并用脱敏 fixture 固化测试样例。
+
+## 安全与日志
+
+- 服务启动时只打印脱敏 URL：`token=<redacted>`。
+- 错误响应只返回类别和可诊断短消息。
+- 不记录 query string、token、Cookie、JSESSIONID、完整 WebVPN URL、完整 HTML 或完整私有课表。
+- fixture 文件必须是人工构造或脱敏样例。

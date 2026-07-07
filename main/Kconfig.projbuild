@@ -99,6 +99,166 @@ menu "Example Configurations"
                 HTTP request timeout for one schedule refresh.
     endif
 
+    config EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
+        bool "Enable parent call alert service"
+        depends on EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR && EXAMPLE_ENABLE_MQ2_SERVICE
+        default y
+        help
+            Enabling this option starts the parent call alert service.
+            Keep Mock selected until the real phone module, SIM, antenna,
+            power supply, and UART wiring are ready.
+
+    if EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
+        config EXAMPLE_PARENT_CALL_ALERT_SERVER_HOST
+            string "Parent call alert server host"
+            default "10.34.88.246"
+            help
+                Server IP or host name. Do not include http:// or a path.
+
+        config EXAMPLE_PARENT_CALL_ALERT_SERVER_PORT
+            int "Parent call alert server port"
+            range 1 65535
+            default 8080
+            help
+                HTTP port used by the parent call alert middleware.
+
+        config EXAMPLE_PARENT_CALL_ALERT_API_PATH
+            string "Parent call alert API path"
+            default "/parent-call-alert/trigger"
+            help
+                HTTP POST path for alert events.
+
+        config EXAMPLE_PARENT_CALL_ALERT_TOKEN
+            string "Parent call alert API token"
+            default "change-me"
+            help
+                Shared access token sent in X-Alert-Token. Replace this in
+                menuconfig or sdkconfig before real deployment. Do not commit a
+                real token.
+
+        choice EXAMPLE_PARENT_CALL_ALERT_TRANSPORT
+            prompt "Parent call alert transport"
+            default EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_MOCK
+            help
+                Select MOCK until the real phone module or cloud voice middleware
+                is connected. HTTP sends POST requests to the configured endpoint.
+                Air780E AT sends ATD/ATH over UART and can place real calls when
+                the module/SIM/operator support voice service.
+
+            config EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_MOCK
+                bool "Mock/demo only"
+                help
+                    Record and display a simulated alert without network or phone dialing.
+
+            config EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_HTTP
+                bool "HTTP middleware"
+                help
+                    Send alert events to the configured HTTP middleware.
+
+            config EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT
+                bool "Air780E AT voice call"
+                help
+                    Send AT commands to an Air780E/Air780EHV-compatible module over UART.
+                    This mode sends ATD<number>; and ATH, so only enable it after
+                    confirming the module firmware, SIM card, antenna, and power rail
+                    support real voice calls. Do not use an IoT-only SIM card.
+        endchoice
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_PHONE_NUMBER
+            string "Air780E parent phone number"
+            default ""
+            help
+                Parent phone number used only by Air780E AT transport. Keep this
+                empty in committed defaults and set it locally before real dialing.
+                Digits are allowed, with an optional leading +.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_UART_NUM
+            int "Air780E UART port"
+            range 1 5
+            default 2
+            help
+                UART0 is reserved for the console. Avoid UART1 when AS608 is enabled.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_TX_GPIO
+            int "Air780E UART TX GPIO"
+            range 0 54
+            default 34
+            help
+                ESP32-P4 GPIO connected to Air780E RX. The default avoids the current
+                ESP-hosted SDIO Wi-Fi pins, AS608, DHT11, and MQ-2 defaults, but must
+                be changed to match the actual wiring.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_RX_GPIO
+            int "Air780E UART RX GPIO"
+            range 0 54
+            default 35
+            help
+                ESP32-P4 GPIO connected to Air780E TX. Change this to match the
+                actual wiring before enabling Air780E AT mode.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_BAUD_RATE
+            int "Air780E UART baud rate"
+            default 115200
+            help
+                Common Air780E AT examples use 115200 bps.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_COMMAND_TIMEOUT_MS
+            int "Air780E AT command timeout in milliseconds"
+            range 1000 30000
+            default 8000
+            help
+                Timeout for one Air780E AT command response.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_CALL_HOLD_MS
+            int "Air780E call hold time in milliseconds"
+            range 0 120000
+            default 15000
+            help
+                Time to keep the call active after ATD is accepted before sending ATH.
+
+        config EXAMPLE_PARENT_CALL_ALERT_AIR780E_SELF_TEST_ON_BOOT
+            bool "Run Air780E AT self-test on boot"
+            default n
+            help
+                When Air780E AT transport is selected, send only AT on boot to verify
+                UART communication. This does not dial the phone number.
+
+        config EXAMPLE_PARENT_CALL_ALERT_COOLDOWN_MS
+            int "Parent call alert cooldown in milliseconds"
+            range 0 3600000
+            default 300000
+            help
+                Cooldown after one successful alert request. Default is 5 minutes.
+
+        config EXAMPLE_PARENT_CALL_ALERT_REQUEST_TIMEOUT_MS
+            int "Parent call alert request timeout in milliseconds"
+            range 1000 30000
+            default 8000
+            help
+                HTTP request timeout for one alert trigger.
+
+        config EXAMPLE_PARENT_CALL_ALERT_TASK_STACK_SIZE
+            int "Parent call alert task stack size"
+            range 4096 16384
+            default 6144
+            help
+                Stack size for the alert HTTP worker task.
+
+        config EXAMPLE_PARENT_CALL_ALERT_TASK_PRIORITY
+            int "Parent call alert task priority"
+            range 1 10
+            default 5
+            help
+                FreeRTOS priority for the alert HTTP worker task.
+
+        config EXAMPLE_PARENT_CALL_ALERT_QUEUE_LENGTH
+            int "Parent call alert queue length"
+            range 1 16
+            default 4
+            help
+                Maximum pending alert events waiting for the worker task.
+    endif
+
     config EXAMPLE_ENABLE_AS608_VALIDATION
         bool "Enable AS608 hardware validation task"
         depends on !EXAMPLE_ENABLE_APP_FINGERPRINT

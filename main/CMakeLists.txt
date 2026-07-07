@@ -10,7 +10,8 @@ set(MAIN_REQUIRES
     heap
     lvgl__lvgl
     mq2
-    nvs_flash)
+    nvs_flash
+    parent_call_alert)
 
 if(CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION)
     list(APPEND MAIN_SRCS as608_validation.c)
