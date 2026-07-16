@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 9
-- **Last Active**: 2026-06-23
+- **Total Sessions**: 10
+- **Last Active**: 2026-07-16
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~501 | Active |
+| `journal-1.md` | ~709 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 10 | 2026-07-16 | 修复课表读取与楼宇中文显示 | `2ea0f30` | `main` |
 | 9 | 2026-06-23 | 完善课堂课表与设置应用交互 | `6f17c13` | `main` |
 | 8 | 2026-06-22 | 闪屏原因补充：DHT11 旧读取路径阻塞显示刷新 | - | `main` |
 | 7 | 2026-06-22 | 环境检测 App 与 DHT11 RMT 完工检查 | - | `main` |

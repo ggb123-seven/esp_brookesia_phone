@@ -605,3 +605,105 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 - 明天在云服务器上以 `--host 0.0.0.0 --port 8080` 启动真实课表服务，并确认安全组/防火墙放行 TCP 8080。
 - 用云服务器公网 IP 或域名从本机验证 `/health` 和 `/classroom-schedule/today`。
 - 将固件课表服务器 host/token 配置切到云服务器公网地址和一致 token，重新构建、刷机，并确认 ESP32 不再回退“离线缓存”。
+
+## Session 13: 真实课表中间层告警接收验证与兼容性收口
+
+**Date**: 2026-07-08
+**Task**: 真实课表服务器中间层
+**Branch**: `main`
+
+### Summary
+
+继续推进真实课表服务器中间层，重点验证新增的 `POST /parent-call-alert/trigger` 告警接收端，并修复本机进程级 curl 验证时发现的 JSON body 兼容性问题。
+
+### Main Changes
+
+- `tools/real_classroom_schedule_server.py` 的告警请求体解码从 `utf-8` 调整为 `utf-8-sig`，兼容 Windows/脚本生成的带 BOM JSON 文件。
+- 自测新增带 BOM 告警 JSON 请求，防止后续再次出现同类兼容性问题。
+- 重新确认告警接口仍只记录 `reason` 和字段长度，不记录完整 `detail` / `message`、`X-Alert-Token` 或原始请求体。
+
+### Testing
+
+- [OK] `python -B -X utf8 tools/real_classroom_schedule_server.py --self-test --fixture tools/fixtures/classroom_schedule_fixture.json`
+- [OK] 本机真实进程级验证 `/health` 返回 200。
+- [OK] 本机真实进程级验证 `/classroom-schedule/today` 成功课表响应、错误 token `401 unauthorized`。
+- [OK] 本机真实进程级验证 `/parent-call-alert/trigger` 成功返回 `accepted`，错误 `X-Alert-Token` 返回 `401 unauthorized`。
+- [OK] `git diff --check`
+
+### Status
+
+[OK] **Local middleware and alert receiver verified**
+
+### Next Steps
+
+- 云服务器上启动中间层并配置公网可访问 host/port、`SCHEDULE_API_TOKEN`、`PARENT_CALL_ALERT_API_TOKEN`、安全组/防火墙。
+- 固件端把课表 host/token 和家长电话告警 HTTP transport token 切到云端一致配置后，重新构建刷机并做硬件联调。
+
+## Session 14: Windows 本机课表服务双击启动与登录自启动
+
+**Date**: 2026-07-14
+**Task**: 真实课表服务器中间层
+**Branch**: `main`
+
+### Summary
+
+将真实课表中间层从云端部署暂停点切换为 Windows 局域网优先方案，复用桌面已有批处理配置，补齐自动 IP、EAMS 会话检查、双击启动和登录自启动。
+
+### Main Changes
+
+- 新增 `tools/windows/start_classroom_schedule_server.ps1`，集中处理 Python、物理网卡 IPv4、配置文件、EAMS 会话、端口和服务启动。
+- 修复隧道虚拟网卡抢占默认路由的问题：排除 `Meta Tunnel` 后正确选择 WLAN `10.96.111.246`。
+- EAMS 探测改为独立隐藏子进程并设置总超时；失败时清理子进程，不输出 Cookie、JSESSIONID 或 token。
+- 新增桌面 `.bat` 模板、本地配置示例和可逆的 Windows Startup 快捷方式安装器。
+- 更新 OneDrive 桌面现有启动脚本和配置；本地敏感 token 原值保持不变。
+
+### Testing
+
+- [OK] 两个 PowerShell 脚本通过语法解析。
+- [OK] fixture `--check-only` 自动识别 WLAN 地址 `10.96.111.246`。
+- [OK] 隔离端口启动完整链路，`/health` 返回成功，`A101` 返回 3 条 fixture 课程。
+- [OK] Windows Startup 快捷方式存在，目标、`--autostart` 参数和最小化窗口配置正确。
+- [LIMITED] 真实 EAMS 会话探测在总时限内超时，未把网络超时误判为会话过期。
+
+### Status
+
+[OK] **Windows local launcher ready; EAMS reachability still needs confirmation**
+
+### Next Steps
+
+- 在浏览器确认 WebVPN/EAMS 当前是否可访问；若会话已过期，人工登录后更新 `.local-secrets/eams-session.json`。
+- 再次双击桌面启动器或运行 `--check-only`，确认 `Session: valid`。
+- 服务成功运行后，把 ESP32 课表 host 设置为 `10.96.111.246`，进行构建、刷机和硬件联调。
+
+
+## Session 10: 修复课表读取与楼宇中文显示
+
+**Date**: 2026-07-16
+**Task**: 修复课表读取与楼宇中文显示
+**Branch**: `main`
+
+### Summary
+
+恢复真实 EAMS 课表链路，统一查询日期与响应校验，扩展 13 个楼宇映射，修复课程和 dropdown 中文字形及箭头显示，并完成构建、COM3 刷写和设备验收。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2ea0f30` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
