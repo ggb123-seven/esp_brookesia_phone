@@ -18,7 +18,9 @@
   "commit": "06d2fbc",
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "07-15-improve-schedule-classroom-date-input"
+  ],
   "parent": null,
   "relatedFiles": [
     "components/apps/classroom_schedule/ClassroomScheduleApp.cpp",

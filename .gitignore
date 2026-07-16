@@ -1,0 +1,9 @@
+# ESP-IDF build output
+build/
+
+# Python generated cache files
+__pycache__/
+*.py[cod]
+
+# Local credentials and browser session exports
+.local-secrets/

@@ -30,9 +30,12 @@ from urllib.error import HTTPError
 
 
 DEFAULT_PATH = "/classroom-schedule/today"
+DEFAULT_ALERT_PATH = "/parent-call-alert/trigger"
 DEFAULT_TOKEN = "change-me"
 DEFAULT_FIXTURE = Path(__file__).with_name("fixtures") / "classroom_schedule_fixture.json"
 MAX_COURSES = 16
+MAX_ALERT_BODY_BYTES = 2048
+ALERT_TEXT_RE = re.compile(r"^[\w .,:;!?+\-_/()\[\]\u4e00-\u9fff，。！？、；：（）【】]{0,160}$")
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RE = re.compile(r"^\d{2}:\d{2}$")
@@ -106,6 +109,11 @@ class ProviderUnavailable(ScheduleError):
 class UpstreamError(ScheduleError):
     status = HTTPStatus.BAD_GATEWAY
     code = "upstream_error"
+
+
+class PayloadTooLarge(ScheduleError):
+    status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    code = "payload_too_large"
 
 
 @dataclass
@@ -1279,6 +1287,41 @@ def single(query: dict[str, list[str]], name: str, default: str = "") -> str:
     return values[0]
 
 
+def validate_alert_text(value: Any, field: str, max_len: int) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise BadRequest(f"{field} must be a string")
+    text = value.strip()
+    if len(text) > max_len:
+        raise BadRequest(f"{field} is too long")
+    if not ALERT_TEXT_RE.fullmatch(text):
+        raise BadRequest(f"{field} contains unsupported characters")
+    return text
+
+
+def validate_alert_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise BadRequest("alert payload must be a JSON object")
+
+    reason = validate_alert_text(payload.get("reason"), "reason", 48)
+    detail = validate_alert_text(payload.get("detail"), "detail", 96)
+    message = validate_alert_text(payload.get("message"), "message", 160)
+    if not reason:
+        raise BadRequest("reason is required")
+
+    timestamp_ms = payload.get("timestamp_ms", 0)
+    if not isinstance(timestamp_ms, (int, float)) or timestamp_ms < 0:
+        raise BadRequest("timestamp_ms must be a non-negative number")
+
+    return {
+        "reason": reason,
+        "detail": detail,
+        "message": message,
+        "timestamp_ms": int(timestamp_ms),
+    }
+
+
 class ScheduleHandler(BaseHTTPRequestHandler):
     server_version = "ClassroomScheduleReal/0.1"
 
@@ -1303,6 +1346,18 @@ class ScheduleHandler(BaseHTTPRequestHandler):
             self.log_message("unexpected server error")
             self.send_error_json(ScheduleError("internal server error"))
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path != self.server.alert_path:
+                raise NotFound("not found")
+            self.handle_parent_call_alert()
+        except ScheduleError as exc:
+            self.send_error_json(exc)
+        except Exception:
+            self.log_message("unexpected alert server error")
+            self.send_error_json(ScheduleError("internal server error"))
+
     def handle_schedule(self, query: dict[str, list[str]]) -> None:
         token = single(query, "token")
         if token != self.server.api_token:
@@ -1321,6 +1376,49 @@ class ScheduleHandler(BaseHTTPRequestHandler):
                 self.send_json(cached)
                 return
             raise exc
+
+    def handle_parent_call_alert(self) -> None:
+        token = self.headers.get("X-Alert-Token", "")
+        if token != self.server.alert_token:
+            raise Unauthorized("invalid token")
+
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" not in content_type.lower():
+            raise BadRequest("content type must be application/json")
+
+        content_length_text = self.headers.get("Content-Length", "")
+        try:
+            content_length = int(content_length_text)
+        except ValueError as exc:
+            raise BadRequest("content length is required") from exc
+        if content_length <= 0:
+            raise BadRequest("request body is required")
+        if content_length > MAX_ALERT_BODY_BYTES:
+            raise PayloadTooLarge("alert payload is too large")
+
+        try:
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8-sig"))
+        except UnicodeDecodeError as exc:
+            raise BadRequest("request body must be UTF-8") from exc
+        except json.JSONDecodeError as exc:
+            raise BadRequest("request body must be valid JSON") from exc
+
+        alert = validate_alert_payload(payload)
+        now = updated_at_text()
+        self.log_message(
+            "parent call alert accepted reason=%s detail_len=%d message_len=%d",
+            alert["reason"],
+            len(alert["detail"]),
+            len(alert["message"]),
+        )
+        self.send_json(
+            {
+                "ok": True,
+                "status": "accepted",
+                "mode": self.server.alert_mode,
+                "received_at": now,
+            }
+        )
 
     def log_message(self, fmt: str, *args: object) -> None:
         message = fmt % args if args else fmt
@@ -1400,6 +1498,9 @@ def run_http_self_test(args: argparse.Namespace) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), ScheduleHandler)
     server.api_path = args.path
     server.api_token = "self-test-token"
+    server.alert_path = args.alert_path
+    server.alert_token = "self-test-alert-token"
+    server.alert_mode = args.alert_mode
     server.provider = provider
     server.cache = ScheduleCache(args.cache_ttl_seconds)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1441,6 +1542,96 @@ def run_http_self_test(args: argparse.Namespace) -> None:
         assert status == HTTPStatus.NOT_FOUND
         assert body["error"] == "not_found"
 
+        alert_body = json.dumps(
+            {
+                "reason": "mq2_alarm",
+                "detail": "MQ-2 detected smoke or combustible gas",
+                "message": "环境监测检测到烟雾或可燃气体异常，请及时确认。",
+                "timestamp_ms": 123456,
+            }
+        ).encode("utf-8")
+        alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=alert_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Alert-Token": "self-test-alert-token",
+            },
+            method="POST",
+        )
+        with urlopen(alert_request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            assert response.status == HTTPStatus.OK
+            assert body["ok"] is True
+            assert body["mode"] == args.alert_mode
+
+        bom_alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=b"\xef\xbb\xbf" + alert_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Alert-Token": "self-test-alert-token",
+            },
+            method="POST",
+        )
+        with urlopen(bom_alert_request, timeout=5) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            assert response.status == HTTPStatus.OK
+            assert body["ok"] is True
+
+        bad_alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=alert_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Alert-Token": "wrong",
+            },
+            method="POST",
+        )
+        status, body = read_json_url_request(bad_alert_request)
+        assert status == HTTPStatus.UNAUTHORIZED
+        assert body["error"] == "unauthorized"
+        assert "self-test-alert-token" not in json.dumps(body)
+
+        missing_reason_alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=json.dumps({"detail": "self-test"}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Alert-Token": "self-test-alert-token",
+            },
+            method="POST",
+        )
+        status, body = read_json_url_request(missing_reason_alert_request)
+        assert status == HTTPStatus.BAD_REQUEST
+        assert body["error"] == "bad_request"
+
+        oversized_alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=(b"{" + b'"reason":"mq2_alarm","detail":"' + (b"x" * MAX_ALERT_BODY_BYTES) + b'"}'),
+            headers={
+                "Content-Type": "application/json",
+                "X-Alert-Token": "self-test-alert-token",
+            },
+            method="POST",
+        )
+        status, body = read_json_url_request(oversized_alert_request)
+        assert status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+        assert body["error"] == "payload_too_large"
+
+        non_json_alert_request = Request(
+            f"{base_url}{args.alert_path}",
+            data=b"reason=mq2_alarm",
+            headers={
+                "Content-Type": "text/plain",
+                "X-Alert-Token": "self-test-alert-token",
+            },
+            method="POST",
+        )
+        status, body = read_json_url_request(non_json_alert_request)
+        assert status == HTTPStatus.BAD_REQUEST
+        assert body["error"] == "bad_request"
+
         server.provider = FailingScheduleProvider()
         status, body = read_json_url(
             f"{base_url}{args.path}?classroom=A101&date=2026-07-05&token=self-test-token"
@@ -1454,6 +1645,16 @@ def run_http_self_test(args: argparse.Namespace) -> None:
         thread.join(timeout=5)
 
     run_manual_session_self_test(args)
+
+
+def read_json_url_request(request: Request) -> tuple[int, dict[str, Any]]:
+    try:
+        with urlopen(request, timeout=5) as response:
+            body = response.read().decode("utf-8")
+            return response.status, json.loads(body)
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        return exc.code, json.loads(body)
 
 
 def run_manual_session_self_test(args: argparse.Namespace) -> None:
@@ -1542,6 +1743,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port", default=int(os.getenv("SCHEDULE_PORT", "8080")), type=int)
     parser.add_argument("--path", default=os.getenv("SCHEDULE_API_PATH", DEFAULT_PATH))
     parser.add_argument("--token", default=os.getenv("SCHEDULE_API_TOKEN", DEFAULT_TOKEN))
+    parser.add_argument("--alert-path", default=os.getenv("PARENT_CALL_ALERT_API_PATH", DEFAULT_ALERT_PATH))
+    parser.add_argument("--alert-token", default=os.getenv("PARENT_CALL_ALERT_API_TOKEN", DEFAULT_TOKEN))
+    parser.add_argument(
+        "--alert-mode",
+        choices=("mock",),
+        default=os.getenv("PARENT_CALL_ALERT_MODE", "mock"),
+        help="Parent call alert handling mode. mock accepts and records without dialing.",
+    )
     parser.add_argument(
         "--provider",
         choices=("fixture", "manual-session", "eams-room-occupancy"),
@@ -1616,6 +1825,9 @@ def main(argv: list[str] | None = None) -> int:
     server = ThreadingHTTPServer((args.host, args.port), ScheduleHandler)
     server.api_path = args.path
     server.api_token = args.token
+    server.alert_path = args.alert_path
+    server.alert_token = args.alert_token
+    server.alert_mode = args.alert_mode
     server.provider = provider
     server.cache = ScheduleCache(args.cache_ttl_seconds)
 
@@ -1623,7 +1835,9 @@ def main(argv: list[str] | None = None) -> int:
     print("Real classroom schedule middleware is running.")
     print(f"  Bind: http://{args.host}:{args.port}")
     print(f"  LAN:  http://{lan_ip}:{args.port}{args.path}?classroom=A101&token=<redacted>")
+    print(f"  Alert: http://{lan_ip}:{args.port}{args.alert_path} X-Alert-Token=<redacted>")
     print(f"  Provider: {provider.name}")
+    print(f"  Alert mode: {args.alert_mode}")
     print("Press Ctrl+C to stop.")
 
     try:

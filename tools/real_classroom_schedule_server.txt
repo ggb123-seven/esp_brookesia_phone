@@ -17,6 +17,9 @@ export SCHEDULE_PROVIDER=fixture
 export SCHEDULE_FIXTURE=tools/fixtures/classroom_schedule_fixture.json
 export SCHEDULE_CACHE_TTL_SECONDS=600
 export SCHEDULE_UPSTREAM_TIMEOUT_SECONDS=10
+export PARENT_CALL_ALERT_API_PATH=/parent-call-alert/trigger
+export PARENT_CALL_ALERT_API_TOKEN=change-me-local-only
+export PARENT_CALL_ALERT_MODE=mock
 ```
 
 不要把真实 `SCHEDULE_API_TOKEN`、学校账号、密码、Cookie、JSESSIONID 或 WebVPN 会话 URL 写入 Git。云服务器上建议把这些值放在 shell profile、systemd environment file、Docker/进程管理器 secret，或其它未提交配置中。
@@ -28,6 +31,7 @@ python tools/real_classroom_schedule_server.py \
   --host 0.0.0.0 \
   --port 8080 \
   --token change-me-local-only \
+  --alert-token change-me-local-only \
   --fixture tools/fixtures/classroom_schedule_fixture.json
 ```
 
@@ -55,6 +59,65 @@ token 错误：
 curl -i "http://127.0.0.1:8080/classroom-schedule/today?classroom=A101&token=wrong"
 ```
 
+家长电话告警接收接口：
+
+```bash
+curl -i -X POST "http://127.0.0.1:8080/parent-call-alert/trigger" \
+  -H "Content-Type: application/json" \
+  -H "X-Alert-Token: change-me-local-only" \
+  --data '{"reason":"mq2_alarm","detail":"MQ-2 detected smoke or combustible gas","message":"环境监测检测到烟雾或可燃气体异常，请及时确认。","timestamp_ms":123456}'
+```
+
+告警 token 错误：
+
+```bash
+curl -i -X POST "http://127.0.0.1:8080/parent-call-alert/trigger" \
+  -H "Content-Type: application/json" \
+  -H "X-Alert-Token: wrong" \
+  --data '{"reason":"mq2_alarm","detail":"self-test","message":"self-test","timestamp_ms":123456}'
+```
+
+## Windows 双击启动与登录自启动
+
+Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服务器。相关脚本位于 `tools/windows/`：
+
+- `start_classroom_schedule_server.ps1`：统一处理 Python 检查、物理网卡 IPv4 自动识别、EAMS 会话探测、端口占用检查和服务启动。
+- `start_classroom_schedule_server.bat`：桌面双击入口，不在窗口中打印 token。
+- `classroom_schedule_server_config.example.bat`：不含真实凭据的配置模板。
+- `set_classroom_schedule_autostart.ps1`：安装或移除 Windows 登录自启动快捷方式。
+
+把 `.bat` 和本地配置放在同一目录。配置中的 `DISPLAY_IP` 留空时，启动器会选择带默认路由的已连接物理网卡，排除隧道、VMware 和 Wi-Fi Direct 等虚拟接口。真实课表模式使用：
+
+```bat
+set "SCHEDULE_PROVIDER=eams-room-occupancy"
+set "EAMS_SESSION_FILE=.local-secrets\eams-session.json"
+set "EAMS_LOGIN_FILE=.local-secrets\eams-login.json"
+set "CHECK_EAMS_SESSION=1"
+```
+
+双击 `start_classroom_schedule_server.bat` 即可启动。只检查配置、网卡、会话和端口而不启动服务：
+
+```bat
+start_classroom_schedule_server.bat --check-only
+```
+
+启动器不会输出 Cookie、JSESSIONID 或 API token。EAMS 返回登录页时会明确报告会话过期；学校系统不可达或探测超过总时限时报告网络超时，不把两者混为一类。检查失败时服务不会启动。仅在排障时可暂时设置 `CHECK_EAMS_SESSION=0` 跳过检查。
+
+安装 Windows 登录自启动，`LauncherPath` 替换为本机桌面入口：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/set_classroom_schedule_autostart.ps1 `
+  -LauncherPath "$env:USERPROFILE\OneDrive\Desktop\start_classroom_schedule_server.bat"
+```
+
+自启动窗口保持最小化；启动失败时会显示诊断对话框。移除自启动：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/set_classroom_schedule_autostart.ps1 -Remove
+```
+
+第一次以 `0.0.0.0:8080` 启动时，Windows 防火墙可能询问是否允许 Python 访问网络；只需允许当前专用网络。ESP32 与电脑必须连接同一个局域网，电脑关机或休眠后设备会回退到离线缓存。
+
 ## 自测
 
 ```bash
@@ -71,6 +134,9 @@ python tools/real_classroom_schedule_server.py \
 - 未知教室返回空课表而不是解析失败。
 - 非法日期会被拒绝。
 - 未知路径返回 `404 not_found`。
+- `POST /parent-call-alert/trigger` 能接收固件 HTTP 告警 payload，并校验 `X-Alert-Token`。
+- 告警 token 错误时返回 `401 unauthorized`，且响应不泄露真实 token。
+- 告警 payload 缺少 `reason`、body 超限、非 JSON Content-Type 时会返回可诊断错误。
 - 上游失败且缓存可用时返回带 `cached: true` 的缓存课表。
 - `manual-session` provider 可通过假上游解析 JSON 响应和 HTML 内嵌 JSON 响应。
 
@@ -170,6 +236,9 @@ python tools/real_classroom_schedule_server.py \
 - port: `8080`
 - path: `/classroom-schedule/today`
 - token: 与服务器 `SCHEDULE_API_TOKEN` 一致
+- parent call alert path: `/parent-call-alert/trigger`
+- parent call alert token: 与服务器 `PARENT_CALL_ALERT_API_TOKEN` 一致
+- parent call alert transport: 默认仍建议 `Mock/demo only`；需要联调云端接收点时再切到 `HTTP middleware`
 
 MVP 可先用 `HTTP + IP:端口 + token` 跑通。后续有域名和证书后，再把传输层升级到 HTTPS 或反向代理。
 
@@ -222,5 +291,6 @@ python tools/real_classroom_schedule_server.py \
 
 - 服务启动时只打印脱敏 URL：`token=<redacted>`。
 - 错误响应只返回类别和可诊断短消息。
-- 不记录 query string、token、Cookie、JSESSIONID、完整 WebVPN URL、完整 HTML 或完整私有课表。
+- 不记录 query string、token、`X-Alert-Token`、Cookie、JSESSIONID、完整 WebVPN URL、完整 HTML 或完整私有课表。
+- 电话告警接口只记录 `reason` 和字段长度，不记录完整 `detail` / `message` 内容。
 - fixture 文件必须是人工构造或脱敏样例。
