@@ -94,9 +94,10 @@ menu "Example Configurations"
         config EXAMPLE_CLASSROOM_SCHEDULE_REQUEST_TIMEOUT_MS
             int "Classroom schedule request timeout in milliseconds"
             range 1000 30000
-            default 8000
+            default 30000
             help
-                HTTP request timeout for one schedule refresh.
+                HTTP request timeout for one schedule refresh. The real EAMS
+                provider may need to scan multiple syllabus pages on a cache miss.
     endif
 
     config EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE

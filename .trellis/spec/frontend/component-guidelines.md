@@ -81,6 +81,46 @@ arguments, app member variables, `lv_event_t` user data, and config structs.
 - Keep generated UI styling in generated files unless the change belongs to
   runtime behavior or cannot be represented in the source UI tool.
 
+### Chinese Text And Fonts
+
+For Chinese LVGL text, verify glyph coverage before shipping. `lv_font_simsun_16_cjk`
+is only LVGL's small CJK subset and does not cover many Simplified Chinese
+characters used by app copy. Brookesia launcher labels use the system stylesheet
+font, which is Maison Neue in the current phone stylesheets and should be treated
+as ASCII-only unless the stylesheet is deliberately changed.
+
+Use an app-local generated LVGL font subset when an app needs Chinese text:
+
+```cpp
+LV_FONT_DECLARE(fingerprint_font_20);
+
+#define FINGERPRINT_FONT_CN (&fingerprint_font_20)
+
+lv_label_set_text(title, "指纹识别");
+lv_obj_set_style_text_font(title, FINGERPRINT_FONT_CN, 0);
+```
+
+For composite LVGL controls, apply the Chinese font only to the parts that draw
+Chinese text. A dropdown uses `LV_PART_MAIN` for its selected text and list
+parts for its options, but its arrow is `LV_SYMBOL_DOWN` on
+`LV_PART_INDICATOR`. Keep the indicator on a symbol-capable LVGL font such as
+`lv_font_montserrat_20`; otherwise the arrow becomes a missing-glyph rectangle.
+Reapply list and child-label fonts from `LV_EVENT_READY` because dropdown list
+content is prepared when the control opens.
+
+Keep launcher names ASCII, such as `Fingerprint`, unless the Brookesia launcher
+font table is updated to a Chinese-capable font and the build size impact is
+checked. Prefer project-side stylesheet overrides before `activateStylesheet()`
+over editing `managed_components/`:
+
+```cpp
+for (int i = 0; i < stylesheet->core.home.text.default_fonts_num; ++i) {
+    if (stylesheet->core.home.text.default_fonts[i].size_px == 22) {
+        stylesheet->core.home.text.default_fonts[i].font_resource = &fingerprint_font_20;
+    }
+}
+```
+
 ---
 
 ## Accessibility

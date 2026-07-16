@@ -1,5 +1,31 @@
 {
   "classrooms": {
+    "尔雅楼103": {
+      "classroom_name": "尔雅楼103",
+      "courses": [
+        {
+          "start": "08:00",
+          "end": "09:40",
+          "name": "高等数学",
+          "teacher": "张老师",
+          "group": "软件工程 1 班"
+        },
+        {
+          "start": "10:10",
+          "end": "11:40",
+          "name": "计算机组成原理",
+          "teacher": "王老师",
+          "group": "软件工程 1 班"
+        },
+        {
+          "start": "14:00",
+          "end": "15:30",
+          "name": "数据库实验",
+          "teacher": "赵老师",
+          "group": "软件工程 1 班"
+        }
+      ]
+    },
     "A101": {
       "classroom_name": "博学楼 A101",
       "courses": [

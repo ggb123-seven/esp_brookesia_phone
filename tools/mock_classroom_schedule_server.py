@@ -146,7 +146,7 @@ def main() -> None:
     lan_ip = guess_lan_ip()
     print("Mock classroom schedule server is running.")
     print(f"  Bind: http://{args.host}:{args.port}")
-    print(f"  LAN:  http://{lan_ip}:{args.port}{args.path}?classroom=A101&token={args.token}")
+    print(f"  LAN:  http://{lan_ip}:{args.port}{args.path}?classroom=A101&token=<redacted>")
     print("Press Ctrl+C to stop.")
 
     try:

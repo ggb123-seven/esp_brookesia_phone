@@ -120,6 +120,7 @@ private:
     void applySelectedDate(const char *date);
     void startRefresh(void);
     void stopRefreshTimer(void);
+    void applyBuildingDropdownFont(void);
     void applyLabelStyle(lv_obj_t *label, uint32_t color, const lv_font_t *font);
     lv_obj_t *createButton(lv_obj_t *parent, const char *text, lv_event_cb_t cb, lv_coord_t width,
                            lv_coord_t height);
@@ -131,6 +132,7 @@ private:
     static void refreshTask(void *arg);
     static void refreshTimerCallback(lv_timer_t *timer);
     static void refreshEventCb(lv_event_t *e);
+    static void buildingDropdownEventCb(lv_event_t *e);
     static void saveClassroomEventCb(lv_event_t *e);
     static void roomInputEventCb(lv_event_t *e);
     static void serverHostInputEventCb(lv_event_t *e);

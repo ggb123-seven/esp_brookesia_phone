@@ -19,7 +19,8 @@
   "pr_url": null,
   "subtasks": [],
   "children": [
-    "07-15-improve-schedule-classroom-date-input"
+    "07-15-improve-schedule-classroom-date-input",
+    "07-16-fix-schedule-fetch-and-building-font"
   ],
   "parent": null,
   "relatedFiles": [

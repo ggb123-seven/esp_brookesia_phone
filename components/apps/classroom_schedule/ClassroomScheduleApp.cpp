@@ -63,12 +63,24 @@ struct ClassroomBuildingConfig {
 };
 
 /*
- * 首版只开放服务器已配置 EAMS building id 的尔雅楼。
+ * 楼宇列表与 EAMS 教室占用页保持一致，顺序按页面展示顺序排列。
  * canonical_prefix 用于保存和查询，legacy_prefix 仅用于兼容已有 NVS 值。
- * 增加楼宇前必须先确认服务器端已配置对应 building id，并同步更新字体子集。
+ * EAMS building id 由 Windows 中间层维护；楼宇变化时需同步更新两端和字体子集。
  */
 static const ClassroomBuildingConfig CLASSROOM_SCHEDULE_BUILDINGS[] = {
+    {"博文楼", "博文楼", ""},
+    {"知行楼", "知行楼", ""},
+    {"主楼机房", "主楼机房", ""},
+    {"静远楼", "静远楼", ""},
+    {"博雅楼", "博雅楼", ""},
+    {"耘慧楼", "耘慧楼", ""},
+    {"物理实验室", "物理实验室", ""},
+    {"葫芦岛物理实验室", "葫芦岛物理实验室", ""},
+    {"中和楼", "中和楼", ""},
+    {"致远楼", "致远楼", ""},
+    {"新华楼", "新华楼", ""},
     {"尔雅楼", "尔雅楼", "尔雅"},
+    {"葫芦岛机房", "葫芦岛机房", ""},
 };
 
 static bool hasNetworkIp(void)
@@ -680,6 +692,10 @@ esp_err_t ClassroomScheduleApp::fetchScheduleJson(const QuerySnapshot &query, ch
     *http_status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
+    ESP_LOGI(TAG, "Schedule HTTP result: host=%s port=%d classroom=%s date=%s err=%s status=%d bytes=%u overflow=%d",
+             query.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT, query.classroom, query.date,
+             esp_err_to_name(err), *http_status, (unsigned)response.len, response.overflow ? 1 : 0);
+
     if (response.overflow) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -1186,9 +1202,9 @@ void ClassroomScheduleApp::buildUi(void)
     applyLabelStyle(building_label, CLASSROOM_SCHEDULE_COLOR_MUTED, CLASSROOM_SCHEDULE_FONT_CN);
 
     _building_dropdown = lv_dropdown_create(input_row);
-    lv_obj_set_width(_building_dropdown, 140);
+    lv_obj_set_width(_building_dropdown, 210);
     lv_obj_set_height(_building_dropdown, 42);
-    char building_options[128] = {};
+    char building_options[512] = {};
     size_t option_len = 0;
     for (size_t i = 0; i < sizeof(CLASSROOM_SCHEDULE_BUILDINGS) / sizeof(CLASSROOM_SCHEDULE_BUILDINGS[0]); ++i) {
         const int written = snprintf(building_options + option_len, sizeof(building_options) - option_len,
@@ -1201,11 +1217,9 @@ void ClassroomScheduleApp::buildUi(void)
     }
     lv_dropdown_set_options(_building_dropdown, building_options);
     lv_dropdown_set_selected(_building_dropdown, (uint16_t)building_index);
-    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN, 0);
-    lv_obj_t *building_list = lv_dropdown_get_list(_building_dropdown);
-    if (building_list != NULL) {
-        lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN, 0);
-    }
+    lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_READY, this);
+    lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_VALUE_CHANGED, this);
+    applyBuildingDropdownFont();
 
     lv_obj_t *room_label = lv_label_create(input_row);
     lv_label_set_text(room_label, "房间号");
@@ -1646,6 +1660,9 @@ void ClassroomScheduleApp::startRefresh(void)
 
     _active_query = query;
     _busy = true;
+    ESP_LOGI(TAG, "Schedule query start: host=%s port=%d path=%s classroom=%s date=%s",
+             query.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT,
+             CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_API_PATH, query.classroom, query.date);
     if (_worker_done != NULL) {
         xSemaphoreTake(_worker_done, 0);
     }
@@ -1673,6 +1690,62 @@ void ClassroomScheduleApp::stopRefreshTimer(void)
     if (_refresh_timer != NULL) {
         lv_timer_del(_refresh_timer);
         _refresh_timer = NULL;
+    }
+}
+
+void ClassroomScheduleApp::applyBuildingDropdownFont(void)
+{
+    if (_building_dropdown == NULL) {
+        return;
+    }
+
+    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_FOCUSED);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_FOCUSED | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
+                               LV_PART_INDICATOR | LV_STATE_PRESSED | LV_STATE_CHECKED);
+    lv_obj_t *building_list = lv_dropdown_get_list(_building_dropdown);
+    if (building_list == NULL) {
+        return;
+    }
+
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_MAIN | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_SELECTED | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_SELECTED | LV_STATE_PRESSED);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_SELECTED | LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
+                               LV_PART_SELECTED | LV_STATE_CHECKED | LV_STATE_PRESSED);
+
+    const uint32_t child_count = lv_obj_get_child_cnt(building_list);
+    for (uint32_t i = 0; i < child_count; ++i) {
+        lv_obj_t *child = lv_obj_get_child(building_list, i);
+        if (child != NULL) {
+            lv_obj_set_style_text_font(child, CLASSROOM_SCHEDULE_FONT_CN,
+                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
     }
 }
 
@@ -1839,9 +1912,17 @@ void ClassroomScheduleApp::refreshTask(void *arg)
             result->err = app->parseScheduleJson(json, json_len, &result->data);
             if (result->err == ESP_OK && (strcmp(result->data.classroom, query.classroom) != 0 ||
                                           strcmp(result->data.date, query.date) != 0)) {
+                ESP_LOGE(TAG, "Schedule response mismatch: requested_classroom=%s response_classroom=%s "
+                         "requested_date=%s response_date=%s",
+                         query.classroom, result->data.classroom, query.date, result->data.date);
+                copy_string(result->detail, sizeof(result->detail),
+                            "服务器返回的教室或日期与当前查询不同。");
                 result->err = ESP_ERR_INVALID_RESPONSE;
             }
             if (result->err == ESP_OK) {
+                ESP_LOGI(TAG, "Schedule response parsed: classroom=%s requested_date=%s response_date=%s courses=%u",
+                         result->data.classroom, query.date, result->data.date,
+                         (unsigned)result->data.course_count);
                 result->data.from_cache = false;
                 result->has_data = true;
                 esp_err_t cache_err = app->saveCacheJson(json);
@@ -1854,7 +1935,7 @@ void ClassroomScheduleApp::refreshTask(void *arg)
                         ESP_LOGW(TAG, "Failed to save schedule cache metadata");
                     }
                 }
-            } else {
+            } else if (result->detail[0] == '\0') {
                 copy_string(result->detail, sizeof(result->detail), "服务器返回的课表格式无法解析。");
             }
         }
@@ -1870,8 +1951,19 @@ void ClassroomScheduleApp::refreshTask(void *arg)
                 copy_string(result->detail, sizeof(result->detail), "服务器拒绝访问，请检查 token 配置。");
             } else if (result->err == ESP_ERR_INVALID_SIZE) {
                 copy_string(result->detail, sizeof(result->detail), "课表响应过大，设备无法缓存或解析。");
+            } else if (result->err == ESP_ERR_HTTP_CONNECT) {
+                copy_string(result->detail, sizeof(result->detail), "服务器不可用，请检查服务器 IP 和端口后重试。");
+            } else if (result->err == ESP_ERR_HTTP_READ_TIMEOUT) {
+                copy_string(result->detail, sizeof(result->detail), "服务器响应超时，请检查网络后重试。");
+            } else if (result->http_status == 502 || result->http_status == 503) {
+                copy_string(result->detail, sizeof(result->detail),
+                            "课表上游会话不可用，请在电脑端重新登录 EAMS。");
+            } else if (result->http_status >= 500) {
+                copy_string(result->detail, sizeof(result->detail), "课表服务器内部错误，请检查电脑端服务。");
             } else if (result->err == ESP_ERR_INVALID_RESPONSE) {
-                copy_string(result->detail, sizeof(result->detail), "服务器响应异常，请检查接口格式。");
+                if (result->detail[0] == '\0') {
+                    copy_string(result->detail, sizeof(result->detail), "服务器响应异常，请检查接口格式。");
+                }
             } else {
                 ESP_LOGW(TAG, "No usable schedule cache: request=%s, cache=%s, http=%d",
                          esp_err_to_name(result->err), esp_err_to_name(cache_err), result->http_status);
@@ -1908,6 +2000,14 @@ void ClassroomScheduleApp::refreshEventCb(lv_event_t *e)
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
     if (app != NULL) {
         app->startRefresh();
+    }
+}
+
+void ClassroomScheduleApp::buildingDropdownEventCb(lv_event_t *e)
+{
+    ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
+    if (app != NULL) {
+        app->applyBuildingDropdownFont();
     }
 }
 

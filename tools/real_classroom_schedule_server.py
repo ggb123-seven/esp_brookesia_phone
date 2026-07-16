@@ -53,6 +53,36 @@ DEFAULT_SECTION_TIMES = {
 }
 EAMS_SYLLABUS_PAGE_SIZE = 500
 EAMS_SYLLABUS_MAX_PAGES = 12
+EAMS_BUILDING_IDS = {
+    "博文楼": "7",
+    "知行楼": "8",
+    "主楼机房": "9",
+    "静远楼": "11",
+    "博雅楼": "13",
+    "耘慧楼": "14",
+    "物理实验室": "15",
+    "葫芦岛物理实验室": "16",
+    "中和楼": "17",
+    "致远楼": "18",
+    "新华楼": "19",
+    "尔雅楼": "20",
+    "葫芦岛机房": "21",
+}
+EAMS_BUILDING_QUERY_NAMES = {
+    "博文楼": "null",
+    "知行楼": "育龙主楼",
+    "主楼机房": "主楼机房",
+    "静远楼": "静远楼",
+    "博雅楼": "博雅楼",
+    "耘慧楼": "耘慧楼",
+    "物理实验室": "物理实验室",
+    "葫芦岛物理实验室": "葫芦岛物理实验室",
+    "中和楼": "null",
+    "致远楼": "null",
+    "新华楼": "新华楼",
+    "尔雅楼": "尔雅楼",
+    "葫芦岛机房": "葫芦岛机房",
+}
 EAMS_WEEKDAY_NAMES = {
     "星期一": 1,
     "星期二": 2,
@@ -202,6 +232,7 @@ class ManualSessionEamsProvider(ScheduleProvider):
             raise ProviderUnavailable("manual WebVPN/EAMS session file must be a JSON object")
         if not isinstance(config.get("upstream_url"), str) or not config["upstream_url"].strip():
             raise ProviderUnavailable("manual WebVPN/EAMS session requires upstream_url")
+        apply_playwright_storage_state(config, session_file)
         return config
 
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
@@ -252,24 +283,66 @@ class ManualSessionEamsProvider(ScheduleProvider):
         return headers
 
 
+def apply_playwright_storage_state(config: dict[str, Any], session_file: Path) -> None:
+    state_file_text = str(config.get("playwright_storage_state") or "").strip()
+    if not state_file_text:
+        return
+
+    state_file = Path(state_file_text)
+    if not state_file.is_absolute():
+        state_file = session_file.parent / state_file
+    if not state_file.exists():
+        raise ProviderUnavailable("Playwright EAMS storage state file is missing")
+    try:
+        with state_file.open("r", encoding="utf-8") as fp:
+            state = json.load(fp)
+    except json.JSONDecodeError as exc:
+        raise ProviderUnavailable("Playwright EAMS storage state is not valid JSON") from exc
+    if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+        raise ProviderUnavailable("Playwright EAMS storage state has no cookies array")
+
+    upstream_host = (urlparse(str(config["upstream_url"])).hostname or "").lower()
+    cookie_pairs: list[str] = []
+    now = time.time()
+    for cookie in state["cookies"]:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "").lstrip(".").lower()
+        if not domain or (upstream_host != domain and not upstream_host.endswith("." + domain)):
+            continue
+        expires = cookie.get("expires")
+        if isinstance(expires, (int, float)) and expires > 0 and expires <= now:
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if not isinstance(name, str) or not name or not isinstance(value, str):
+            continue
+        cookie_pairs.append(f"{name}={value}")
+    if not cookie_pairs:
+        raise ProviderUnavailable("Playwright EAMS storage state has no usable upstream cookies")
+
+    configured_headers = config.get("headers")
+    if configured_headers is None:
+        configured_headers = {}
+    if not isinstance(configured_headers, dict):
+        raise ProviderUnavailable("manual WebVPN/EAMS headers config must be an object")
+    configured_headers["Cookie"] = "; ".join(cookie_pairs)
+    config["headers"] = configured_headers
+
+
 class EamsRoomOccupancyProvider(ScheduleProvider):
     name = "eams-room-occupancy"
 
     def __init__(self, session_file: Path | None, timeout_seconds: int = 10) -> None:
         self.timeout_seconds = max(1, timeout_seconds)
         self.config = ManualSessionEamsProvider._load_session_config(session_file)
+        self._syllabus_lock = threading.Lock()
 
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         classroom_name = normalize_eams_classroom_name(classroom)
         target_week = self._week_for_date(date_text)
         target_day = datetime.strptime(date_text, "%Y-%m-%d").isoweekday()
         detailed_courses = self._fetch_syllabus_courses(classroom_name, target_week, target_day)
-        if detailed_courses:
-            record = {
-                "classroom_name": classroom_name,
-                "courses": detailed_courses,
-            }
-            return normalize_schedule(classroom, date_text, record)
 
         detail_url = self._build_detail_url(classroom_name, date_text)
         request = Request(detail_url, headers=self._build_headers(), method="GET")
@@ -278,7 +351,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
                 raw = response.read()
                 content_type = response.headers.get("Content-Type", "")
         except HTTPError as exc:
-            if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+            if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) or 300 <= exc.code < 400:
                 raise ProviderUnavailable("EAMS room occupancy session is rejected or expired") from exc
             raise UpstreamError("EAMS room occupancy upstream returned an error") from exc
         except OSError as exc:
@@ -289,11 +362,20 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         occupied_sections = sections_by_day.get(target_day, [])
         record = {
             "classroom_name": classroom_name,
-            "courses": build_occupancy_courses(occupied_sections),
+            "courses": merge_syllabus_and_occupancy_courses(detailed_courses, occupied_sections),
         }
         return normalize_schedule(classroom, date_text, record)
 
     def _fetch_syllabus_courses(self, classroom_name: str, target_week: int, target_day: int) -> list[dict[str, str]]:
+        with self._syllabus_lock:
+            return self._fetch_syllabus_courses_locked(classroom_name, target_week, target_day)
+
+    def _fetch_syllabus_courses_locked(
+        self,
+        classroom_name: str,
+        target_week: int,
+        target_day: int,
+    ) -> list[dict[str, str]]:
         courses: list[dict[str, str]] = []
         total_pages = 1
         for page_no in range(1, EAMS_SYLLABUS_MAX_PAGES + 1):
@@ -304,7 +386,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
                     raw = response.read()
                     content_type = response.headers.get("Content-Type", "")
             except HTTPError as exc:
-                if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) or 300 <= exc.code < 400:
                     raise ProviderUnavailable("EAMS syllabus session is rejected or expired") from exc
                 if courses:
                     break
@@ -339,7 +421,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             "semesterId": str(self.config.get("semesterId") or self.config.get("semester_id") or "723"),
             "iWeek": str(self._week_for_date(date_text)),
             "room.building.id": str(self._building_id_for(classroom_name)),
-            "buildingname": self._building_name_for(classroom_name),
+            "buildingname": self._building_query_name_for(classroom_name),
         }
         path = prefix + "/eams/classroom/occupy/class-details!unitDetail.action"
         return urlunparse((parsed.scheme, parsed.netloc, path, "", urlencode(query), ""))
@@ -360,8 +442,6 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         return urlunparse((parsed.scheme, parsed.netloc, path, "", urlencode(query), ""))
 
     def _week_for_date(self, date_text: str) -> int:
-        if self.config.get("iWeek") or self.config.get("week"):
-            return int(self.config.get("iWeek") or self.config.get("week"))
         first_week_start = str(
             self.config.get("first_week_start")
             or self.config.get("semester_start_date")
@@ -375,6 +455,8 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
                 raise ProviderUnavailable("EAMS room occupancy first_week_start must use YYYY-MM-DD") from exc
             week = ((target_date - start_date).days // 7) + 1
             return max(1, week)
+        if self.config.get("iWeek") or self.config.get("week"):
+            return int(self.config.get("iWeek") or self.config.get("week"))
         return 1
 
     def _building_id_for(self, classroom_name: str) -> str:
@@ -384,19 +466,33 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             configured = buildings.get(building_name) or buildings.get(classroom_name)
             if configured:
                 return str(configured)
-        if building_name == "尔雅楼":
-            return "20"
+        default_id = EAMS_BUILDING_IDS.get(building_name)
+        if default_id:
+            return default_id
         raise ProviderUnavailable("EAMS room occupancy building id is not configured")
 
     def _building_name_for(self, classroom_name: str) -> str:
         buildings_by_prefix = self.config.get("building_prefixes", {})
         if isinstance(buildings_by_prefix, dict):
-            for prefix, building_name in buildings_by_prefix.items():
+            for prefix, building_name in sorted(
+                buildings_by_prefix.items(), key=lambda item: len(str(item[0])), reverse=True
+            ):
                 if classroom_name.startswith(str(prefix)):
                     return str(building_name)
-        if classroom_name.startswith("尔雅楼") or classroom_name.startswith("尔雅"):
-            return "尔雅楼"
+        for building_name in sorted(EAMS_BUILDING_IDS, key=len, reverse=True):
+            if classroom_name.startswith(building_name):
+                return building_name
         raise ProviderUnavailable("EAMS room occupancy building name is not configured")
+
+    def _building_query_name_for(self, classroom_name: str) -> str:
+        building_name = self._building_name_for(classroom_name)
+        configured = self.config.get("building_query_names", {})
+        if isinstance(configured, dict) and building_name in configured:
+            return str(configured[building_name])
+        query_name = EAMS_BUILDING_QUERY_NAMES.get(building_name)
+        if query_name is not None:
+            return query_name
+        raise ProviderUnavailable("EAMS room occupancy building query name is not configured")
 
     def _build_headers(self) -> dict[str, str]:
         configured = self.config.get("headers", {})
@@ -996,6 +1092,30 @@ def build_occupancy_courses(sections: list[int]) -> list[dict[str, str]]:
     return courses
 
 
+def merge_syllabus_and_occupancy_courses(
+    detailed_courses: list[dict[str, str]],
+    occupied_sections: list[int],
+) -> list[dict[str, str]]:
+    covered_sections: set[int] = set()
+    section_by_start = {times[0]: section for section, times in DEFAULT_SECTION_TIMES.items()}
+    section_by_end = {times[1]: section for section, times in DEFAULT_SECTION_TIMES.items()}
+    for course in detailed_courses:
+        first_section = section_by_start.get(course.get("start", ""))
+        last_section = section_by_end.get(course.get("end", ""))
+        if first_section is None or last_section is None or last_section < first_section:
+            continue
+        covered_sections.update(range(first_section, last_section + 1))
+
+    unresolved_sections = [
+        section
+        for section in occupied_sections
+        if section not in covered_sections
+    ]
+    return dedupe_courses(
+        [*detailed_courses, *build_occupancy_courses(unresolved_sections)]
+    )[:MAX_COURSES]
+
+
 def syllabus_total_pages(text: str, fallback_page_size: int) -> int | None:
     match = re.search(r"page_grid\w+\.pageInfo\((\d+),(\d+),(\d+)\)", text)
     if match is None:
@@ -1100,7 +1220,7 @@ def iter_syllabus_arrangements(arrange_text: str) -> list[dict[str, str]]:
         r"(?P<teacher>\S+)\s+"
         r"(?P<weekday>星期[一二三四五六日]|周[一二三四五六日])\s+"
         r"(?P<section>\d{1,2}-\d{1,2})\s+"
-        r"(?P<weeks>\[[^\]]+\]|\d+(?:,\d+)*)\s+"
+        r"(?P<weeks>(?:\[[^\]]+\]|\d+(?:,\d+)*)[单双]?)\s+"
         r"(?P<classroom>\S+)"
     )
     return [match.groupdict() for match in pattern.finditer(normalized)]
@@ -1463,6 +1583,13 @@ def run_self_test(args: argparse.Namespace) -> None:
     assert isinstance(sample["courses"], list)
     assert sample["courses"] == sorted(sample["courses"], key=lambda item: item["start"])
 
+    if provider.name == "fixture":
+        for date_text in ("2026-07-16", "2026-07-17"):
+            device_sample = provider.fetch_schedule("尔雅楼103", date_text)
+            assert device_sample["classroom"] == "尔雅楼103"
+            assert device_sample["date"] == date_text
+            assert device_sample["courses"]
+
     empty = provider.fetch_schedule("EMPTY", "2026-07-05")
     assert empty["courses"] == []
 
@@ -1520,6 +1647,20 @@ def run_http_self_test(args: argparse.Namespace) -> None:
         assert body["classroom"] == "A101"
         assert body["date"] == "2026-07-05"
         assert body["courses"]
+
+        if provider.name == "fixture":
+            query = urlencode(
+                {
+                    "classroom": "尔雅楼103",
+                    "date": "2026-07-17",
+                    "token": "self-test-token",
+                }
+            )
+            status, body = read_json_url(f"{base_url}{args.path}?{query}")
+            assert status == HTTPStatus.OK
+            assert body["classroom"] == "尔雅楼103"
+            assert body["date"] == "2026-07-17"
+            assert body["courses"]
 
         status, body = read_json_url(
             f"{base_url}{args.path}?classroom=EMPTY&date=2026-07-05&token=self-test-token"
@@ -1664,13 +1805,40 @@ def run_manual_session_self_test(args: argparse.Namespace) -> None:
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             session_path = Path(temp_dir) / "eams-session.json"
+            storage_state_path = Path(temp_dir) / "eams-playwright-state.json"
+            storage_state_path.write_text(
+                json.dumps(
+                    {
+                        "cookies": [
+                            {
+                                "name": "SESSION",
+                                "value": "fresh-self-test",
+                                "domain": "127.0.0.1",
+                                "path": "/",
+                                "expires": -1,
+                            },
+                            {
+                                "name": "OTHER",
+                                "value": "ignored",
+                                "domain": "example.invalid",
+                                "path": "/",
+                                "expires": -1,
+                            },
+                        ],
+                        "origins": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
             session = {
                 "upstream_url": f"http://127.0.0.1:{upstream.server_port}/json",
                 "query": {"room": "{classroom}", "day": "{date}"},
-                "headers": {"Cookie": "SESSION=fake-self-test"},
+                "headers": {"Cookie": "SESSION=stale-self-test"},
+                "playwright_storage_state": storage_state_path.name,
             }
             session_path.write_text(json.dumps(session), encoding="utf-8")
             provider = ManualSessionEamsProvider(session_path, timeout_seconds=5)
+            assert provider._build_headers()["Cookie"] == "SESSION=fresh-self-test"
             data = provider.fetch_schedule("A101", "2026-07-05")
             assert data["classroom"] == "A101"
             assert data["classroom_name"] == "真实接入测试 A101"
@@ -1726,6 +1894,78 @@ def run_syllabus_parser_self_test() -> None:
             "group": "班级:会计25-3 会计25-4 会计25-5",
         }
     ]
+
+    merged_courses = merge_syllabus_and_occupancy_courses(
+        monday_courses,
+        [1, 2, 3, 4, 7, 8, 9, 10],
+    )
+    assert merged_courses == [
+        {
+            "start": "08:00",
+            "end": "11:50",
+            "name": "第1-4节占用",
+            "teacher": "EAMS 教室资源",
+            "group": "真实占用",
+        },
+        {
+            "start": "16:10",
+            "end": "17:50",
+            "name": "组织行为学",
+            "teacher": "符萌萌",
+            "group": "班级:会计25-3 会计25-4 会计25-5",
+        },
+        {
+            "start": "19:00",
+            "end": "20:40",
+            "name": "第9-10节占用",
+            "teacher": "EAMS 教室资源",
+            "group": "真实占用",
+        },
+    ]
+
+    occupancy_only = merge_syllabus_and_occupancy_courses([], [5, 6, 7, 8])
+    assert occupancy_only == [
+        {
+            "start": "14:00",
+            "end": "17:50",
+            "name": "第5-8节占用",
+            "teacher": "EAMS 教室资源",
+            "group": "真实占用",
+        }
+    ]
+
+    provider = object.__new__(EamsRoomOccupancyProvider)
+    provider.config = {
+        "first_week_start": "2026-03-02",
+        "iWeek": 20,
+    }
+    assert provider._week_for_date("2026-03-02") == 1
+    assert provider._week_for_date("2026-04-06") == 6
+    assert provider._week_for_date("2026-07-16") == 20
+    for building_name, building_id in EAMS_BUILDING_IDS.items():
+        assert provider._building_name_for(f"{building_name}103") == building_name
+        assert provider._building_id_for(f"{building_name}103") == building_id
+        assert provider._building_query_name_for(f"{building_name}103") == EAMS_BUILDING_QUERY_NAMES[building_name]
+
+    provider.config["buildings"] = {"博文楼": "107"}
+    provider.config["building_query_names"] = {"博文楼": "自定义博文楼"}
+    assert provider._building_id_for("博文楼105") == "107"
+    assert provider._building_query_name_for("博文楼105") == "自定义博文楼"
+
+    parity_arrangements = iter_syllabus_arrangements(
+        "韩旭 星期一 9-10 [6-12]双 尔雅楼101"
+    )
+    assert parity_arrangements == [
+        {
+            "teacher": "韩旭",
+            "weekday": "星期一",
+            "section": "9-10",
+            "weeks": "[6-12]双",
+            "classroom": "尔雅楼101",
+        }
+    ]
+    assert week_spec_matches(parity_arrangements[0]["weeks"], 6)
+    assert not week_spec_matches(parity_arrangements[0]["weeks"], 7)
 
     sunday_courses = build_syllabus_courses(
         lessons,
