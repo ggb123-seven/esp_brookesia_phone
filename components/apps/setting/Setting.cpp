@@ -4,14 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <cmath>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
-#include "esp_check.h"
 #include "esp_memory_utils.h"
 #include "esp_mac.h"
 #include "bsp/esp-bsp.h"
@@ -24,24 +20,15 @@
 #include "app_sntp.h"
 
 #include "esp_brookesia_versions.h"
-#include "esp_lv_adapter.h"
-
-#define ENABLE_DEBUG_LOG                (0)
 
 #define HOME_REFRESH_TASK_STACK_SIZE    (1024 * 4)
 #define HOME_REFRESH_TASK_PRIORITY      (1)
 #define HOME_REFRESH_TASK_PERIOD_MS     (2000)
 
-#define WIFI_SCAN_TASK_STACK_SIZE       (1024 * 6)
-#define WIFI_SCAN_TASK_PRIORITY         (1)
-#define WIFI_SCAN_TASK_PERIOD_MS        (5 * 1000)
-
-#define WIFI_CONNECT_TASK_STACK_SIZE    (1024 * 4)
-#define WIFI_CONNECT_TASK_PRIORITY      (4)
-#define WIFI_CONNECT_TASK_STACK_CORE    (0)
+#define SNTP_TASK_STACK_SIZE            (1024 * 4)
+#define SNTP_TASK_PRIORITY              (4)
 #define WIFI_CONNECT_UI_WAIT_TIME_MS    (1 * 1000)
-#define WIFI_CONNECT_UI_PANEL_SIZE      (1 * 1000)
-#define WIFI_CONNECT_RET_WAIT_TIME_MS   (10 * 1000)
+#define WIFI_UI_TIMER_PERIOD_MS         (100)
 
 #define SCREEN_BRIGHTNESS_MIN           (20)
 #define SCREEN_BRIGHTNESS_MAX           (BSP_LCD_BACKLIGHT_BRIGHTNESS_MAX)
@@ -69,27 +56,12 @@
 
 using namespace std;
 
-#define SCAN_LIST_SIZE      25
-
 static const char TAG[] = "EUI_Setting";
 
-TaskHandle_t wifi_scan_handle_task;
-
-static EventGroupHandle_t s_wifi_event_group;
-
-static char st_wifi_ssid[32];
-static char st_wifi_password[64];
-static TaskHandle_t s_sntp_task = NULL;
-static bool s_sntp_done = false;
+static bool s_sntp_started = false;
 
 static uint8_t base_mac_addr[6] = {0};
 static char mac_str[18] = {0};
-
-static lv_obj_t* panel_wifi_btn[SCAN_LIST_SIZE];
-static lv_obj_t* label_wifi_ssid[SCAN_LIST_SIZE];
-static lv_obj_t* img_img_wifi_lock[SCAN_LIST_SIZE];
-static lv_obj_t* wifi_image[SCAN_LIST_SIZE];
-static lv_obj_t* wifi_connect[SCAN_LIST_SIZE];
 
 static int brightness;
 
@@ -100,13 +72,6 @@ LV_IMG_DECLARE(img_wifisignal_good);
 LV_IMG_DECLARE(img_wifi_lock);
 LV_IMG_DECLARE(img_wifi_connect_success);
 LV_IMG_DECLARE(img_wifi_connect_fail);
-
-typedef enum {
-    WIFI_EVENT_GOT_IP = BIT(0),
-    WIFI_EVENT_INIT_DONE = BIT(1),
-    WIFI_EVENT_UI_INIT_DONE = BIT(2),
-    WIFI_EVENT_SCANING = BIT(3)
-} wifi_event_id_t;
 
 LV_IMG_DECLARE(img_app_setting);
 extern lv_obj_t *ui_Min;
@@ -119,8 +84,6 @@ static void sntpInitTask(void *arg)
 {
     (void)arg;
     app_sntp_init();
-    s_sntp_done = true;
-    s_sntp_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -129,7 +92,28 @@ AppSettings::AppSettings():
     _is_ui_resumed(false),
     _is_ui_del(true),
     _screen_index(UI_MAIN_SETTING_INDEX),
-    _screen_list({nullptr})
+    _wifi_signal_strength_level(WIFI_SIGNAL_STRENGTH_NONE),
+    _wifi_manager(),
+    _panel_wifi_connect(nullptr),
+    _spinner_wifi_connect(nullptr),
+    _img_wifi_connect(nullptr),
+    _wifi_refresh_btn(nullptr),
+    _wifi_ui_timer(nullptr),
+    _screen_list({nullptr}),
+    _wifi_panel_buttons({nullptr}),
+    _wifi_ssid_labels({nullptr}),
+    _wifi_lock_images({nullptr}),
+    _wifi_signal_images({nullptr}),
+    _wifi_connected_labels({nullptr}),
+    _wifi_scan_results{},
+    _wifi_scan_count(0),
+    _last_wifi_state_version(UINT32_MAX),
+    _last_wifi_scan_version(UINT32_MAX),
+    _last_wifi_result_version(UINT32_MAX),
+    _wifi_result_shown_at(0),
+    _shown_wifi_result(WifiConnectionManager::ConnectResult::NONE),
+    status_bar(nullptr),
+    backstage(nullptr)
 {
 }
 
@@ -140,6 +124,12 @@ AppSettings::~AppSettings()
 bool AppSettings::run(void)
 {
     _is_ui_del = false;
+    _last_wifi_state_version = UINT32_MAX;
+    _last_wifi_scan_version = UINT32_MAX;
+    _last_wifi_result_version = UINT32_MAX;
+    _shown_wifi_result = WifiConnectionManager::ConnectResult::NONE;
+    _wifi_result_shown_at = 0;
+    _wifi_scan_count = 0;
 
     // Initialize Squareline UI
     ui_setting_init();
@@ -157,7 +147,12 @@ bool AppSettings::run(void)
     // Update UI by NVS parameters
     updateUiByNvsParam();
 
-    xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_UI_INIT_DONE);
+    _wifi_ui_timer = lv_timer_create(wifiUiTimerCallback, WIFI_UI_TIMER_PERIOD_MS, this);
+    if (_wifi_ui_timer == nullptr) {
+        ESP_LOGE(TAG, "Failed to create Wi-Fi UI timer");
+        return false;
+    }
+    syncWifiUi();
 
     return true;
 }
@@ -169,13 +164,12 @@ bool AppSettings::back(void)
     if (_screen_index == UI_WIFI_CONNECT_INDEX) {
         lv_scr_load(ui_ScreenSettingWiFi);
     } else if (_screen_index != UI_MAIN_SETTING_INDEX) {
+        if (_screen_index == UI_WIFI_SCAN_INDEX) {
+            endWifiDiscovery();
+        }
         lv_scr_load(ui_ScreenSettingMain);
     } else {
-        while(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
-            ESP_LOGI(TAG, "WiFi is scanning, please wait");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            stopWifiScan();
-        }
+        endWifiDiscovery();
         notifyCoreClosed();
     }
 
@@ -184,13 +178,22 @@ bool AppSettings::back(void)
 
 bool AppSettings::close(void)
 {
-    while(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
-        ESP_LOGI(TAG, "WiFi is scanning, please wait");
-        vTaskDelay(pdMS_TO_TICKS(100));
-        stopWifiScan();
+    endWifiDiscovery();
+    if (_wifi_ui_timer != nullptr) {
+        lv_timer_del(_wifi_ui_timer);
+        _wifi_ui_timer = nullptr;
     }
 
     _is_ui_del = true;
+    _wifi_refresh_btn = nullptr;
+    _panel_wifi_connect = nullptr;
+    _spinner_wifi_connect = nullptr;
+    _img_wifi_connect = nullptr;
+    _wifi_panel_buttons.fill(nullptr);
+    _wifi_ssid_labels.fill(nullptr);
+    _wifi_lock_images.fill(nullptr);
+    _wifi_signal_images.fill(nullptr);
+    _wifi_connected_labels.fill(nullptr);
 
     return true;
 }
@@ -216,8 +219,16 @@ bool AppSettings::init(void)
     bsp_extra_codec_volume_set(_nvs_param_map[NVS_KEY_AUDIO_VOLUME], (int *)&_nvs_param_map[NVS_KEY_AUDIO_VOLUME]);
     bsp_display_brightness_set(_nvs_param_map[NVS_KEY_DISPLAY_BRIGHTNESS]);
 
-    xTaskCreate(euiRefresTask, "Home Refresh", HOME_REFRESH_TASK_STACK_SIZE, this, HOME_REFRESH_TASK_PRIORITY, NULL);
-    xTaskCreate(wifiScanTask, "WiFi Scan", WIFI_SCAN_TASK_STACK_SIZE, this, WIFI_SCAN_TASK_PRIORITY, NULL);
+    esp_err_t err = _wifi_manager.begin(_nvs_param_map[NVS_KEY_WIFI_ENABLE] != 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Wi-Fi manager: %s", esp_err_to_name(err));
+    }
+
+    BaseType_t created = xTaskCreate(euiRefresTask, "Home Refresh", HOME_REFRESH_TASK_STACK_SIZE,
+                                     this, HOME_REFRESH_TASK_PRIORITY, NULL);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create home refresh task");
+    }
 
     return true;
 }
@@ -268,40 +279,57 @@ void AppSettings::extraUiInit(void)
     lv_obj_set_style_pad_all(ui_PanelScreenSettingWiFiList, 0, 0);
     lv_obj_set_style_pad_top(ui_PanelScreenSettingWiFiList, UI_WIFI_LIST_UP_PAD, 0);
     lv_obj_set_style_pad_bottom(ui_PanelScreenSettingWiFiList, UI_WIFI_LIST_DOWN_PAD, 0);
-    for(int i = 0; i < SCAN_LIST_SIZE; i++) {
-        panel_wifi_btn[i] = lv_obj_create(ui_PanelScreenSettingWiFiList);
-        lv_obj_set_size(panel_wifi_btn[i], lv_pct(100), UI_WIFI_LIST_ITEM_H);
-        lv_obj_set_style_radius(panel_wifi_btn[i], 0, 0);
-        lv_obj_set_style_border_width(panel_wifi_btn[i], 0, 0);
-        lv_obj_set_style_text_font(panel_wifi_btn[i], UI_WIFI_LIST_ITEM_FONT, 0);
-        lv_obj_add_flag(panel_wifi_btn[i], LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_clear_flag( panel_wifi_btn[i], LV_OBJ_FLAG_SCROLLABLE );
-        lv_obj_set_style_bg_color(panel_wifi_btn[i], lv_color_hex(0xCBCBCB), LV_PART_MAIN | LV_STATE_PRESSED );
-        lv_obj_set_style_bg_opa(panel_wifi_btn[i], 255, LV_PART_MAIN| LV_STATE_DEFAULT);
-        lv_obj_set_style_border_color(panel_wifi_btn[i], lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT );
-        lv_obj_set_style_border_opa(panel_wifi_btn[i], 255, LV_PART_MAIN| LV_STATE_DEFAULT);
+    for (size_t i = 0; i < WifiConnectionManager::MAX_SCAN_RESULTS; ++i) {
+        _wifi_panel_buttons[i] = lv_obj_create(ui_PanelScreenSettingWiFiList);
+        lv_obj_set_size(_wifi_panel_buttons[i], lv_pct(100), UI_WIFI_LIST_ITEM_H);
+        lv_obj_set_style_radius(_wifi_panel_buttons[i], 0, 0);
+        lv_obj_set_style_border_width(_wifi_panel_buttons[i], 0, 0);
+        lv_obj_set_style_text_font(_wifi_panel_buttons[i], UI_WIFI_LIST_ITEM_FONT, 0);
+        lv_obj_add_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_bg_color(_wifi_panel_buttons[i], lv_color_hex(0xCBCBCB),
+                                  LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(_wifi_panel_buttons[i], LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_color(_wifi_panel_buttons[i], lv_color_white(),
+                                      LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_opa(_wifi_panel_buttons[i], LV_OPA_COVER,
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_HIDDEN);
 
-        label_wifi_ssid[i] = lv_label_create(panel_wifi_btn[i]);
-        lv_obj_set_align(label_wifi_ssid[i], LV_ALIGN_LEFT_MID);
+        _wifi_ssid_labels[i] = lv_label_create(_wifi_panel_buttons[i]);
+        lv_obj_set_width(_wifi_ssid_labels[i], lv_pct(70));
+        lv_label_set_long_mode(_wifi_ssid_labels[i], LV_LABEL_LONG_DOT);
+        lv_obj_set_align(_wifi_ssid_labels[i], LV_ALIGN_LEFT_MID);
 
-        img_img_wifi_lock[i] = lv_img_create(panel_wifi_btn[i]);
-        lv_obj_align(img_img_wifi_lock[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_LOCK_RIGHT_OFFSET, 0);
-        lv_obj_add_flag(img_img_wifi_lock[i], LV_OBJ_FLAG_HIDDEN);
+        _wifi_lock_images[i] = lv_img_create(_wifi_panel_buttons[i]);
+        lv_obj_align(_wifi_lock_images[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_LOCK_RIGHT_OFFSET, 0);
+        lv_obj_add_flag(_wifi_lock_images[i], LV_OBJ_FLAG_HIDDEN);
 
-        wifi_image[i] = lv_img_create(panel_wifi_btn[i]);
-        lv_obj_align(wifi_image[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_SIGNAL_RIGHT_OFFSET, 0);
+        _wifi_signal_images[i] = lv_img_create(_wifi_panel_buttons[i]);
+        lv_obj_align(_wifi_signal_images[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_SIGNAL_RIGHT_OFFSET, 0);
 
-        wifi_connect[i] = lv_label_create(panel_wifi_btn[i]);
-        lv_label_set_text(wifi_connect[i], LV_SYMBOL_OK);
-        lv_obj_align(wifi_connect[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_CONNECT_RIGHT_OFFSET, 0);
-        lv_obj_add_flag(wifi_connect[i], LV_OBJ_FLAG_HIDDEN);
+        _wifi_connected_labels[i] = lv_label_create(_wifi_panel_buttons[i]);
+        lv_label_set_text(_wifi_connected_labels[i], LV_SYMBOL_OK);
+        lv_obj_align(_wifi_connected_labels[i], LV_ALIGN_RIGHT_MID, UI_WIFI_ICON_CONNECT_RIGHT_OFFSET, 0);
+        lv_obj_add_flag(_wifi_connected_labels[i], LV_OBJ_FLAG_HIDDEN);
 
-        lv_obj_add_event_cb(panel_wifi_btn[i], onButtonWifiListClickedEventCallback, LV_EVENT_CLICKED, (void*)label_wifi_ssid[i]);
-        if(!(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING)) {
-            lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
-        }
+        lv_obj_add_event_cb(_wifi_panel_buttons[i], onButtonWifiListClickedEventCallback,
+                            LV_EVENT_CLICKED, this);
     }
+    lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_align(ui_SwitchPanelScreenSettingWiFiSwitch, LV_ALIGN_RIGHT_MID, -12, 0);
+    _wifi_refresh_btn = lv_btn_create(ui_PanelScreenSettingWiFiSwitch);
+    lv_obj_set_size(_wifi_refresh_btn, 44, 44);
+    lv_obj_align(_wifi_refresh_btn, LV_ALIGN_RIGHT_MID, -75, 0);
+    lv_obj_set_style_radius(_wifi_refresh_btn, 6, 0);
+    lv_obj_set_style_bg_color(_wifi_refresh_btn, lv_color_hex(0xE5F3FF), 0);
+    lv_obj_set_style_shadow_width(_wifi_refresh_btn, 0, 0);
+    lv_obj_add_event_cb(_wifi_refresh_btn, onWifiRefreshClickedEventCallback, LV_EVENT_CLICKED, this);
+    lv_obj_t *refresh_icon = lv_label_create(_wifi_refresh_btn);
+    lv_label_set_text(refresh_icon, LV_SYMBOL_REFRESH);
+    lv_obj_center(refresh_icon);
     lv_obj_add_flag(ui_ButtonScreenSettingWiFiReturn, LV_OBJ_FLAG_HIDDEN);
     // Connect
     lv_obj_add_flag(ui_SpinnerScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
@@ -379,6 +407,10 @@ void AppSettings::extraUiInit(void)
 
 void AppSettings::processWifiConnect(WifiConnectState_t state)
 {
+    if (_panel_wifi_connect == nullptr || _img_wifi_connect == nullptr || _spinner_wifi_connect == nullptr) {
+        return;
+    }
+
     switch (state) {
     case WIFI_CONNECT_HIDE:
         lv_obj_add_flag(_panel_wifi_connect, LV_OBJ_FLAG_HIDDEN);
@@ -489,415 +521,310 @@ void AppSettings::updateUiByNvsParam(void)
     lv_slider_set_value(ui_SliderPanelScreenSettingVolumeSwitch, _nvs_param_map[NVS_KEY_AUDIO_VOLUME], LV_ANIM_OFF);
 }
 
-esp_err_t AppSettings::initWifi()
+void AppSettings::requestWifiDiscovery(void)
 {
-    s_wifi_event_group = xEventGroupCreate();
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_SCANING);
-    if(!(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_UI_INIT_DONE)) {
-        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_UI_INIT_DONE);
-    }
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-    assert(sta_netif);
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifiEventHandler,
-                                                        this,
-                                                        &instance_any_id));
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifiEventHandler,
-                                                        this,
-                                                        &instance_got_ip));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    return ESP_OK;
-}
-
-void AppSettings::startWifiScan(void)
-{
-    ESP_LOGI(TAG, "Start Wi-Fi scan");
-    xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_SCANING);
-    lv_obj_clear_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(ui_SwitchPanelScreenSettingWiFiSwitch, LV_OBJ_FLAG_CLICKABLE);
-}
-
-void AppSettings::stopWifiScan(void)
-{
-    ESP_LOGI(TAG, "Stop Wi-Fi scan");
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_SCANING);
-    lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
-    deinitWifiListButton();
-}
-
-void AppSettings::scanWifiAndUpdateUi(void)
-{
-    bool psk_flag = false;
-
-    uint16_t number = SCAN_LIST_SIZE;
-    wifi_ap_record_t ap_info[SCAN_LIST_SIZE];
-    uint16_t ap_count = 0;
-    memset(ap_info, 0, sizeof(ap_info));
-
-    esp_err_t ret = esp_wifi_start();
-    if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
-        ESP_LOGW(TAG, "Start Wi-Fi before scan returned %s", esp_err_to_name(ret));
-    }
-    ret = esp_wifi_scan_start(NULL, true);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    ret = esp_wifi_scan_get_ap_num(&ap_count);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Get Wi-Fi AP count failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    ret = esp_wifi_scan_get_ap_records(&number, ap_info);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Get Wi-Fi AP records failed: %s", esp_err_to_name(ret));
-        return;
-    }
-#if ENABLE_DEBUG_LOG
-    ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
-#endif
-
-    esp_lv_adapter_lock(-1);
-    if(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
-        deinitWifiListButton();
-    }
-    esp_lv_adapter_unlock();
-
-    for (int i = 0; (i < SCAN_LIST_SIZE) && (i < ap_count); i++) {
-#if ENABLE_DEBUG_LOG
-        ESP_LOGI(TAG, "SSID \t\t%s", ap_info[i].ssid);
-        ESP_LOGI(TAG, "RSSI \t\t%d", ap_info[i].rssi);
-        ESP_LOGI(TAG, "Channel \t\t%d", ap_info[i].primary);
-#endif
-
-        if(ap_info[i].authmode != WIFI_AUTH_OPEN && ap_info[i].authmode != WIFI_AUTH_OWE) {
-            psk_flag = true;
-        }
-#if ENABLE_DEBUG_LOG
-        ESP_LOGI(TAG, "psk_flag: %d", psk_flag);
-#endif
-
-        if(ap_info[i].rssi > -100 && ap_info[i].rssi <= -80) {
-            _wifi_signal_strength_level = WIFI_SIGNAL_STRENGTH_WEAK;
-        } else if(ap_info[i].rssi > -80 && ap_info[i].rssi <= -60) {
-            _wifi_signal_strength_level = WIFI_SIGNAL_STRENGTH_MODERATE;
-        } else if(ap_info[i].rssi > -60) {
-            _wifi_signal_strength_level = WIFI_SIGNAL_STRENGTH_GOOD;
-        } else {
-            _wifi_signal_strength_level = WIFI_SIGNAL_STRENGTH_NONE;
-        }
-#if ENABLE_DEBUG_LOG
-        ESP_LOGI(TAG, "signal_strength: %d", _wifi_signal_strength_level);
-#endif
-
-        esp_lv_adapter_lock(-1);
-        if(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
-            initWifiListButton(label_wifi_ssid[i], img_img_wifi_lock[i], wifi_image[i], wifi_connect[i],
-                                ap_info[i].ssid, psk_flag, _wifi_signal_strength_level);
-        }
-        esp_lv_adapter_unlock();
+    if (!_wifi_manager.startDiscovery()) {
+        ESP_LOGW(TAG, "Failed to queue Wi-Fi discovery request");
     }
 }
 
-void AppSettings::initWifiListButton(lv_obj_t* lv_label_ssid, lv_obj_t* lv_img_wifi_lock, lv_obj_t* lv_wifi_img,
-                                     lv_obj_t *lv_wifi_connect, uint8_t* ssid, bool psk, WifiSignalStrengthLevel_t signal_strength)
+void AppSettings::endWifiDiscovery(void)
 {
-    lv_label_set_text_fmt(lv_label_ssid, "%s", (const char*)ssid);
+    _wifi_manager.endDiscovery();
+}
 
-    if (strcmp((const char*)ssid, (const char*)st_wifi_ssid) == 0) {
-        lv_obj_clear_flag(lv_wifi_connect, LV_OBJ_FLAG_HIDDEN);
+AppSettings::WifiSignalStrengthLevel_t AppSettings::signalLevelFromRssi(int8_t rssi) const
+{
+    if (rssi > -60) {
+        return WIFI_SIGNAL_STRENGTH_GOOD;
+    }
+    if (rssi > -80) {
+        return WIFI_SIGNAL_STRENGTH_MODERATE;
+    }
+    if (rssi > -100) {
+        return WIFI_SIGNAL_STRENGTH_WEAK;
+    }
+    return WIFI_SIGNAL_STRENGTH_NONE;
+}
+
+void AppSettings::initWifiListButton(lv_obj_t *ssid_label, lv_obj_t *lock_image, lv_obj_t *signal_image,
+                                     lv_obj_t *connected_label, const char *ssid, bool psk,
+                                     WifiSignalStrengthLevel_t signal_strength, bool connected)
+{
+    lv_label_set_text(ssid_label, ssid != nullptr ? ssid : "");
+
+    if (psk) {
+        lv_img_set_src(lock_image, &img_wifi_lock);
+        lv_obj_clear_flag(lock_image, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lock_image, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if(psk) {
-        lv_img_set_src(lv_img_wifi_lock, &img_wifi_lock);
-        lv_obj_clear_flag(lv_img_wifi_lock, LV_OBJ_FLAG_HIDDEN);
+    if (connected) {
+        lv_obj_clear_flag(connected_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(connected_label, LV_OBJ_FLAG_HIDDEN);
     }
 
     if (signal_strength == WIFI_SIGNAL_STRENGTH_GOOD) {
-        lv_img_set_src(lv_wifi_img, &img_wifisignal_good);
+        lv_img_set_src(signal_image, &img_wifisignal_good);
     } else if (signal_strength == WIFI_SIGNAL_STRENGTH_MODERATE) {
-        lv_img_set_src(lv_wifi_img, &img_wifisignal_moderate);
+        lv_img_set_src(signal_image, &img_wifisignal_moderate);
     } else if (signal_strength == WIFI_SIGNAL_STRENGTH_WEAK) {
-        lv_img_set_src(lv_wifi_img, &img_wifisignal_wake);
+        lv_img_set_src(signal_image, &img_wifisignal_wake);
     } else {
-        lv_img_set_src(lv_wifi_img, &img_wifisignal_absent);
+        lv_img_set_src(signal_image, &img_wifisignal_absent);
     }
 }
 
 void AppSettings::deinitWifiListButton(void)
 {
-    for (int i = 0; i < SCAN_LIST_SIZE; i++) {
-        lv_obj_add_flag(img_img_wifi_lock[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(wifi_connect[i], LV_OBJ_FLAG_HIDDEN);
+    _wifi_scan_count = 0;
+    for (size_t i = 0; i < WifiConnectionManager::MAX_SCAN_RESULTS; ++i) {
+        if (_wifi_panel_buttons[i] != nullptr) {
+            lv_obj_add_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (_wifi_lock_images[i] != nullptr) {
+            lv_obj_add_flag(_wifi_lock_images[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        if (_wifi_connected_labels[i] != nullptr) {
+            lv_obj_add_flag(_wifi_connected_labels[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
+}
+
+void AppSettings::renderWifiList(const WifiConnectionManager::Snapshot &snapshot)
+{
+    uint32_t scan_version = snapshot.scan_version;
+    size_t count = _wifi_manager.copyScanResults(_wifi_scan_results.data(), _wifi_scan_results.size(),
+                                                  &scan_version);
+    _last_wifi_scan_version = scan_version;
+
+    if (snapshot.got_ip && snapshot.ssid[0] != '\0') {
+        size_t connected_index = count;
+        for (size_t i = 0; i < count; ++i) {
+            if (strncmp(reinterpret_cast<const char *>(_wifi_scan_results[i].ssid), snapshot.ssid,
+                        sizeof(_wifi_scan_results[i].ssid)) == 0) {
+                connected_index = i;
+                break;
+            }
+        }
+
+        wifi_ap_record_t connected_record = {};
+        if (connected_index < count) {
+            connected_record = _wifi_scan_results[connected_index];
+        } else {
+            const size_t ssid_len = strnlen(snapshot.ssid, sizeof(connected_record.ssid) - 1);
+            memcpy(connected_record.ssid, snapshot.ssid, ssid_len);
+        }
+        connected_record.authmode = snapshot.authmode;
+        connected_record.rssi = snapshot.rssi;
+
+        if (connected_index > 0 && connected_index < count) {
+            memmove(&_wifi_scan_results[1], &_wifi_scan_results[0],
+                    connected_index * sizeof(_wifi_scan_results[0]));
+            _wifi_scan_results[0] = connected_record;
+        } else if (connected_index == count) {
+            const size_t move_count = (count < _wifi_scan_results.size()) ? count : count - 1;
+            if (move_count > 0) {
+                memmove(&_wifi_scan_results[1], &_wifi_scan_results[0],
+                        move_count * sizeof(_wifi_scan_results[0]));
+            }
+            _wifi_scan_results[0] = connected_record;
+            if (count < _wifi_scan_results.size()) {
+                ++count;
+            }
+        } else {
+            _wifi_scan_results[0] = connected_record;
+        }
+    }
+
+    _wifi_scan_count = count;
+    for (size_t i = 0; i < _wifi_panel_buttons.size(); ++i) {
+        if (i >= count) {
+            lv_obj_add_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        const wifi_ap_record_t &record = _wifi_scan_results[i];
+        const char *ssid = reinterpret_cast<const char *>(record.ssid);
+        const bool connected = snapshot.got_ip && strncmp(ssid, snapshot.ssid, sizeof(record.ssid)) == 0;
+        const bool psk = record.authmode != WIFI_AUTH_OPEN && record.authmode != WIFI_AUTH_OWE;
+        WifiSignalStrengthLevel_t signal = signalLevelFromRssi(record.rssi);
+        if (connected && record.rssi <= -100) {
+            signal = WIFI_SIGNAL_STRENGTH_MODERATE;
+        }
+
+        initWifiListButton(_wifi_ssid_labels[i], _wifi_lock_images[i], _wifi_signal_images[i],
+                           _wifi_connected_labels[i], ssid, psk, signal, connected);
+        lv_obj_clear_flag(_wifi_panel_buttons[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (count > 0 && snapshot.enabled && !snapshot.scanning) {
+        lv_obj_clear_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void AppSettings::syncWifiUi(void)
+{
+    if (_is_ui_del) {
+        return;
+    }
+
+    WifiConnectionManager::Snapshot snapshot = {};
+    if (!_wifi_manager.getSnapshot(&snapshot)) {
+        return;
+    }
+
+    const bool state_changed = snapshot.state_version != _last_wifi_state_version;
+    const bool scan_changed = snapshot.scan_version != _last_wifi_scan_version;
+    if (_wifi_refresh_btn != nullptr) {
+        const bool refresh_disabled = !snapshot.initialized || !snapshot.enabled || snapshot.scanning ||
+                                      snapshot.state == WifiConnectionManager::State::CONNECTING_CANDIDATE;
+        if (refresh_disabled) {
+            lv_obj_add_state(_wifi_refresh_btn, LV_STATE_DISABLED);
+        } else {
+            lv_obj_clear_state(_wifi_refresh_btn, LV_STATE_DISABLED);
+        }
+    }
+
+    if (snapshot.scanning && _screen_index == UI_WIFI_SCAN_INDEX) {
+        lv_obj_clear_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!snapshot.enabled) {
+        deinitWifiListButton();
+        lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+        _last_wifi_scan_version = snapshot.scan_version;
+    } else if (state_changed || scan_changed) {
+        renderWifiList(snapshot);
+    }
+
+    if (snapshot.state == WifiConnectionManager::State::CONNECTING_CANDIDATE &&
+        _screen_index == UI_WIFI_CONNECT_INDEX &&
+        _shown_wifi_result == WifiConnectionManager::ConnectResult::NONE) {
+        processWifiConnect(WIFI_CONNECT_RUNNING);
+    }
+
+    if (_last_wifi_result_version == UINT32_MAX) {
+        _last_wifi_result_version = snapshot.connect_result_version;
+    } else if (snapshot.connect_result_version != _last_wifi_result_version) {
+        _last_wifi_result_version = snapshot.connect_result_version;
+        _shown_wifi_result = snapshot.connect_result;
+        _wifi_result_shown_at = lv_tick_get();
+        if (snapshot.connect_result == WifiConnectionManager::ConnectResult::SUCCESS) {
+            processWifiConnect(WIFI_CONNECT_SUCCESS);
+        } else if (snapshot.connect_result == WifiConnectionManager::ConnectResult::FAILED ||
+                   snapshot.connect_result == WifiConnectionManager::ConnectResult::SAVE_FAILED) {
+            processWifiConnect(WIFI_CONNECT_FAIL);
+        } else {
+            processWifiConnect(WIFI_CONNECT_HIDE);
+        }
+    }
+
+    if (_shown_wifi_result != WifiConnectionManager::ConnectResult::NONE &&
+        static_cast<uint32_t>(lv_tick_get() - _wifi_result_shown_at) >= WIFI_CONNECT_UI_WAIT_TIME_MS) {
+        const bool connected = _shown_wifi_result == WifiConnectionManager::ConnectResult::SUCCESS;
+        _shown_wifi_result = WifiConnectionManager::ConnectResult::NONE;
+        processWifiConnect(WIFI_CONNECT_HIDE);
+        if (connected && _screen_index == UI_WIFI_CONNECT_INDEX) {
+            lv_scr_load(ui_ScreenSettingWiFi);
+        }
+    }
+
+    _last_wifi_state_version = snapshot.state_version;
 }
 
 void AppSettings::euiRefresTask(void *arg)
 {
-    AppSettings *app = (AppSettings *)arg;
-    time_t now;
-    struct tm timeinfo;
-    bool is_time_pm = false;
-    // char textBuf[50];
-    uint16_t free_sram_size_kb = 0;
-    uint16_t total_sram_size_kb = 0;
-    uint16_t free_psram_size_kb = 0;
-    uint16_t total_psram_size_kb = 0;
-
-    if (app == NULL) {
+    AppSettings *app = static_cast<AppSettings *>(arg);
+    if (app == nullptr) {
         ESP_LOGE(TAG, "App instance is NULL");
-        goto err;
+        vTaskDelete(nullptr);
+        return;
     }
 
-    while (1) {
-        /* Update status bar */
-        // time
+    while (true) {
+        time_t now;
+        struct tm timeinfo;
         time(&now);
         localtime_r(&now, &timeinfo);
-        is_time_pm = (timeinfo.tm_hour >= 12);
 
-        esp_lv_adapter_lock(-1);
-        if(!app->status_bar->setClock(timeinfo.tm_hour, timeinfo.tm_min, is_time_pm)) {
-            ESP_LOGE(TAG, "Set clock failed");
-        }
-        esp_lv_adapter_unlock();
-
-        // Update WiFi icon state
-        if((xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_GOT_IP)) {
-            if (!s_sntp_done && s_sntp_task == NULL) {
-                BaseType_t ret = xTaskCreate(sntpInitTask, "SNTP Init", WIFI_CONNECT_TASK_STACK_SIZE, NULL,
-                                             WIFI_CONNECT_TASK_PRIORITY, &s_sntp_task);
-                if (ret != pdPASS) {
+        WifiConnectionManager::Snapshot snapshot = {};
+        app->_wifi_manager.getSnapshot(&snapshot);
+        WifiSignalStrengthLevel_t signal = WIFI_SIGNAL_STRENGTH_NONE;
+        if (snapshot.got_ip) {
+            signal = app->signalLevelFromRssi(snapshot.rssi);
+            if (signal == WIFI_SIGNAL_STRENGTH_NONE) {
+                signal = WIFI_SIGNAL_STRENGTH_MODERATE;
+            }
+            if (!s_sntp_started) {
+                s_sntp_started = true;
+                BaseType_t created = xTaskCreate(sntpInitTask, "SNTP Init", SNTP_TASK_STACK_SIZE, nullptr,
+                                                 SNTP_TASK_PRIORITY, nullptr);
+                if (created != pdPASS) {
                     ESP_LOGW(TAG, "Failed to create SNTP init task");
-                    s_sntp_task = NULL;
+                    s_sntp_started = false;
                 }
             }
+        }
+        app->_wifi_signal_strength_level = signal;
 
-            esp_lv_adapter_lock(-1);
-            if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_NONE) {
-                app->status_bar->setWifiIconState(0);
-            } else if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_WEAK) {
-                app->status_bar->setWifiIconState(1);
-            } else if(app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_MODERATE) {
-                app->status_bar->setWifiIconState(2);
-            } else if (app->_wifi_signal_strength_level == WIFI_SIGNAL_STRENGTH_GOOD) {
-                app->status_bar->setWifiIconState(3);
+        bool backstage_visible = false;
+        if (esp_lv_adapter_lock(-1) == ESP_OK) {
+            if (app->status_bar != nullptr) {
+                if (!app->status_bar->setClock(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_hour >= 12)) {
+                    ESP_LOGE(TAG, "Set clock failed");
+                }
+                app->status_bar->setWifiIconState(static_cast<int>(signal));
+            }
+            if (app->backstage != nullptr) {
+                backstage_visible = app->backstage->checkVisible();
             }
             esp_lv_adapter_unlock();
         }
 
-        /* Update Smart Gadget app */
-        // app->updateGadgetTime(timeinfo);
-
-        // Update memory in backstage
-        if(app->backstage->checkVisible()) {
-            free_sram_size_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
-            total_sram_size_kb = heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024;
-            free_psram_size_kb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
-            total_psram_size_kb = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
+        if (backstage_visible) {
+            const uint16_t free_sram_size_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+            const uint16_t total_sram_size_kb = heap_caps_get_total_size(MALLOC_CAP_INTERNAL) / 1024;
+            const uint16_t free_psram_size_kb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+            const uint16_t total_psram_size_kb = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024;
             ESP_LOGI(TAG, "Free sram size: %d KB, total sram size: %d KB, "
-                        "free psram size: %d KB, total psram size: %d KB",
-                        free_sram_size_kb, total_sram_size_kb, free_psram_size_kb, total_psram_size_kb);
+                     "free psram size: %d KB, total psram size: %d KB",
+                     free_sram_size_kb, total_sram_size_kb, free_psram_size_kb, total_psram_size_kb);
 
-            esp_lv_adapter_lock(-1);
-            if(!app->backstage->setMemoryLabel(free_sram_size_kb, total_sram_size_kb, free_psram_size_kb, total_psram_size_kb)) {
-                ESP_LOGE(TAG, "Update memory usage failed");
+            if (esp_lv_adapter_lock(-1) == ESP_OK) {
+                if (app->backstage != nullptr && app->backstage->checkVisible() &&
+                    !app->backstage->setMemoryLabel(free_sram_size_kb, total_sram_size_kb,
+                                                    free_psram_size_kb, total_psram_size_kb)) {
+                    ESP_LOGE(TAG, "Update memory usage failed");
+                }
+                esp_lv_adapter_unlock();
             }
-            esp_lv_adapter_unlock();
         }
 
         vTaskDelay(pdMS_TO_TICKS(HOME_REFRESH_TASK_PERIOD_MS));
     }
-
-err:
-    vTaskDelete(NULL);
 }
 
-void AppSettings::wifiScanTask(void *arg)
+void AppSettings::wifiUiTimerCallback(lv_timer_t *timer)
 {
-    AppSettings *app = (AppSettings *)arg;
-    esp_err_t ret = ESP_OK;
-
-    if (app == NULL) {
-        ESP_LOGE(TAG, "App instance is NULL");
-        goto err;
+    AppSettings *app = static_cast<AppSettings *>(timer != nullptr ? timer->user_data : nullptr);
+    if (app != nullptr) {
+        app->syncWifiUi();
     }
-
-    ret = app->initWifi();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Init Wi-Fi failed");
-        goto err;
-    }
-
-    if (ret == ESP_OK) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
-        ESP_LOGI(TAG, "wifi_init done");
-    } else {
-        ESP_LOGE(TAG, "wifi_init failed");
-    }
-
-    while (true) {
-        if((xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_INIT_DONE) &&
-           (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_UI_INIT_DONE)){
-            esp_lv_adapter_lock(-1);
-            lv_obj_add_flag(ui_SwitchPanelScreenSettingWiFiSwitch, LV_OBJ_FLAG_CLICKABLE);
-            esp_lv_adapter_unlock();
-            xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
-            xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_UI_INIT_DONE);
-        }
-
-        if(xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING){
-            app->scanWifiAndUpdateUi();
-            vTaskDelay(pdMS_TO_TICKS(WIFI_SCAN_TASK_PERIOD_MS));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-err:
-    vTaskDelete(NULL);
 }
 
-void AppSettings::wifiConnectTask(void *arg)
+void AppSettings::onWifiRefreshClickedEventCallback(lv_event_t *e)
 {
-    AppSettings *app = (AppSettings *)arg;
-    wifi_config_t wifi_config = { 0 };
-    esp_err_t ret = ESP_OK;
-
-    esp_wifi_disconnect();
-
-    if (!app->_is_ui_del) {
-        esp_lv_adapter_lock(-1);
-        app->status_bar->setWifiIconState(0);
-        esp_lv_adapter_unlock();
-    }
-
-    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", st_wifi_ssid);
-    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", st_wifi_password);
-
-    ret = esp_wifi_start();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Start Wi-Fi before connect returned %s", esp_err_to_name(ret));
-    }
-
-    ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Set Wi-Fi config failed: %s", esp_err_to_name(ret));
-        if (!app->_is_ui_del) {
-            esp_lv_adapter_lock(-1);
-            app->processWifiConnect(WIFI_CONNECT_FAIL);
-            esp_lv_adapter_unlock();
-        }
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "Connecting to SSID:%s.", wifi_config.sta.ssid);
-    esp_wifi_connect();
-
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_EVENT_GOT_IP,
-            pdFALSE,
-            pdFALSE,
-            pdMS_TO_TICKS(WIFI_CONNECT_RET_WAIT_TIME_MS));
-
-    if (bits & WIFI_EVENT_GOT_IP) {
-        ESP_LOGI(TAG, "Connected successfully");
-
-        if (!app->_is_ui_del) {
-            esp_lv_adapter_lock(-1);
-            app->processWifiConnect(WIFI_CONNECT_SUCCESS);
-            esp_lv_adapter_unlock();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(WIFI_CONNECT_UI_WAIT_TIME_MS));
-
-        if (!app->_is_ui_del) {
-            esp_lv_adapter_lock(-1);
-            app->processWifiConnect(WIFI_CONNECT_HIDE);
-            // lv_obj_clear_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
-            lv_textarea_set_text(ui_TextAreaScreenSettingVerificationPassword, "");
-            app->back();
-            esp_lv_adapter_unlock();
-        }
-
-        // app->updateGadgetTime(timeinfo);
-    } else {
-        ESP_LOGI(TAG, "Connect failed");
-
-        if (!app->_is_ui_del) {
-            esp_lv_adapter_lock(-1);
-            app->processWifiConnect(WIFI_CONNECT_FAIL);
-            esp_lv_adapter_unlock();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(WIFI_CONNECT_UI_WAIT_TIME_MS));
-
-        if (!app->_is_ui_del) {
-            esp_lv_adapter_lock(-1);
-            app->processWifiConnect(WIFI_CONNECT_HIDE);
-            // lv_obj_clear_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
-            lv_textarea_set_text(ui_TextAreaScreenSettingVerificationPassword, "");
-            // app->back();
-            esp_lv_adapter_unlock();
-        }
-    }
-
-    // if (!app->_is_ui_del) {
-    //     xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_SCANING);
-    //     app->startWifiScan();
-    // }
-
-    vTaskDelete(NULL);
-}
-
-void AppSettings::wifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
-    AppSettings *app = (AppSettings *)arg;
-
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s.", st_wifi_ssid);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
-        ESP_LOGI(TAG, "disconnected from ap SSID:%s.", st_wifi_ssid);
-        memset(st_wifi_ssid, 0, sizeof(st_wifi_ssid));
-
-        // app->back();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
-        ESP_LOGI(TAG, "got IP address for SSID:%s.", st_wifi_ssid);
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-        xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_GOT_IP);
-        ESP_LOGW(TAG, "lost IP address for SSID:%s.", st_wifi_ssid);
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
-        if(lv_obj_has_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN) &&
-           xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_SCANING) {
-            if (!app->_is_ui_del) {
-                esp_lv_adapter_lock(-1);
-                lv_obj_clear_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_add_flag(ui_SwitchPanelScreenSettingWiFiSwitch, LV_OBJ_FLAG_CLICKABLE);
-                app->status_bar->setWifiIconState(0);
-                esp_lv_adapter_unlock();
-            }
-        }
+    AppSettings *app = static_cast<AppSettings *>(lv_event_get_user_data(e));
+    if (app != nullptr && !app->_is_ui_del) {
+        app->requestWifiDiscovery();
     }
 }
 
@@ -952,17 +879,18 @@ void AppSettings::onKeyboardScreenSettingVerificationClickedEventCallback(lv_eve
     if(lv_keyboard_get_selected_btn(target) == 39) {
         const char *ssid = lv_label_get_text(ui_LabelScreenSettingVerificationSSID);
         const char *password = lv_textarea_get_text(ui_TextAreaScreenSettingVerificationPassword);
-        snprintf(st_wifi_ssid, sizeof(st_wifi_ssid), "%s", ssid ? ssid : "");
-        snprintf(st_wifi_password, sizeof(st_wifi_password), "%s", password ? password : "");
 
         app->setVerificationKeyboardVisible(false);
         app->processWifiConnect(WIFI_CONNECT_RUNNING);
-        // lv_obj_add_flag(ui_KeyboardScreenSettingVerification, LV_OBJ_FLAG_HIDDEN);
-
-        app->stopWifiScan();
-
-        xTaskCreatePinnedToCore(wifiConnectTask, "wifi Connect", WIFI_CONNECT_TASK_STACK_SIZE, app,
-                                WIFI_CONNECT_TASK_PRIORITY, NULL, WIFI_CONNECT_TASK_STACK_CORE);
+        const bool queued = app->_wifi_manager.connectCandidate(ssid != nullptr ? ssid : "",
+                                                                 password != nullptr ? password : "");
+        lv_textarea_set_text(ui_TextAreaScreenSettingVerificationPassword, "");
+        if (!queued) {
+            app->_shown_wifi_result = WifiConnectionManager::ConnectResult::FAILED;
+            app->_wifi_result_shown_at = lv_tick_get();
+            app->processWifiConnect(WIFI_CONNECT_FAIL);
+            ESP_LOGW(TAG, "Failed to queue candidate Wi-Fi connection");
+        }
     }
 
 end:
@@ -972,9 +900,11 @@ end:
 void AppSettings::onScreenLoadEventCallback( lv_event_t * e)
 {
     AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
+    if (app == nullptr) {
+        ESP_LOGE(TAG, "Invalid app pointer");
+        return;
+    }
     SettingScreenIndex_t last_scr_index = app->_screen_index;
-
-    ESP_BROOKESIA_CHECK_NULL_GOTO(app, end, "Invalid app pointer");
 
     for (int i = 0; i < UI_MAX_INDEX; i++) {
         if (app->_screen_list[i] == lv_event_get_target(e)) {
@@ -983,66 +913,84 @@ void AppSettings::onScreenLoadEventCallback( lv_event_t * e)
         }
     }
 
-    if (last_scr_index == UI_WIFI_SCAN_INDEX) {
-        app->stopWifiScan();
+    const bool was_wifi_screen = last_scr_index == UI_WIFI_SCAN_INDEX || last_scr_index == UI_WIFI_CONNECT_INDEX;
+    const bool is_wifi_screen = app->_screen_index == UI_WIFI_SCAN_INDEX ||
+                                app->_screen_index == UI_WIFI_CONNECT_INDEX;
+    if (was_wifi_screen && !is_wifi_screen) {
+        app->endWifiDiscovery();
     }
 
-    if ((app->_screen_index == UI_WIFI_SCAN_INDEX) && (app->_nvs_param_map[NVS_KEY_WIFI_ENABLE] == true)) {
-        app->startWifiScan();
+    if (app->_screen_index == UI_WIFI_SCAN_INDEX && app->_nvs_param_map[NVS_KEY_WIFI_ENABLE] != 0) {
+        WifiConnectionManager::Snapshot snapshot = {};
+        const bool has_snapshot = app->_wifi_manager.getSnapshot(&snapshot);
+        if (!has_snapshot || (!snapshot.got_ip && !snapshot.discovery_active &&
+                              snapshot.state != WifiConnectionManager::State::CONNECTING_CANDIDATE)) {
+            app->requestWifiDiscovery();
+        }
+        app->syncWifiUi();
     }
-
-end:
-    return;
 }
 
 void AppSettings::onSwitchPanelScreenSettingWiFiSwitchValueChangeEventCallback( lv_event_t * e) {
-    lv_state_t state = lv_obj_get_state(ui_SwitchPanelScreenSettingWiFiSwitch);
-
     AppSettings *app = (AppSettings *)lv_event_get_user_data(e);
-    ESP_BROOKESIA_CHECK_NULL_GOTO(app, end, "Invalid app pointer");
+    if (app == nullptr) {
+        ESP_LOGE(TAG, "Invalid app pointer");
+        return;
+    }
+    lv_state_t state = lv_obj_get_state(ui_SwitchPanelScreenSettingWiFiSwitch);
+    const bool enabled = (state & LV_STATE_CHECKED) != 0;
 
-    if (state & LV_STATE_CHECKED) {
-        app->_nvs_param_map[NVS_KEY_WIFI_ENABLE] = true;
-        app->setNvsParam(NVS_KEY_WIFI_ENABLE, 1);
-        if (app->_screen_index == UI_WIFI_SCAN_INDEX) {
-            app->startWifiScan();
-        }
-    } else {
-        app->_nvs_param_map[NVS_KEY_WIFI_ENABLE] = false;
-        app->setNvsParam(NVS_KEY_WIFI_ENABLE, 0);
-        if (app->_screen_index == UI_WIFI_SCAN_INDEX) {
-            app->stopWifiScan();
-            if (xEventGroupGetBits(s_wifi_event_group) & WIFI_EVENT_GOT_IP) {
-                ESP_ERROR_CHECK(esp_wifi_disconnect());
-                app->status_bar->setWifiIconState(0);
-            }
-        }
+    app->_nvs_param_map[NVS_KEY_WIFI_ENABLE] = enabled;
+    app->setNvsParam(NVS_KEY_WIFI_ENABLE, enabled ? 1 : 0);
+    if (!app->_wifi_manager.setEnabled(enabled)) {
+        ESP_LOGW(TAG, "Failed to queue Wi-Fi enabled state: enabled=%d", enabled);
     }
 
-end:
-    return;
+    if (enabled) {
+        if (app->_screen_index == UI_WIFI_SCAN_INDEX) {
+            app->requestWifiDiscovery();
+        }
+    } else {
+        app->deinitWifiListButton();
+        lv_obj_add_flag(ui_PanelScreenSettingWiFiList, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ui_SpinnerScreenSettingWiFi, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void AppSettings::onButtonWifiListClickedEventCallback(lv_event_t * e)
 {
-    lv_obj_t *label_wifi_ssid = (lv_obj_t*)lv_event_get_user_data(e);
+    AppSettings *app = static_cast<AppSettings *>(lv_event_get_user_data(e));
     lv_obj_t *btn = lv_event_get_target(e);
-    lv_area_t btn_click_area;
-    lv_point_t point;
-
-    lv_obj_get_click_area(btn, &btn_click_area);
-    lv_indev_get_point(lv_indev_get_act(), &point);
-    if ((point.x < btn_click_area.x1) || (point.x > btn_click_area.x2) ||
-        (point.y < btn_click_area.y1) || (point.y > btn_click_area.y2)) {
+    if (app == nullptr || btn == nullptr) {
         return;
     }
 
+    size_t index = app->_wifi_panel_buttons.size();
+    for (size_t i = 0; i < app->_wifi_panel_buttons.size(); ++i) {
+        if (app->_wifi_panel_buttons[i] == btn) {
+            index = i;
+            break;
+        }
+    }
+    if (index >= app->_wifi_scan_count) {
+        return;
+    }
+
+    const char *ssid = reinterpret_cast<const char *>(app->_wifi_scan_results[index].ssid);
+    if (ssid[0] == '\0') {
+        return;
+    }
+    WifiConnectionManager::Snapshot snapshot = {};
+    if (app->_wifi_manager.getSnapshot(&snapshot) && snapshot.got_ip &&
+        strncmp(ssid, snapshot.ssid, sizeof(snapshot.ssid)) == 0) {
+        return;
+    }
+
+    app->processWifiConnect(WIFI_CONNECT_HIDE);
+    app->setVerificationKeyboardVisible(false);
+    lv_textarea_set_text(ui_TextAreaScreenSettingVerificationPassword, "");
+    lv_label_set_text(ui_LabelScreenSettingVerificationSSID, ssid);
     lv_scr_load(ui_ScreenSettingVerification);
-    lv_label_set_text_fmt(ui_LabelScreenSettingVerificationSSID, "%s", lv_label_get_text(label_wifi_ssid));
-
-    xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_SCANING);
-
-    esp_wifi_scan_stop();
 }
 
 void AppSettings::onSwitchPanelScreenSettingBLESwitchValueChangeEventCallback( lv_event_t * e) {

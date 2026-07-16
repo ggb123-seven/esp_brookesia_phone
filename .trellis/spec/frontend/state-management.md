@@ -95,3 +95,107 @@ through the owning component:
 - Making persistent settings local to one callback instead of routing through
   the NVS load/set helpers.
 - Holding LVGL locks across state waits, file scans, or Wi-Fi operations.
+
+## Hosted Wi-Fi Connection Contract
+
+### 1. Scope / Trigger
+
+Use this contract for Wi-Fi enablement, saved credentials, reconnect behavior,
+or AP discovery on the ESP32-P4 board. The P4 uses `esp_wifi_remote` and
+ESP-Hosted to control an ESP32-C6, so Wi-Fi control RPCs and network data share
+the SDIO transport.
+
+### 2. Signatures
+
+The long-lived `WifiConnectionManager` owns these app-facing operations:
+
+```cpp
+esp_err_t begin(bool enabled);
+bool setEnabled(bool enabled);
+bool connectCandidate(const char *ssid, const char *password);
+bool startDiscovery(void);
+bool endDiscovery(void);
+bool getSnapshot(Snapshot *snapshot);
+size_t copyScanResults(wifi_ap_record_t *records, size_t capacity,
+                       uint32_t *version);
+```
+
+Only its manager task may call `esp_wifi_start/stop/connect/disconnect`,
+`esp_wifi_set/get_config`, `esp_wifi_set_storage`, or `esp_wifi_scan_*`.
+Settings and status-bar code consume `Snapshot`; the snapshot never contains a
+password.
+
+### 3. Contracts
+
+- `storage/wifi_en=0` disables connection and retries but retains credentials.
+- The first implementation stores exactly one network: the last candidate that
+  reached `IP_EVENT_STA_GOT_IP` and was committed successfully.
+- Candidate credentials use `WIFI_STORAGE_RAM`. A wrong password, timeout, or
+  missing AP must not replace the saved Flash configuration.
+- With Wi-Fi enabled and a saved SSID, startup calls `esp_wifi_connect()`
+  without requiring the Settings app to be opened.
+- Temporary failures retry after 1, 2, 5, 10, then 30 seconds. Authentication
+  failures retry no faster than once per 60 seconds.
+- A connected station must never start an automatic or periodic scan. Explicit
+  discovery disconnects the station, allows the link to settle, performs one
+  blocking scan in the manager task, and reconnects the saved network when the
+  discovery page is left without a successful replacement.
+- The manager never calls LVGL. Settings polls versioned snapshots from an LVGL
+  timer and may enqueue commands from callbacks without waiting for Wi-Fi RPCs.
+- Logs may contain SSID, state, disconnect reason, and stack watermark. They
+  must not contain passwords or complete `wifi_config_t` values.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+|-----------|-------------------|
+| No saved SSID | Enter `IDLE_NO_CONFIG`; allow explicit discovery |
+| Saved AP absent | Enter bounded `RETRY_WAIT`; keep UI responsive |
+| Authentication failure | Preserve saved config; apply 60-second retry delay |
+| Candidate reaches GOT_IP | Commit candidate to Flash, then publish success |
+| Candidate timeout or disconnect | Restore saved Flash config and publish failure |
+| Wi-Fi disabled | Stop Wi-Fi, cancel deadlines/discovery, retain saved config |
+| Connected user requests refresh | Controlled disconnect, settle, one scan; no concurrent connected scan |
+| Stale GOT_IP outside a connecting state | Ignore it; do not publish a false connected state |
+| Command/event queue full | Log an error without printing credentials |
+
+### 5. Good / Base / Bad Cases
+
+- **Good**: Reboot with `wifi_en=1` and a saved AP available; the manager gets an
+  IP, starts no scan, and SNTP/HTTP traffic does not reset the SDIO transport.
+- **Base**: No saved network; Settings shows results only after discovery and a
+  successful candidate becomes the sole saved network.
+- **Bad**: A Settings task periodically calls `esp_wifi_scan_start()` after
+  GOT_IP while SNTP or HTTP is active. Older C6 firmware can report
+  `H_SDIO_DRV: Unrecoverable host sdio state` and restart the P4.
+
+### 6. Tests Required
+
+- Build with `idf.py build`; assert no direct Wi-Fi control calls remain outside
+  `WifiConnectionManager` in the Settings component.
+- Reboot without opening Settings; assert logs show saved-network connect and
+  GOT_IP, with no subsequent automatic `Scan start Req`.
+- Keep SNTP and a schedule HTTP request active after GOT_IP; assert there is no
+  SDIO transport restart, software reset, panic, or watchdog.
+- Turn the hotspot off and on; assert retry delays are bounded and GOT_IP
+  recovers without UI interaction.
+- Try a wrong candidate password; reboot or restore the old AP and assert the
+  previous saved network still connects.
+- Toggle Wi-Fi off/on and close/reopen Settings during discovery; assert no
+  invalid LVGL access and no retry while disabled.
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```cpp
+// A page task scans every few seconds, including while connected.
+esp_wifi_scan_start(nullptr, true);
+```
+
+Correct:
+
+```cpp
+// LVGL only enqueues intent; the manager serializes disconnect and scan.
+wifi_manager.startDiscovery();
+```
