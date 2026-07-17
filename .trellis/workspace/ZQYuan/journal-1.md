@@ -707,3 +707,69 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: 整合课表服务器启动与 EAMS 会话续期
+
+**Date**: 2026-07-17
+**Task**: 整合课表服务器启动与 EAMS 会话续期
+**Branch**: `main`
+
+### Summary
+
+实现桌面单入口会话检查与可见 Edge 续期，人工完成滑块后原子更新 storage state，安全重启受管服务器；修复 token 对齐并完成构建、刷机和真实课表验证。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f35559c` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 12: 归档课表动态查询相关任务
+
+**Date**: 2026-07-17
+**Task**: 归档课表动态查询相关任务
+**Branch**: `main`
+
+### Summary
+
+完成课表动态楼宇与教室目录、精确真实查询、固件选择状态和陈旧响应保护的质量收口；服务端自测、mock 日志脱敏、字体覆盖和固件构建通过，并按用户要求归档三个课表相关任务。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `97b0db7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
