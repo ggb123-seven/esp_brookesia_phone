@@ -49,6 +49,25 @@ function Resolve-ProjectFile {
     return [IO.Path]::GetFullPath((Join-Path $ProjectDirectory $PathText))
 }
 
+function Get-SessionStorageStatePath {
+    param([Parameter(Mandatory = $true)][string]$SessionFile)
+
+    try {
+        $config = Get-Content -LiteralPath $SessionFile -Raw | ConvertFrom-Json
+        $property = $config.PSObject.Properties | Where-Object { $_.Name -eq "playwright_storage_state" } | Select-Object -First 1
+        if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return $null
+        }
+        $pathText = [string]$property.Value
+        if ([IO.Path]::IsPathRooted($pathText)) {
+            return [IO.Path]::GetFullPath($pathText)
+        }
+        return [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $SessionFile) $pathText))
+    } catch {
+        return $null
+    }
+}
+
 function Get-PythonCommand {
     $python = Get-Command "python.exe" -ErrorAction SilentlyContinue
     if ($null -ne $python) {
@@ -80,15 +99,24 @@ function Invoke-PythonCapture {
     $quotedArguments = foreach ($argument in $allArguments) {
         '"' + $argument.Replace('"', '\"') + '"'
     }
-    $stdoutPath = [IO.Path]::GetTempFileName()
-    $stderrPath = [IO.Path]::GetTempFileName()
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $PythonCommand.Executable
+    $startInfo.Arguments = $quotedArguments -join " "
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
     try {
-        $process = Start-Process -FilePath $PythonCommand.Executable `
-            -ArgumentList ($quotedArguments -join " ") `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath `
-            -WindowStyle Hidden `
-            -PassThru
+        if (-not $process.Start()) {
+            throw "Python process could not be started."
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             try {
                 $process.Kill()
@@ -102,9 +130,9 @@ function Invoke-PythonCapture {
                 TimedOut = $true
             }
         }
-
-        $stdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
-        $stderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         $output = (@($stdout, $stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
         return [PSCustomObject]@{
             ExitCode = $process.ExitCode
@@ -112,7 +140,7 @@ function Invoke-PythonCapture {
             TimedOut = $false
         }
     } finally {
-        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+        $process.Dispose()
     }
 }
 
@@ -214,19 +242,80 @@ function Test-ExistingScheduleServer {
     return $false
 }
 
-function Assert-PortAvailable {
-    param([int]$Port)
+function Test-CommandLineContainsPath {
+    param(
+        [string]$CommandLine,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath
+    )
 
-    if (Test-ExistingScheduleServer $Port) {
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
         return $false
     }
+    $normalizedExpected = [IO.Path]::GetFullPath($ExpectedPath).Replace("/", "\").ToLowerInvariant()
+    $normalizedCommandLine = $CommandLine.Replace("/", "\").ToLowerInvariant()
+    return $normalizedCommandLine.Contains($normalizedExpected)
+}
+
+function Get-ScheduleServerPortState {
+    param(
+        [int]$Port,
+        [Parameter(Mandatory = $true)][string]$ServerScript,
+        [Parameter(Mandatory = $true)][string]$LauncherScript
+    )
 
     $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
-    if ($listeners.Count -gt 0) {
-        $processIds = ($listeners | Select-Object -ExpandProperty OwningProcess -Unique) -join ", "
-        throw "Port $Port is already used by another process (PID: $processIds)."
+    if ($listeners.Count -eq 0) {
+        return [PSCustomObject]@{ Kind = "free"; ProcessId = $null; Healthy = $false }
     }
-    return $true
+
+    $processIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($processIds.Count -ne 1) {
+        return [PSCustomObject]@{ Kind = "foreign"; ProcessId = ($processIds -join ", "); Healthy = $false }
+    }
+
+    $processId = [int]$processIds[0]
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return [PSCustomObject]@{ Kind = "foreign"; ProcessId = $processId; Healthy = $false }
+    }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.ParentProcessId)" -ErrorAction SilentlyContinue
+    $serverMatches = Test-CommandLineContainsPath -CommandLine $process.CommandLine -ExpectedPath $ServerScript
+    $launcherMatches = ($null -ne $parent) -and `
+        (Test-CommandLineContainsPath -CommandLine $parent.CommandLine -ExpectedPath $LauncherScript)
+    if (-not $serverMatches -or -not $launcherMatches) {
+        return [PSCustomObject]@{ Kind = "foreign"; ProcessId = $processId; Healthy = $false }
+    }
+
+    return [PSCustomObject]@{
+        Kind = "project_server"
+        ProcessId = $processId
+        Healthy = Test-ExistingScheduleServer $Port
+        StartedAtUtc = ([datetime]$process.CreationDate).ToUniversalTime()
+    }
+}
+
+function Stop-VerifiedScheduleServer {
+    param(
+        [int]$Port,
+        [int]$ExpectedProcessId,
+        [Parameter(Mandatory = $true)][string]$ServerScript,
+        [Parameter(Mandatory = $true)][string]$LauncherScript
+    )
+
+    $current = Get-ScheduleServerPortState -Port $Port -ServerScript $ServerScript -LauncherScript $LauncherScript
+    if ($current.Kind -ne "project_server" -or $current.ProcessId -ne $ExpectedProcessId) {
+        throw "The existing schedule server changed before restart; no process was stopped."
+    }
+
+    Stop-Process -Id $ExpectedProcessId -Force -ErrorAction Stop
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        Start-Sleep -Milliseconds 500
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+        if ($listeners.Count -eq 0) {
+            return
+        }
+    }
+    throw "The previous schedule server did not release port $Port in time."
 }
 
 function Test-EamsSession {
@@ -254,13 +343,15 @@ function Test-EamsSession {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $true
+            CanRefresh = $false
             Message = "The EAMS session check timed out. Check the network and WebVPN reachability, then try again."
         }
     }
-    if ($probe.ExitCode -ne 0) {
+    if ($null -ne $probe.ExitCode -and $probe.ExitCode -ne 0) {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $true
+            CanRefresh = $false
             Message = "The EAMS session check could not run. Check Python and the local session configuration."
         }
     }
@@ -271,23 +362,27 @@ function Test-EamsSession {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $false
+            CanRefresh = $false
             Message = "The EAMS session check returned an invalid response."
         }
     }
 
-    if ($null -eq $result.session) {
+    $sessionProperty = $result.PSObject.Properties | Where-Object { $_.Name -eq "session" } | Select-Object -First 1
+    if ($null -eq $sessionProperty -or $null -eq $sessionProperty.Value) {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $false
+            CanRefresh = $false
             Message = "The EAMS session check returned no session result."
         }
     }
 
-    $session = $result.session
+    $session = $sessionProperty.Value
     if ($session.status -eq "request_failed") {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $true
+            CanRefresh = $false
             Message = "The school system is temporarily unreachable. Check the network and try again."
         }
     }
@@ -295,29 +390,96 @@ function Test-EamsSession {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $false
-            Message = "The EAMS session is unavailable (status: $($session.status)). Re-export the session file after logging in."
+            CanRefresh = $session.status -notin @("placeholder_upstream_url", "placeholder_headers")
+            Message = "The EAMS session is unavailable (status: $($session.status)). Run the launcher normally to refresh it."
         }
     }
     if ([bool]$session.looks_like_login) {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $false
-            Message = "The EAMS session has expired and returned to the login page. Re-export the session file after logging in."
+            CanRefresh = $true
+            Message = "The EAMS session has expired and returned to the login page. Run the launcher normally to refresh it."
         }
     }
     if (-not ([bool]$session.looks_like_eams) -and -not ([bool]$session.starts_json)) {
         return [PSCustomObject]@{
             IsValid = $false
             IsRetryable = $false
-            Message = "The session response is not recognized as EAMS data. Re-export the session file after logging in."
+            CanRefresh = $true
+            Message = "The session response is not recognized as EAMS data. Run the launcher normally to refresh it."
         }
     }
 
     return [PSCustomObject]@{
         IsValid = $true
         IsRetryable = $false
+        CanRefresh = $false
         Message = "EAMS session is valid."
     }
+}
+
+function Invoke-EamsSessionRefresh {
+    param(
+        [Parameter(Mandatory = $true)]$PythonCommand,
+        [Parameter(Mandatory = $true)][string]$RefreshScript,
+        [Parameter(Mandatory = $true)][string]$SessionFile,
+        [Parameter(Mandatory = $true)][string]$LoginFile,
+        [Parameter(Mandatory = $true)][string]$ProfileDirectory,
+        [string]$EdgeExecutable,
+        [int]$LoginTimeoutSeconds,
+        [int]$UpstreamTimeoutSeconds
+    )
+
+    $arguments = @(
+        "-B", "-X", "utf8", $RefreshScript,
+        "--session-file", $SessionFile,
+        "--login-file", $LoginFile,
+        "--profile-dir", $ProfileDirectory,
+        "--timeout-seconds", "$LoginTimeoutSeconds",
+        "--upstream-timeout-seconds", "$UpstreamTimeoutSeconds"
+    )
+    if (-not [string]::IsNullOrWhiteSpace($EdgeExecutable)) {
+        $arguments += @("--edge-executable", $EdgeExecutable)
+    }
+
+    $refresh = Invoke-PythonCapture `
+        -PythonCommand $PythonCommand `
+        -Arguments $arguments `
+        -TimeoutSeconds ($LoginTimeoutSeconds + $UpstreamTimeoutSeconds + 45)
+    if ($refresh.TimedOut) {
+        return [PSCustomObject]@{
+            Success = $false
+            Message = "The EAMS login window did not finish in time. Run the launcher again to retry."
+        }
+    }
+
+    $result = $null
+    try {
+        $result = $refresh.Output | ConvertFrom-Json
+    } catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Message = "The EAMS session refresh returned an invalid response."
+        }
+    }
+    if ($null -eq $result) {
+        return [PSCustomObject]@{
+            Success = $false
+            Message = "The EAMS session refresh returned no result."
+        }
+    }
+    $okProperty = $result.PSObject.Properties | Where-Object { $_.Name -eq "ok" } | Select-Object -First 1
+    if ($null -eq $okProperty -or -not [bool]$okProperty.Value) {
+        $messageProperty = $result.PSObject.Properties | Where-Object { $_.Name -eq "message" } | Select-Object -First 1
+        $message = if ($null -ne $messageProperty -and -not [string]::IsNullOrWhiteSpace([string]$messageProperty.Value)) {
+            [string]$messageProperty.Value
+        } else {
+            "The EAMS session refresh failed."
+        }
+        return [PSCustomObject]@{ Success = $false; Message = $message }
+    }
+    return [PSCustomObject]@{ Success = $true; Message = "EAMS session updated." }
 }
 
 function Show-AutoStartError {
@@ -352,6 +514,10 @@ function Invoke-Launcher {
     if (-not (Test-Path -LiteralPath $serverScript -PathType Leaf)) {
         throw "Server script not found: $serverScript"
     }
+    $refreshScript = Join-Path $projectDirectory "tools\eams_session_refresh.py"
+    if (-not (Test-Path -LiteralPath $refreshScript -PathType Leaf)) {
+        throw "EAMS session refresh script not found: $refreshScript"
+    }
 
     $python = Get-PythonCommand
     $serverHost = Get-ProcessSetting -Name "SERVER_HOST" -Default "0.0.0.0"
@@ -377,11 +543,28 @@ function Invoke-Launcher {
     $fixtureFile = Resolve-ProjectFile -ProjectDirectory $projectDirectory -PathText (Get-ProcessSetting -Name "FIXTURE_PATH" -Default "tools\fixtures\classroom_schedule_fixture.json")
     $sessionFile = Resolve-ProjectFile -ProjectDirectory $projectDirectory -PathText (Get-ProcessSetting -Name "EAMS_SESSION_FILE" -Default ".local-secrets\eams-session.json")
     $loginFile = Resolve-ProjectFile -ProjectDirectory $projectDirectory -PathText (Get-ProcessSetting -Name "EAMS_LOGIN_FILE" -Default ".local-secrets\eams-login.json")
+    $storageStateFile = Get-SessionStorageStatePath -SessionFile $sessionFile
     $timeoutText = Get-ProcessSetting -Name "UPSTREAM_TIMEOUT_SECONDS" -Default "12"
     $timeoutSeconds = 0
     if (-not [int]::TryParse($timeoutText, [ref]$timeoutSeconds) -or $timeoutSeconds -lt 1 -or $timeoutSeconds -gt 120) {
         throw "UPSTREAM_TIMEOUT_SECONDS must be between 1 and 120."
     }
+    $loginTimeoutText = Get-ProcessSetting -Name "EAMS_LOGIN_TIMEOUT_SECONDS" -Default "600"
+    $loginTimeoutSeconds = 0
+    if (-not [int]::TryParse($loginTimeoutText, [ref]$loginTimeoutSeconds) -or
+        $loginTimeoutSeconds -lt 30 -or $loginTimeoutSeconds -gt 3600) {
+        throw "EAMS_LOGIN_TIMEOUT_SECONDS must be between 30 and 3600."
+    }
+    $browserProfile = Resolve-ProjectFile `
+        -ProjectDirectory $projectDirectory `
+        -PathText (Get-ProcessSetting -Name "EAMS_BROWSER_PROFILE" -Default ".local-secrets\eams-edge-profile")
+    $edgeExecutable = Get-ProcessSetting -Name "EDGE_EXECUTABLE"
+    if (-not [string]::IsNullOrWhiteSpace($edgeExecutable)) {
+        $edgeExecutable = Resolve-ProjectFile -ProjectDirectory $projectDirectory -PathText $edgeExecutable
+    }
+    $refreshSession = ConvertTo-SettingBoolean `
+        -Value (Get-ProcessSetting -Name "REFRESH_EAMS_SESSION" -Default "1") `
+        -Default $true
 
     if ($provider -eq "fixture") {
         if (-not (Test-Path -LiteralPath $fixtureFile -PathType Leaf)) {
@@ -396,6 +579,14 @@ function Invoke-Launcher {
         $checkSession = $false
     }
 
+    $portState = Get-ScheduleServerPortState `
+        -Port $serverPort `
+        -ServerScript $serverScript `
+        -LauncherScript $PSCommandPath
+    if ($portState.Kind -eq "foreign") {
+        throw "Port $serverPort is used by a process that is not the managed schedule server (PID: $($portState.ProcessId))."
+    }
+
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host "Classroom schedule server" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
@@ -405,6 +596,7 @@ function Invoke-Launcher {
     Write-Host "Provider: $provider"
     Write-Host "Tokens:   configured (values are hidden)"
 
+    $sessionRefreshed = $false
     if ($provider -ne "fixture" -and $checkSession) {
         Write-Host "Session:  checking EAMS..." -NoNewline
         $probeAttempts = if ($AutoStart) { 2 } else { 1 }
@@ -418,22 +610,89 @@ function Invoke-Launcher {
         }
         if (-not $probe.IsValid) {
             Write-Host " failed" -ForegroundColor Red
-            throw $probe.Message
+            if ($probe.CanRefresh -and $refreshSession -and -not $CheckOnly) {
+                Write-Host "Session:  open Edge and complete the slider/login within $loginTimeoutSeconds seconds." -ForegroundColor Yellow
+                $refresh = Invoke-EamsSessionRefresh `
+                    -PythonCommand $python `
+                    -RefreshScript $refreshScript `
+                    -SessionFile $sessionFile `
+                    -LoginFile $loginFile `
+                    -ProfileDirectory $browserProfile `
+                    -EdgeExecutable $edgeExecutable `
+                    -LoginTimeoutSeconds $loginTimeoutSeconds `
+                    -UpstreamTimeoutSeconds $timeoutSeconds
+                if (-not $refresh.Success) {
+                    $fallbackProbe = Test-EamsSession `
+                        -PythonCommand $python `
+                        -ServerScript $serverScript `
+                        -SessionFile $sessionFile `
+                        -LoginFile $loginFile `
+                        -TimeoutSeconds $timeoutSeconds
+                    if (-not $fallbackProbe.IsValid) {
+                        throw $refresh.Message
+                    }
+                }
+
+                Write-Host "Session:  verifying updated EAMS session..." -NoNewline
+                $probe = Test-EamsSession `
+                    -PythonCommand $python `
+                    -ServerScript $serverScript `
+                    -SessionFile $sessionFile `
+                    -LoginFile $loginFile `
+                    -TimeoutSeconds $timeoutSeconds
+                if (-not $probe.IsValid) {
+                    Write-Host " failed" -ForegroundColor Red
+                    throw $probe.Message
+                }
+                $sessionRefreshed = $true
+                Write-Host " valid" -ForegroundColor Green
+            } else {
+                throw $probe.Message
+            }
+        } else {
+            Write-Host " valid" -ForegroundColor Green
         }
-        Write-Host " valid" -ForegroundColor Green
     } elseif ($provider -ne "fixture") {
         Write-Host "Session:  check skipped" -ForegroundColor Yellow
     }
 
-    $shouldStart = Assert-PortAvailable -Port $serverPort
-    if (-not $shouldStart) {
-        Write-Host "Status:   server is already running on port $serverPort" -ForegroundColor Green
+    if ($CheckOnly) {
+        if ($portState.Kind -eq "project_server" -and -not $portState.Healthy) {
+            throw "The managed schedule server is listening on port $serverPort but its health check failed."
+        }
+        Write-Host "Status:   checks passed; server was not started" -ForegroundColor Green
         return 0
     }
 
-    if ($CheckOnly) {
-        Write-Host "Status:   checks passed; server was not started" -ForegroundColor Green
-        return 0
+    $storageStateIsNewer = $false
+    if ($portState.Kind -eq "project_server" -and
+        -not [string]::IsNullOrWhiteSpace($storageStateFile) -and
+        (Test-Path -LiteralPath $storageStateFile -PathType Leaf)) {
+        $storageStateIsNewer = (Get-Item -LiteralPath $storageStateFile).LastWriteTimeUtc -gt $portState.StartedAtUtc
+    }
+
+    if ($portState.Kind -eq "project_server") {
+        if ($sessionRefreshed -or $storageStateIsNewer) {
+            Write-Host "Status:   restarting the managed server to load the updated session" -ForegroundColor Yellow
+            Stop-VerifiedScheduleServer `
+                -Port $serverPort `
+                -ExpectedProcessId $portState.ProcessId `
+                -ServerScript $serverScript `
+                -LauncherScript $PSCommandPath
+            $portState = Get-ScheduleServerPortState `
+                -Port $serverPort `
+                -ServerScript $serverScript `
+                -LauncherScript $PSCommandPath
+            if ($portState.Kind -ne "free") {
+                throw "Port $serverPort was not released after restarting the managed schedule server."
+            }
+        } else {
+            if (-not $portState.Healthy) {
+                throw "The managed schedule server is listening on port $serverPort but its health check failed."
+            }
+            Write-Host "Status:   server is already running on port $serverPort" -ForegroundColor Green
+            return 0
+        }
     }
 
     $env:SCHEDULE_HOST = $serverHost

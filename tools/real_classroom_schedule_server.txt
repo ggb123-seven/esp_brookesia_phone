@@ -81,10 +81,17 @@ curl -i -X POST "http://127.0.0.1:8080/parent-call-alert/trigger" \
 
 Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服务器。相关脚本位于 `tools/windows/`：
 
-- `start_classroom_schedule_server.ps1`：统一处理 Python 检查、物理网卡 IPv4 自动识别、EAMS 会话探测、端口占用检查和服务启动。
+- `start_classroom_schedule_server.ps1`：统一处理 Python 检查、物理网卡 IPv4 自动识别、EAMS 会话探测、浏览器会话续期、端口占用检查和服务启动。
 - `start_classroom_schedule_server.bat`：桌面双击入口，不在窗口中打印 token。
 - `classroom_schedule_server_config.example.bat`：不含真实凭据的配置模板。
 - `set_classroom_schedule_autostart.ps1`：安装或移除 Windows 登录自启动快捷方式。
+- `../eams_session_refresh.py`：由启动器内部调用的可见 Edge 会话更新辅助程序，不是第二个用户入口。
+
+会话自动更新需要 Python Playwright；浏览器使用系统已安装的 Microsoft Edge，不需要下载 Playwright 自带浏览器：
+
+```powershell
+python -m pip install playwright
+```
 
 把 `.bat` 和本地配置放在同一目录。配置中的 `DISPLAY_IP` 留空时，启动器会选择带默认路由的已连接物理网卡，排除隧道、VMware 和 Wi-Fi Direct 等虚拟接口。真实课表模式使用：
 
@@ -92,16 +99,30 @@ Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服�
 set "SCHEDULE_PROVIDER=eams-room-occupancy"
 set "EAMS_SESSION_FILE=.local-secrets\eams-session.json"
 set "EAMS_LOGIN_FILE=.local-secrets\eams-login.json"
+set "EAMS_BROWSER_PROFILE=.local-secrets\eams-edge-profile"
+set "EAMS_LOGIN_TIMEOUT_SECONDS=600"
+set "EDGE_EXECUTABLE="
 set "CHECK_EAMS_SESSION=1"
+set "REFRESH_EAMS_SESSION=1"
 ```
 
-双击 `start_classroom_schedule_server.bat` 即可启动。只检查配置、网卡、会话和端口而不启动服务：
+双击 `start_classroom_schedule_server.bat` 即可完成一次启动流程：
+
+1. 会话有效时直接启动服务器；已有健康实例时正常退出。
+2. 会话过期时自动打开可见 Edge，并从未提交的 `eams-login.json` 填写账号密码。
+3. 用户本人完成滑块并提交登录；脚本不识别、拖动或绕过验证码。
+4. 登录成功后脚本自动检测 EAMS 页面，先验证候选 storage state，再原子更新正式状态文件。
+5. 若旧实例确认属于当前项目，启动器安全重启该实例，使新会话立即生效；其他端口占用进程不会被终止。
+
+浏览器默认等待 600 秒。超时、用户关闭窗口或候选会话验证失败时，旧 storage state 和旧服务器进程保持不变。Windows 登录自启动模式遇到会话过期时同样会显示 Edge 登录窗口。
+
+只检查配置、网卡、会话和端口而不启动服务：
 
 ```bat
 start_classroom_schedule_server.bat --check-only
 ```
 
-启动器不会输出 Cookie、JSESSIONID 或 API token。EAMS 返回登录页时会明确报告会话过期；学校系统不可达或探测超过总时限时报告网络超时，不把两者混为一类。检查失败时服务不会启动。仅在排障时可暂时设置 `CHECK_EAMS_SESSION=0` 跳过检查。
+`--check-only` 不打开浏览器，也不修改会话文件。启动器不会输出账号、密码、Cookie、JSESSIONID 或 API token。EAMS 返回登录页时进入一次续期流程；学校系统不可达或探测超过总时限时报告网络超时，不把两者混为一类。仅在排障时可暂时设置 `REFRESH_EAMS_SESSION=0` 禁用自动续期，或设置 `CHECK_EAMS_SESSION=0` 跳过检查后手工诊断。
 
 安装 Windows 登录自启动，`LauncherPath` 替换为本机桌面入口：
 
@@ -121,6 +142,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/set_classroom_
 ## 自测
 
 ```bash
+python tools/eams_session_refresh.py --self-test
 python tools/real_classroom_schedule_server.py \
   --self-test \
   --fixture tools/fixtures/classroom_schedule_fixture.json
@@ -152,7 +174,7 @@ python tools/real_classroom_schedule_server.py \
   --upstream-timeout-seconds 15
 ```
 
-当前已确认辽宁工程技术大学统一身份认证页面包含 CAS 字段和密码加密盐，并且对已配置账号返回 `need_captcha: true`。因此不能在服务器后台直接绕过验证码做账号密码自动登录；需要先在浏览器人工完成验证码/滑块登录，再把最小必要的 WebVPN/EAMS 查询地址和 Cookie 写入未提交的 `eams-session.json`。
+当前已确认辽宁工程技术大学统一身份认证页面包含 CAS 字段和密码加密盐，并且对已配置账号返回 `need_captcha: true`。因此不能在服务器后台直接绕过验证码做账号密码自动登录。Windows 启动器会在会话失效时打开可见 Edge 并填写本地账号密码；用户本人完成验证码/滑块和登录提交后，启动器自动验证并更新未提交的 storage state。手工运行 `--probe-eams` 仍只负责脱敏诊断，不修改会话。
 
 探测输出里常见状态含义：
 

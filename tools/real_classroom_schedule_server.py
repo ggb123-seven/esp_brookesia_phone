@@ -518,6 +518,7 @@ def sanitize_url(url: str | None) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme and parsed.netloc:
         path = parsed.path or "/"
+        path = re.sub(r";jsessionid=[^/;?#]*", "", path, flags=re.IGNORECASE)
         return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     return str(url).split("?", 1)[0].split("#", 1)[0]
 
@@ -751,6 +752,7 @@ def probe_session_config(
     timeout_seconds: int,
 ) -> EamsProbeResult:
     config = load_json_file(session_file)
+    apply_playwright_storage_state(config, session_file)
     upstream_url = config.get("upstream_url")
     headers_config = config.get("headers", {})
     result = EamsProbeResult(
@@ -1582,6 +1584,9 @@ def run_self_test(args: argparse.Namespace) -> None:
     assert sample["classroom"] == "A101"
     assert isinstance(sample["courses"], list)
     assert sample["courses"] == sorted(sample["courses"], key=lambda item: item["start"])
+    sanitized = sanitize_url("https://example.invalid/eams/home;jsessionid=secret?token=secret")
+    assert sanitized == "https://example.invalid/eams/home"
+    assert "secret" not in sanitized
 
     if provider.name == "fixture":
         for date_text in ("2026-07-16", "2026-07-17"):
