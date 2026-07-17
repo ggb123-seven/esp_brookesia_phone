@@ -773,3 +773,37 @@ Updated the Chinese README video-player notes so Windows users do not try Ubuntu
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: 归档教室今日课程联网展示 App
+
+**Date**: 2026-07-17
+**Task**: 归档教室今日课程联网展示 App
+**Branch**: `main`
+
+### Summary
+
+教室课表 App 的联网展示、NVS/SPIFFS 缓存、中文字体、动态楼宇与教室选择、真实 EAMS 中间件和请求一致性子任务均已完成，归档父任务。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `06d2fbc` | (see git log) |
+| `97b0db7` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
