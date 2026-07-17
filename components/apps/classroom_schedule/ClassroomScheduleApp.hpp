@@ -55,6 +55,7 @@ private:
     };
 
     struct QuerySnapshot {
+        uint32_t generation;
         char classroom[64];
         char date[16];
         char server_host[96];
@@ -70,8 +71,46 @@ private:
         char detail[160];
     };
 
+    struct CatalogName {
+        char value[64];
+    };
+
+    enum CatalogRequestType {
+        CATALOG_LOAD_ALL,
+        CATALOG_LOAD_ROOMS,
+    };
+
+    struct CatalogRequest {
+        CatalogRequestType type;
+        uint32_t generation;
+        char server_host[96];
+        char building[64];
+        char saved_classroom[64];
+    };
+
+    struct CatalogResult {
+        esp_err_t err;
+        int http_status;
+        CatalogRequest request;
+        CatalogName *buildings;
+        size_t building_count;
+        CatalogName *rooms;
+        size_t room_count;
+        size_t selected_building;
+        size_t selected_room;
+        bool saved_classroom_valid;
+        char detail[160];
+    };
+
+    enum PendingRequestType {
+        PENDING_NONE,
+        PENDING_CATALOG,
+        PENDING_SCHEDULE,
+    };
+
     bool loadClassroom(void);
-    bool saveClassroom(const char *classroom);
+    bool loadBuilding(void);
+    bool saveSelection(const char *building, const char *classroom);
     bool loadServerHost(void);
     bool saveServerHost(const char *server_host);
     bool loadCacheUpdatedAt(char *updated_at, size_t updated_at_size);
@@ -86,6 +125,11 @@ private:
     esp_err_t saveCacheJsonToNvs(const char *json);
     esp_err_t fetchScheduleJson(const QuerySnapshot &query, char *buffer, size_t buffer_size, size_t *json_len,
                                 int *http_status);
+    esp_err_t fetchCatalogJson(const CatalogRequest &request, const char *path, const char *building,
+                               char *buffer, size_t buffer_size, size_t *json_len, int *http_status);
+    esp_err_t parseBuildingsJson(const char *json, size_t json_len, CatalogName **buildings, size_t *count);
+    esp_err_t parseRoomsJson(const char *json, size_t json_len, const char *expected_building,
+                             CatalogName **rooms, size_t *count);
     esp_err_t parseScheduleJson(const char *json, size_t json_len, ScheduleData *data);
     esp_err_t parseCachedScheduleJson(const char *json, size_t json_len, const QuerySnapshot &query,
                                       ScheduleData *data);
@@ -96,9 +140,6 @@ private:
     bool urlEncode(const char *input, char *output, size_t output_size) const;
     void trimClassroom(char *text) const;
     void trimServerHost(char *text) const;
-    bool splitClassroom(const char *classroom, size_t *building_index, char *room, size_t room_size) const;
-    bool composeClassroom(size_t building_index, const char *room, char *classroom, size_t classroom_size) const;
-    bool validateRoomNumber(const char *room) const;
     bool parseDate(const char *date, lv_calendar_date_t *parsed) const;
     bool formatDate(const lv_calendar_date_t &date, char *text, size_t text_size) const;
     bool createQuerySnapshot(QuerySnapshot *query) const;
@@ -119,8 +160,16 @@ private:
     void closeCalendar(void);
     void applySelectedDate(const char *date);
     void startRefresh(void);
+    void startCatalogLoad(CatalogRequestType type, const char *building = NULL);
+    void launchRefresh(const QuerySnapshot &query);
+    void launchCatalogLoad(const CatalogRequest &request);
+    void startPendingRequest(void);
+    void advanceRequestGeneration(void);
     void stopRefreshTimer(void);
     void applyBuildingDropdownFont(void);
+    void updateCatalogDropdown(lv_obj_t *dropdown, const CatalogName *names, size_t count, size_t selected,
+                               const char *empty_text);
+    void freeCatalog(void);
     void applyLabelStyle(lv_obj_t *label, uint32_t color, const lv_font_t *font);
     lv_obj_t *createButton(lv_obj_t *parent, const char *text, lv_event_cb_t cb, lv_coord_t width,
                            lv_coord_t height);
@@ -128,13 +177,15 @@ private:
     int parseMinuteOfDay(const char *time_text) const;
     void findCurrentAndNext(const ScheduleData &data, int *current_index, int *next_index) const;
     void updateFromWorker(const RefreshResult &result);
+    void updateFromCatalogWorker(CatalogResult *result);
 
     static void refreshTask(void *arg);
+    static void catalogTask(void *arg);
     static void refreshTimerCallback(lv_timer_t *timer);
     static void refreshEventCb(lv_event_t *e);
     static void buildingDropdownEventCb(lv_event_t *e);
+    static void roomDropdownEventCb(lv_event_t *e);
     static void saveClassroomEventCb(lv_event_t *e);
-    static void roomInputEventCb(lv_event_t *e);
     static void serverHostInputEventCb(lv_event_t *e);
     static void keyboardEventCb(lv_event_t *e);
     static void dateButtonEventCb(lv_event_t *e);
@@ -144,14 +195,28 @@ private:
 
     volatile bool _busy;
     volatile bool _closing;
+    bool _updating_dropdowns;
     ViewState _view_state;
+    char _building[64];
     char _classroom[64];
+    char _draft_building[64];
+    char _draft_classroom[64];
     char _server_host[96];
+    char _catalog_server_host[96];
     char _selected_date[16];
+    uint32_t _request_generation;
     QuerySnapshot _active_query;
+    CatalogRequest _active_catalog_request;
+    PendingRequestType _pending_request_type;
+    QuerySnapshot _pending_query;
+    CatalogRequest _pending_catalog_request;
     ScheduleData _schedule;
     bool _has_schedule;
     bool _classroom_config_valid;
+    CatalogName *_buildings;
+    size_t _building_count;
+    CatalogName *_rooms;
+    size_t _room_count;
 
     TaskHandle_t _worker_task;
     SemaphoreHandle_t _worker_done;
@@ -166,7 +231,7 @@ private:
     lv_obj_t *_detail_label;
     lv_obj_t *_course_list;
     lv_obj_t *_building_dropdown;
-    lv_obj_t *_room_ta;
+    lv_obj_t *_room_dropdown;
     lv_obj_t *_server_host_ta;
     lv_obj_t *_keyboard;
     lv_obj_t *_refresh_btn;

@@ -27,15 +27,18 @@
 #define CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS         (200)
 #define CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS   (1000)
 #define CLASSROOM_SCHEDULE_JSON_MAX_LEN            (8192)
+#define CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN    (32768)
 #define CLASSROOM_SCHEDULE_URL_MAX_LEN             (512)
 #define CLASSROOM_SCHEDULE_NVS_NAMESPACE           "class_sched"
+#define CLASSROOM_SCHEDULE_NVS_KEY_BUILDING        "building"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CLASSROOM       "classroom"
 #define CLASSROOM_SCHEDULE_NVS_KEY_SERVER_HOST     "server_host"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_UPDATED   "cache_updated"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_SERVER    "cache_server"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON      "cache_json"
 #define CLASSROOM_SCHEDULE_CACHE_PATH              "/spiffs/class_schedule.json"
-#define CLASSROOM_SCHEDULE_ROOM_MAX_LEN             (16)
+#define CLASSROOM_SCHEDULE_MAX_BUILDINGS           (64)
+#define CLASSROOM_SCHEDULE_MAX_ROOMS               (512)
 
 #define CLASSROOM_SCHEDULE_COLOR_BG                0x111827
 #define CLASSROOM_SCHEDULE_COLOR_PANEL             0x1F2937
@@ -55,33 +58,6 @@ LV_FONT_DECLARE(classroom_schedule_font_20);
 LV_IMG_DECLARE(img_app_classroom_schedule);
 
 static const char *TAG = "ClassroomSchedule";
-
-struct ClassroomBuildingConfig {
-    const char *display_name;
-    const char *canonical_prefix;
-    const char *legacy_prefix;
-};
-
-/*
- * 楼宇列表与 EAMS 教室占用页保持一致，顺序按页面展示顺序排列。
- * canonical_prefix 用于保存和查询，legacy_prefix 仅用于兼容已有 NVS 值。
- * EAMS building id 由 Windows 中间层维护；楼宇变化时需同步更新两端和字体子集。
- */
-static const ClassroomBuildingConfig CLASSROOM_SCHEDULE_BUILDINGS[] = {
-    {"博文楼", "博文楼", ""},
-    {"知行楼", "知行楼", ""},
-    {"主楼机房", "主楼机房", ""},
-    {"静远楼", "静远楼", ""},
-    {"博雅楼", "博雅楼", ""},
-    {"耘慧楼", "耘慧楼", ""},
-    {"物理实验室", "物理实验室", ""},
-    {"葫芦岛物理实验室", "葫芦岛物理实验室", ""},
-    {"中和楼", "中和楼", ""},
-    {"致远楼", "致远楼", ""},
-    {"新华楼", "新华楼", ""},
-    {"尔雅楼", "尔雅楼", "尔雅"},
-    {"葫芦岛机房", "葫芦岛机房", ""},
-};
 
 static bool hasNetworkIp(void)
 {
@@ -158,14 +134,28 @@ ClassroomScheduleApp::ClassroomScheduleApp():
     ESP_Brookesia_PhoneApp("教室课表", &img_app_classroom_schedule, true),
     _busy(false),
     _closing(false),
+    _updating_dropdowns(false),
     _view_state(VIEW_NO_CLASSROOM),
+    _building{0},
     _classroom{0},
+    _draft_building{0},
+    _draft_classroom{0},
     _server_host{0},
+    _catalog_server_host{0},
     _selected_date{0},
+    _request_generation(1),
     _active_query{},
+    _active_catalog_request{},
+    _pending_request_type(PENDING_NONE),
+    _pending_query{},
+    _pending_catalog_request{},
     _schedule{},
     _has_schedule(false),
     _classroom_config_valid(false),
+    _buildings(NULL),
+    _building_count(0),
+    _rooms(NULL),
+    _room_count(0),
     _worker_task(NULL),
     _worker_done(NULL),
     _refresh_timer(NULL),
@@ -178,7 +168,7 @@ ClassroomScheduleApp::ClassroomScheduleApp():
     _detail_label(NULL),
     _course_list(NULL),
     _building_dropdown(NULL),
-    _room_ta(NULL),
+    _room_dropdown(NULL),
     _server_host_ta(NULL),
     _keyboard(NULL),
     _refresh_btn(NULL),
@@ -201,15 +191,26 @@ bool ClassroomScheduleApp::init(void)
 
 bool ClassroomScheduleApp::run(void)
 {
+    freeCatalog();
     _closing = false;
     _busy = false;
+    _updating_dropdowns = false;
     _has_schedule = false;
     _schedule = {};
     _active_query = {};
+    _active_catalog_request = {};
+    _pending_request_type = PENDING_NONE;
+    _pending_query = {};
+    _pending_catalog_request = {};
+    _request_generation = 1;
     _classroom_config_valid = false;
+    _draft_building[0] = '\0';
+    _draft_classroom[0] = '\0';
+    _catalog_server_host[0] = '\0';
     if (!getToday(_selected_date, sizeof(_selected_date))) {
         copy_string(_selected_date, sizeof(_selected_date), "1970-01-01");
     }
+    loadBuilding();
     loadClassroom();
     loadServerHost();
     buildUi();
@@ -223,12 +224,9 @@ bool ClassroomScheduleApp::run(void)
         }
     }
 
-    if (!_classroom_config_valid) {
-        setViewState(VIEW_NO_CLASSROOM, "未设置教室", "请选择楼宇并填写房间号，然后保存。", CLASSROOM_SCHEDULE_COLOR_WARN);
-    } else {
-        updateClassroomLabel();
-        startRefresh();
-    }
+    setViewState(VIEW_LOADING, "正在加载教室目录", "正在从服务器读取真实楼宇和教室。",
+                 CLASSROOM_SCHEDULE_COLOR_ACCENT);
+    startCatalogLoad(CATALOG_LOAD_ALL);
 
     _refresh_timer = lv_timer_create(refreshTimerCallback, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_REFRESH_MS, this);
     if (_refresh_timer == NULL) {
@@ -274,7 +272,7 @@ bool ClassroomScheduleApp::close(void)
     _detail_label = NULL;
     _course_list = NULL;
     _building_dropdown = NULL;
-    _room_ta = NULL;
+    _room_dropdown = NULL;
     _server_host_ta = NULL;
     _keyboard = NULL;
     _refresh_btn = NULL;
@@ -283,6 +281,7 @@ bool ClassroomScheduleApp::close(void)
     _today_btn = NULL;
     _calendar_overlay = NULL;
     _calendar = NULL;
+    freeCatalog();
     _classroom_config_valid = false;
     _closing = false;
 
@@ -318,30 +317,50 @@ bool ClassroomScheduleApp::loadClassroom(void)
     return _classroom[0] != '\0';
 }
 
-bool ClassroomScheduleApp::saveClassroom(const char *classroom)
+bool ClassroomScheduleApp::loadBuilding(void)
 {
-    if (classroom == NULL || classroom[0] == '\0') {
+    _building[0] = '\0';
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(CLASSROOM_SCHEDULE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
         return false;
     }
 
+    size_t len = sizeof(_building);
+    err = nvs_get_str(handle, CLASSROOM_SCHEDULE_NVS_KEY_BUILDING, _building, &len);
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        _building[0] = '\0';
+        return false;
+    }
+    trimClassroom(_building);
+    return _building[0] != '\0';
+}
+
+bool ClassroomScheduleApp::saveSelection(const char *building, const char *classroom)
+{
+    if (building == NULL || building[0] == '\0' || classroom == NULL || classroom[0] == '\0') {
+        return false;
+    }
     nvs_handle_t handle;
     esp_err_t err = nvs_open(CLASSROOM_SCHEDULE_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open schedule NVS for write: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to open schedule NVS for selection write: %s", esp_err_to_name(err));
         return false;
     }
-
-    err = nvs_set_str(handle, CLASSROOM_SCHEDULE_NVS_KEY_CLASSROOM, classroom);
+    err = nvs_set_str(handle, CLASSROOM_SCHEDULE_NVS_KEY_BUILDING, building);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, CLASSROOM_SCHEDULE_NVS_KEY_CLASSROOM, classroom);
+    }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
-
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save classroom: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to save schedule selection: %s", esp_err_to_name(err));
         return false;
     }
-
+    copy_string(_building, sizeof(_building), building);
     copy_string(_classroom, sizeof(_classroom), classroom);
     return true;
 }
@@ -713,6 +732,174 @@ esp_err_t ClassroomScheduleApp::fetchScheduleJson(const QuerySnapshot &query, ch
     return ESP_OK;
 }
 
+esp_err_t ClassroomScheduleApp::fetchCatalogJson(const CatalogRequest &request, const char *path,
+                                                  const char *building, char *buffer, size_t buffer_size,
+                                                  size_t *json_len, int *http_status)
+{
+    if (path == NULL || buffer == NULL || buffer_size == 0 || json_len == NULL || http_status == NULL ||
+        request.server_host[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!hasNetworkIp()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char encoded_token[160];
+    char encoded_building[192];
+    if (!urlEncode(CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_TOKEN, encoded_token, sizeof(encoded_token)) ||
+        (building != NULL && !urlEncode(building, encoded_building, sizeof(encoded_building)))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char url[CLASSROOM_SCHEDULE_URL_MAX_LEN];
+    const char *separator = path[0] == '/' ? "" : "/";
+    int written = 0;
+    if (building != NULL) {
+        written = snprintf(url, sizeof(url), "http://%s:%d%s%s?building=%s&token=%s",
+                           request.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT,
+                           separator, path, encoded_building, encoded_token);
+    } else {
+        written = snprintf(url, sizeof(url), "http://%s:%d%s%s?token=%s",
+                           request.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT,
+                           separator, path, encoded_token);
+    }
+    if (written <= 0 || (size_t)written >= sizeof(url)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    http_response_buffer_t response = {
+        .data = buffer,
+        .len = 0,
+        .cap = buffer_size,
+        .overflow = false,
+    };
+    buffer[0] = '\0';
+    *json_len = 0;
+    *http_status = 0;
+
+    esp_http_client_config_t config = {};
+    config.url = url;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_REQUEST_TIMEOUT_MS;
+    config.event_handler = http_event_handler;
+    config.user_data = &response;
+    config.buffer_size = 1024;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = esp_http_client_perform(client);
+    *http_status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    ESP_LOGI(TAG, "Catalog HTTP result: host=%s path=%s building=%s err=%s status=%d bytes=%u overflow=%d",
+             request.server_host, path, building != NULL ? building : "<all>", esp_err_to_name(err),
+             *http_status, (unsigned)response.len, response.overflow ? 1 : 0);
+    if (response.overflow) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (*http_status != 200) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (response.len == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *json_len = response.len;
+    return ESP_OK;
+}
+
+esp_err_t ClassroomScheduleApp::parseBuildingsJson(const char *json, size_t json_len,
+                                                    CatalogName **buildings, size_t *count)
+{
+    if (json == NULL || json_len == 0 || buildings == NULL || count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *buildings = NULL;
+    *count = 0;
+    cJSON *root = cJSON_ParseWithLength(json, json_len);
+    cJSON *items = root != NULL ? cJSON_GetObjectItemCaseSensitive(root, "buildings") : NULL;
+    if (!cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const int item_count = cJSON_GetArraySize(items);
+    if (item_count <= 0 || item_count > CLASSROOM_SCHEDULE_MAX_BUILDINGS) {
+        cJSON_Delete(root);
+        return item_count == 0 ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_SIZE;
+    }
+    CatalogName *parsed = static_cast<CatalogName *>(calloc((size_t)item_count, sizeof(CatalogName)));
+    if (parsed == NULL) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < item_count; ++i) {
+        cJSON *item = cJSON_GetArrayItem(items, i);
+        if (!cJSON_IsString(item) || item->valuestring == NULL || item->valuestring[0] == '\0' ||
+            strlen(item->valuestring) >= sizeof(parsed[i].value)) {
+            free(parsed);
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        copy_string(parsed[i].value, sizeof(parsed[i].value), item->valuestring);
+    }
+    cJSON_Delete(root);
+    *buildings = parsed;
+    *count = (size_t)item_count;
+    return ESP_OK;
+}
+
+esp_err_t ClassroomScheduleApp::parseRoomsJson(const char *json, size_t json_len, const char *expected_building,
+                                                CatalogName **rooms, size_t *count)
+{
+    if (json == NULL || json_len == 0 || expected_building == NULL || rooms == NULL || count == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *rooms = NULL;
+    *count = 0;
+    cJSON *root = cJSON_ParseWithLength(json, json_len);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    char response_building[64];
+    cJSON *items = cJSON_GetObjectItemCaseSensitive(root, "rooms");
+    if (!copy_json_string(root, "building", response_building, sizeof(response_building), true) ||
+        strcmp(response_building, expected_building) != 0 || !cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const int item_count = cJSON_GetArraySize(items);
+    if (item_count < 0 || item_count > CLASSROOM_SCHEDULE_MAX_ROOMS) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    CatalogName *parsed = NULL;
+    if (item_count > 0) {
+        parsed = static_cast<CatalogName *>(calloc((size_t)item_count, sizeof(CatalogName)));
+        if (parsed == NULL) {
+            cJSON_Delete(root);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    for (int i = 0; i < item_count; ++i) {
+        cJSON *item = cJSON_GetArrayItem(items, i);
+        if (!cJSON_IsString(item) || item->valuestring == NULL || item->valuestring[0] == '\0' ||
+            strlen(item->valuestring) >= sizeof(parsed[i].value)) {
+            free(parsed);
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        copy_string(parsed[i].value, sizeof(parsed[i].value), item->valuestring);
+    }
+    cJSON_Delete(root);
+    *rooms = parsed;
+    *count = (size_t)item_count;
+    return ESP_OK;
+}
+
 esp_err_t ClassroomScheduleApp::parseScheduleJson(const char *json, size_t json_len, ScheduleData *data)
 {
     if (json == NULL || json_len == 0 || data == NULL) {
@@ -990,75 +1177,6 @@ void ClassroomScheduleApp::trimServerHost(char *text) const
     trimClassroom(text);
 }
 
-bool ClassroomScheduleApp::validateRoomNumber(const char *room) const
-{
-    if (room == NULL || room[0] == '\0') {
-        return false;
-    }
-
-    const size_t len = strlen(room);
-    if (len > CLASSROOM_SCHEDULE_ROOM_MAX_LEN) {
-        return false;
-    }
-    for (size_t i = 0; i < len; ++i) {
-        if (!isdigit((unsigned char)room[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool ClassroomScheduleApp::splitClassroom(const char *classroom, size_t *building_index, char *room,
-                                          size_t room_size) const
-{
-    if (classroom == NULL || building_index == NULL || room == NULL || room_size == 0) {
-        return false;
-    }
-
-    for (size_t i = 0; i < sizeof(CLASSROOM_SCHEDULE_BUILDINGS) / sizeof(CLASSROOM_SCHEDULE_BUILDINGS[0]); ++i) {
-        const char *prefix = CLASSROOM_SCHEDULE_BUILDINGS[i].canonical_prefix;
-        const size_t prefix_len = strlen(prefix);
-        if (strncmp(classroom, prefix, prefix_len) == 0 && validateRoomNumber(classroom + prefix_len)) {
-            const int written = snprintf(room, room_size, "%s", classroom + prefix_len);
-            if (written <= 0 || (size_t)written >= room_size) {
-                return false;
-            }
-            *building_index = i;
-            return true;
-        }
-    }
-
-    for (size_t i = 0; i < sizeof(CLASSROOM_SCHEDULE_BUILDINGS) / sizeof(CLASSROOM_SCHEDULE_BUILDINGS[0]); ++i) {
-        const char *prefix = CLASSROOM_SCHEDULE_BUILDINGS[i].legacy_prefix;
-        const size_t prefix_len = strlen(prefix);
-        if (prefix[0] != '\0' && strncmp(classroom, prefix, prefix_len) == 0 &&
-            validateRoomNumber(classroom + prefix_len)) {
-            const int written = snprintf(room, room_size, "%s", classroom + prefix_len);
-            if (written <= 0 || (size_t)written >= room_size) {
-                return false;
-            }
-            *building_index = i;
-            return true;
-        }
-    }
-
-    room[0] = '\0';
-    return false;
-}
-
-bool ClassroomScheduleApp::composeClassroom(size_t building_index, const char *room, char *classroom,
-                                            size_t classroom_size) const
-{
-    const size_t building_count = sizeof(CLASSROOM_SCHEDULE_BUILDINGS) / sizeof(CLASSROOM_SCHEDULE_BUILDINGS[0]);
-    if (building_index >= building_count || !validateRoomNumber(room) || classroom == NULL || classroom_size == 0) {
-        return false;
-    }
-
-    const int written = snprintf(classroom, classroom_size, "%s%s",
-                                 CLASSROOM_SCHEDULE_BUILDINGS[building_index].canonical_prefix, room);
-    return written > 0 && (size_t)written < classroom_size;
-}
-
 bool ClassroomScheduleApp::parseDate(const char *date, lv_calendar_date_t *parsed) const
 {
     if (date == NULL || parsed == NULL || strlen(date) != 10 || date[4] != '-' || date[7] != '-') {
@@ -1116,6 +1234,7 @@ bool ClassroomScheduleApp::createQuerySnapshot(QuerySnapshot *query) const
         return false;
     }
 
+    query->generation = _request_generation;
     const int classroom_len = snprintf(query->classroom, sizeof(query->classroom), "%s", _classroom);
     const int date_len = snprintf(query->date, sizeof(query->date), "%s", _selected_date);
     const int server_len = snprintf(query->server_host, sizeof(query->server_host), "%s", _server_host);
@@ -1126,7 +1245,8 @@ bool ClassroomScheduleApp::createQuerySnapshot(QuerySnapshot *query) const
 
 bool ClassroomScheduleApp::queryMatchesCurrent(const QuerySnapshot &query) const
 {
-    return strcmp(query.classroom, _classroom) == 0 && strcmp(query.date, _selected_date) == 0 &&
+    return query.generation == _request_generation && strcmp(query.classroom, _classroom) == 0 &&
+           strcmp(query.date, _selected_date) == 0 &&
            strcmp(query.server_host, _server_host) == 0;
 }
 
@@ -1184,17 +1304,7 @@ void ClassroomScheduleApp::buildUi(void)
     lv_obj_set_flex_flow(input_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(input_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    size_t building_index = 0;
-    char room[CLASSROOM_SCHEDULE_ROOM_MAX_LEN + 1] = {};
-    _classroom_config_valid = splitClassroom(_classroom, &building_index, room, sizeof(room));
-    if (_classroom_config_valid) {
-        char canonical_classroom[sizeof(_classroom)];
-        if (composeClassroom(building_index, room, canonical_classroom, sizeof(canonical_classroom))) {
-            copy_string(_classroom, sizeof(_classroom), canonical_classroom);
-        } else {
-            _classroom_config_valid = false;
-        }
-    }
+    _classroom_config_valid = false;
 
     lv_obj_t *building_label = lv_label_create(input_row);
     lv_label_set_text(building_label, "楼宇");
@@ -1202,48 +1312,32 @@ void ClassroomScheduleApp::buildUi(void)
     applyLabelStyle(building_label, CLASSROOM_SCHEDULE_COLOR_MUTED, CLASSROOM_SCHEDULE_FONT_CN);
 
     _building_dropdown = lv_dropdown_create(input_row);
-    lv_obj_set_width(_building_dropdown, 210);
+    lv_obj_set_width(_building_dropdown, 170);
     lv_obj_set_height(_building_dropdown, 42);
-    char building_options[512] = {};
-    size_t option_len = 0;
-    for (size_t i = 0; i < sizeof(CLASSROOM_SCHEDULE_BUILDINGS) / sizeof(CLASSROOM_SCHEDULE_BUILDINGS[0]); ++i) {
-        const int written = snprintf(building_options + option_len, sizeof(building_options) - option_len,
-                                     "%s%s", i == 0 ? "" : "\n", CLASSROOM_SCHEDULE_BUILDINGS[i].display_name);
-        if (written <= 0 || (size_t)written >= sizeof(building_options) - option_len) {
-            building_options[0] = '\0';
-            break;
-        }
-        option_len += (size_t)written;
-    }
-    lv_dropdown_set_options(_building_dropdown, building_options);
-    lv_dropdown_set_selected(_building_dropdown, (uint16_t)building_index);
+    lv_dropdown_set_options(_building_dropdown, "加载中");
     lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_READY, this);
     lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_VALUE_CHANGED, this);
     applyBuildingDropdownFont();
 
     lv_obj_t *room_label = lv_label_create(input_row);
-    lv_label_set_text(room_label, "房间号");
-    lv_obj_set_width(room_label, 76);
+    lv_label_set_text(room_label, "教室");
+    lv_obj_set_width(room_label, 58);
     applyLabelStyle(room_label, CLASSROOM_SCHEDULE_COLOR_MUTED, CLASSROOM_SCHEDULE_FONT_CN);
 
-    _room_ta = lv_textarea_create(input_row);
-    lv_obj_set_width(_room_ta, 120);
-    lv_obj_set_height(_room_ta, 42);
-    lv_textarea_set_one_line(_room_ta, true);
-    lv_textarea_set_max_length(_room_ta, CLASSROOM_SCHEDULE_ROOM_MAX_LEN);
-    lv_textarea_set_accepted_chars(_room_ta, "0123456789");
-    lv_textarea_set_placeholder_text(_room_ta, "103");
-    lv_textarea_set_text(_room_ta, _classroom_config_valid ? room : "");
-    lv_obj_set_style_text_font(_room_ta, &lv_font_montserrat_20, 0);
-    lv_obj_add_event_cb(_room_ta, roomInputEventCb, LV_EVENT_CLICKED, this);
+    _room_dropdown = lv_dropdown_create(input_row);
+    lv_obj_set_width(_room_dropdown, 250);
+    lv_obj_set_height(_room_dropdown, 42);
+    lv_dropdown_set_options(_room_dropdown, "加载中");
+    lv_obj_add_event_cb(_room_dropdown, roomDropdownEventCb, LV_EVENT_READY, this);
+    lv_obj_add_event_cb(_room_dropdown, roomDropdownEventCb, LV_EVENT_VALUE_CHANGED, this);
 
     lv_obj_t *server_label = lv_label_create(input_row);
     lv_label_set_text(server_label, "服务器");
-    lv_obj_set_width(server_label, 76);
+    lv_obj_set_width(server_label, 66);
     applyLabelStyle(server_label, CLASSROOM_SCHEDULE_COLOR_MUTED, CLASSROOM_SCHEDULE_FONT_CN);
 
     _server_host_ta = lv_textarea_create(input_row);
-    lv_obj_set_width(_server_host_ta, 190);
+    lv_obj_set_width(_server_host_ta, 160);
     lv_obj_set_height(_server_host_ta, 42);
     lv_textarea_set_one_line(_server_host_ta, true);
     lv_textarea_set_max_length(_server_host_ta, sizeof(_server_host) - 1);
@@ -1252,7 +1346,7 @@ void ClassroomScheduleApp::buildUi(void)
     lv_obj_set_style_text_font(_server_host_ta, CLASSROOM_SCHEDULE_FONT_CN, 0);
     lv_obj_add_event_cb(_server_host_ta, serverHostInputEventCb, LV_EVENT_CLICKED, this);
 
-    _save_btn = createButton(input_row, "保存", saveClassroomEventCb, 108, 42);
+    _save_btn = createButton(input_row, "保存", saveClassroomEventCb, 90, 42);
 
     lv_obj_t *date_row = lv_obj_create(_root);
     lv_obj_set_width(date_row, LV_PCT(100));
@@ -1303,8 +1397,8 @@ void ClassroomScheduleApp::buildUi(void)
     _keyboard = lv_keyboard_create(_root);
     lv_obj_set_width(_keyboard, LV_PCT(100));
     lv_obj_set_height(_keyboard, 180);
-    lv_keyboard_set_mode(_keyboard, LV_KEYBOARD_MODE_NUMBER);
-    lv_keyboard_set_textarea(_keyboard, _room_ta);
+    lv_keyboard_set_mode(_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    lv_keyboard_set_textarea(_keyboard, _server_host_ta);
     lv_obj_add_event_cb(_keyboard, keyboardEventCb, LV_EVENT_READY, this);
     lv_obj_add_event_cb(_keyboard, keyboardEventCb, LV_EVENT_CANCEL, this);
     lv_obj_add_flag(_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -1462,8 +1556,19 @@ void ClassroomScheduleApp::updateClassroomLabel(void)
 {
     if (_classroom_label != NULL) {
         char text[128];
-        const char *name = _schedule.classroom_name[0] != '\0' ? _schedule.classroom_name : _classroom;
-        snprintf(text, sizeof(text), "教室：%s", name[0] != '\0' ? name : "未设置");
+        const bool building_changed = _draft_building[0] != '\0' && strcmp(_draft_building, _building) != 0;
+        const bool classroom_changed = _draft_classroom[0] != '\0' && strcmp(_draft_classroom, _classroom) != 0;
+        if (building_changed && _draft_classroom[0] == '\0') {
+            snprintf(text, sizeof(text), "待保存：%s / 请选择教室", _draft_building);
+        } else if (building_changed || classroom_changed) {
+            snprintf(text, sizeof(text), "待保存：%s", _draft_classroom);
+        } else if (_classroom[0] != '\0') {
+            snprintf(text, sizeof(text), "教室：%s", _classroom);
+        } else if (_draft_building[0] != '\0') {
+            snprintf(text, sizeof(text), "待保存：%s / 请选择教室", _draft_building);
+        } else {
+            snprintf(text, sizeof(text), "教室：未设置");
+        }
         lv_label_set_text(_classroom_label, text);
     }
 
@@ -1482,28 +1587,25 @@ void ClassroomScheduleApp::updateControls(void)
         }
     }
     if (_save_btn != NULL) {
-        if (_busy) {
+        if (_busy || _draft_building[0] == '\0' || _draft_classroom[0] == '\0') {
             lv_obj_add_state(_save_btn, LV_STATE_DISABLED);
         } else {
             lv_obj_clear_state(_save_btn, LV_STATE_DISABLED);
         }
     }
 
-    lv_obj_t *query_controls[] = {
-        _building_dropdown,
-        _room_ta,
-        _server_host_ta,
-        _date_btn,
-        _today_btn,
-    };
-    for (size_t i = 0; i < sizeof(query_controls) / sizeof(query_controls[0]); ++i) {
-        if (query_controls[i] == NULL) {
-            continue;
-        }
-        if (_busy) {
-            lv_obj_add_state(query_controls[i], LV_STATE_DISABLED);
+    if (_building_dropdown != NULL) {
+        if (_building_count == 0) {
+            lv_obj_add_state(_building_dropdown, LV_STATE_DISABLED);
         } else {
-            lv_obj_clear_state(query_controls[i], LV_STATE_DISABLED);
+            lv_obj_clear_state(_building_dropdown, LV_STATE_DISABLED);
+        }
+    }
+    if (_room_dropdown != NULL) {
+        if (_room_count == 0) {
+            lv_obj_add_state(_room_dropdown, LV_STATE_DISABLED);
+        } else {
+            lv_obj_clear_state(_room_dropdown, LV_STATE_DISABLED);
         }
     }
 }
@@ -1523,9 +1625,6 @@ void ClassroomScheduleApp::setKeyboardVisible(bool visible)
         } else {
             lv_obj_add_flag(_keyboard, LV_OBJ_FLAG_HIDDEN);
         }
-    }
-    if (!visible && _room_ta != NULL) {
-        lv_obj_clear_state(_room_ta, LV_STATE_FOCUSED);
     }
     if (!visible && _server_host_ta != NULL) {
         lv_obj_clear_state(_server_host_ta, LV_STATE_FOCUSED);
@@ -1547,7 +1646,7 @@ void ClassroomScheduleApp::updateSelectedDateUi(void)
 
 void ClassroomScheduleApp::openCalendar(void)
 {
-    if (_busy || _root == NULL) {
+    if (_root == NULL) {
         return;
     }
     if (_calendar_overlay != NULL) {
@@ -1636,6 +1735,7 @@ void ClassroomScheduleApp::applySelectedDate(const char *date)
         return;
     }
 
+    advanceRequestGeneration();
     _schedule = {};
     _has_schedule = false;
     clearCourseList();
@@ -1645,33 +1745,329 @@ void ClassroomScheduleApp::applySelectedDate(const char *date)
         setViewState(VIEW_IDLE, "日期已更新", "正在刷新所选日期的课表。", CLASSROOM_SCHEDULE_COLOR_PRIMARY);
         startRefresh();
     } else {
-        setViewState(VIEW_NO_CLASSROOM, "未设置教室", "请选择楼宇并填写房间号，然后保存。",
+        setViewState(VIEW_NO_CLASSROOM, "未设置教室", "请从服务器目录选择楼宇和教室，然后保存。",
                      CLASSROOM_SCHEDULE_COLOR_WARN);
     }
+}
+
+void ClassroomScheduleApp::advanceRequestGeneration(void)
+{
+    ++_request_generation;
+    if (_request_generation == 0) {
+        _request_generation = 1;
+    }
+}
+
+void ClassroomScheduleApp::startCatalogLoad(CatalogRequestType type, const char *building)
+{
+    if (_closing || _worker_done == NULL || _server_host[0] == '\0') {
+        updateControls();
+        return;
+    }
+    CatalogRequest request = {};
+    request.type = type;
+    request.generation = _request_generation;
+    copy_string(request.server_host, sizeof(request.server_host), _server_host);
+    copy_string(request.building, sizeof(request.building), building != NULL ? building : _building);
+    copy_string(request.saved_classroom, sizeof(request.saved_classroom), _classroom);
+    if (type == CATALOG_LOAD_ROOMS && request.building[0] == '\0') {
+        renderError("楼宇无效", "请选择服务器返回的真实楼宇。");
+        return;
+    }
+
+    _classroom_config_valid = false;
+    _schedule = {};
+    _has_schedule = false;
+    clearCourseList();
+    setViewState(VIEW_LOADING, type == CATALOG_LOAD_ALL ? "正在加载楼宇" : "正在加载教室",
+                  type == CATALOG_LOAD_ALL ? "正在从服务器读取真实楼宇目录。" :
+                  "正在从服务器读取该楼宇的真实教室。", CLASSROOM_SCHEDULE_COLOR_ACCENT);
+
+    if (_busy) {
+        _pending_request_type = PENDING_CATALOG;
+        _pending_catalog_request = request;
+        updateControls();
+        return;
+    }
+    launchCatalogLoad(request);
+}
+
+void ClassroomScheduleApp::launchCatalogLoad(const CatalogRequest &request)
+{
+    _active_catalog_request = request;
+    _busy = true;
+    if (_worker_done != NULL) {
+        xSemaphoreTake(_worker_done, 0);
+    }
+
+    BaseType_t ret = xTaskCreatePinnedToCore(catalogTask, "ClassCatalog", CLASSROOM_SCHEDULE_WORKER_STACK_SIZE,
+                                            this, CLASSROOM_SCHEDULE_WORKER_PRIORITY, &_worker_task,
+                                            CLASSROOM_SCHEDULE_WORKER_CORE);
+    if (ret != pdPASS) {
+        _busy = false;
+        _worker_task = NULL;
+        renderError("任务错误", "无法启动教室目录任务。");
+    }
+    updateControls();
+}
+
+void ClassroomScheduleApp::updateFromCatalogWorker(CatalogResult *result)
+{
+    esp_err_t lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS));
+    if (lock_err != ESP_OK && !_closing) {
+        lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS));
+    }
+    if (lock_err != ESP_OK) {
+        if (_worker_done != NULL) {
+            xSemaphoreGive(_worker_done);
+        }
+        if (!_closing) {
+            _busy = false;
+        }
+        return;
+    }
+
+    bool start_schedule = false;
+    const bool current = result != NULL && !_closing && _root != NULL &&
+                         result->request.generation == _request_generation &&
+                         strcmp(result->request.server_host, _server_host) == 0 &&
+                         (result->request.type != CATALOG_LOAD_ROOMS ||
+                          strcmp(result->request.building, _draft_building) == 0);
+    if (current) {
+        if (result->err != ESP_OK) {
+            const char *status = result->http_status == 401 || result->http_status == 403 ? "目录认证失败" :
+                                 (result->http_status == 502 || result->http_status == 503 ? "EAMS 会话不可用" :
+                                  "目录加载失败");
+            renderError(status, result->detail);
+        } else {
+            _updating_dropdowns = true;
+            if (result->request.type == CATALOG_LOAD_ALL) {
+                free(_buildings);
+                _buildings = result->buildings;
+                _building_count = result->building_count;
+                result->buildings = NULL;
+                copy_string(_catalog_server_host, sizeof(_catalog_server_host), result->request.server_host);
+                updateCatalogDropdown(_building_dropdown, _buildings, _building_count,
+                                      result->selected_building, "暂无楼宇");
+            }
+            free(_rooms);
+            _rooms = result->rooms;
+            _room_count = result->room_count;
+            result->rooms = NULL;
+
+            const char *selected_building = result->request.type == CATALOG_LOAD_ALL ?
+                                            _buildings[result->selected_building].value : result->request.building;
+            copy_string(_draft_building, sizeof(_draft_building), selected_building);
+            if (_room_count > 0) {
+                const size_t selected_room = result->selected_room < _room_count ? result->selected_room : 0;
+                copy_string(_draft_classroom, sizeof(_draft_classroom), _rooms[selected_room].value);
+                updateCatalogDropdown(_room_dropdown, _rooms, _room_count, selected_room, "暂无教室");
+            } else {
+                _draft_classroom[0] = '\0';
+                updateCatalogDropdown(_room_dropdown, NULL, 0, 0, "暂无教室");
+            }
+            _updating_dropdowns = false;
+
+            _classroom_config_valid = result->saved_classroom_valid;
+            if (_classroom_config_valid) {
+                copy_string(_building, sizeof(_building), _draft_building);
+                copy_string(_classroom, sizeof(_classroom), _draft_classroom);
+            }
+            updateClassroomLabel();
+            if (_room_count == 0) {
+                setViewState(VIEW_NO_CLASSROOM, "该楼宇暂无可用教室", "请选择其他楼宇。",
+                             CLASSROOM_SCHEDULE_COLOR_WARN);
+            } else if (_classroom_config_valid) {
+                setViewState(VIEW_IDLE, "教室目录已加载", "正在刷新所选日期的课表。",
+                             CLASSROOM_SCHEDULE_COLOR_PRIMARY);
+                start_schedule = true;
+            } else {
+                setViewState(VIEW_NO_CLASSROOM, "请选择教室并保存", "当前选项来自服务器真实教室目录。",
+                             CLASSROOM_SCHEDULE_COLOR_WARN);
+            }
+        }
+    }
+
+    if (start_schedule && _pending_request_type == PENDING_NONE) {
+        QuerySnapshot query = {};
+        if (createQuerySnapshot(&query)) {
+            _pending_request_type = PENDING_SCHEDULE;
+            _pending_query = query;
+        }
+    }
+    if (_worker_done != NULL) {
+        xSemaphoreGive(_worker_done);
+    }
+    _busy = false;
+    startPendingRequest();
+    updateControls();
+    lv_refr_now(NULL);
+    esp_lv_adapter_unlock();
+}
+
+void ClassroomScheduleApp::catalogTask(void *arg)
+{
+    ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(arg);
+    if (app == NULL) {
+        vTaskDelete(NULL);
+        return;
+    }
+    CatalogResult *result = static_cast<CatalogResult *>(calloc(1, sizeof(CatalogResult)));
+    if (result == NULL) {
+        CatalogResult fallback = {};
+        fallback.err = ESP_ERR_NO_MEM;
+        fallback.request = app->_active_catalog_request;
+        copy_string(fallback.detail, sizeof(fallback.detail), "内存不足，无法创建教室目录数据。");
+        app->updateFromCatalogWorker(&fallback);
+        vTaskDelete(NULL);
+        return;
+    }
+    result->err = ESP_FAIL;
+    result->request = app->_active_catalog_request;
+    char *json = static_cast<char *>(calloc(CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN + 1, 1));
+    if (json == NULL) {
+        result->err = ESP_ERR_NO_MEM;
+        copy_string(result->detail, sizeof(result->detail), "内存不足，无法加载教室目录。");
+    } else {
+        size_t json_len = 0;
+        const char *selected_building = result->request.building;
+        if (result->request.type == CATALOG_LOAD_ALL) {
+            result->err = app->fetchCatalogJson(result->request,
+                                                CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_BUILDINGS_PATH,
+                                                NULL, json, CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN + 1,
+                                                &json_len, &result->http_status);
+            if (result->err == ESP_OK) {
+                result->err = app->parseBuildingsJson(json, json_len, &result->buildings,
+                                                      &result->building_count);
+            }
+            if (result->err == ESP_OK) {
+                result->selected_building = 0;
+                size_t longest_prefix = 0;
+                for (size_t i = 0; i < result->building_count; ++i) {
+                    if (result->request.building[0] != '\0' &&
+                        strcmp(result->buildings[i].value, result->request.building) == 0) {
+                        result->selected_building = i;
+                        longest_prefix = SIZE_MAX;
+                        break;
+                    }
+                    const size_t prefix_len = strlen(result->buildings[i].value);
+                    const size_t floor_suffix_len = strlen("楼");
+                    size_t matched_prefix = 0;
+                    if (strncmp(result->request.saved_classroom, result->buildings[i].value, prefix_len) == 0) {
+                        matched_prefix = prefix_len;
+                    } else if (prefix_len > floor_suffix_len &&
+                               strcmp(result->buildings[i].value + prefix_len - floor_suffix_len, "楼") == 0 &&
+                               strncmp(result->request.saved_classroom, result->buildings[i].value,
+                                       prefix_len - floor_suffix_len) == 0) {
+                        matched_prefix = prefix_len - floor_suffix_len;
+                    }
+                    if (matched_prefix > longest_prefix) {
+                        result->selected_building = i;
+                        longest_prefix = matched_prefix;
+                    }
+                }
+                selected_building = result->buildings[result->selected_building].value;
+            }
+        }
+
+        if (result->err == ESP_OK) {
+            json[0] = '\0';
+            json_len = 0;
+            result->err = app->fetchCatalogJson(result->request,
+                                                CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_ROOMS_PATH,
+                                                selected_building, json,
+                                                CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN + 1,
+                                                &json_len, &result->http_status);
+        }
+        if (result->err == ESP_OK) {
+            result->err = app->parseRoomsJson(json, json_len, selected_building,
+                                              &result->rooms, &result->room_count);
+        }
+        if (result->err == ESP_OK && result->room_count > 0) {
+            result->selected_room = 0;
+            if (result->request.type == CATALOG_LOAD_ALL) {
+                char normalized_saved[sizeof(result->request.saved_classroom)];
+                copy_string(normalized_saved, sizeof(normalized_saved), result->request.saved_classroom);
+                const size_t building_len = strlen(selected_building);
+                const size_t floor_suffix_len = strlen("楼");
+                if (building_len > floor_suffix_len &&
+                    strcmp(selected_building + building_len - floor_suffix_len, "楼") == 0 &&
+                    strncmp(result->request.saved_classroom, selected_building,
+                            building_len - floor_suffix_len) == 0 &&
+                    strncmp(result->request.saved_classroom, selected_building, building_len) != 0) {
+                    const int written = snprintf(normalized_saved, sizeof(normalized_saved), "%s%s", selected_building,
+                                                 result->request.saved_classroom + building_len - floor_suffix_len);
+                    if (written <= 0 || (size_t)written >= sizeof(normalized_saved)) {
+                        normalized_saved[0] = '\0';
+                    }
+                }
+                for (size_t i = 0; i < result->room_count; ++i) {
+                    if (strcmp(result->rooms[i].value, normalized_saved) == 0) {
+                        result->selected_room = i;
+                        result->saved_classroom_valid = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (result->err != ESP_OK && result->detail[0] == '\0') {
+            if (result->http_status == 401 || result->http_status == 403) {
+                copy_string(result->detail, sizeof(result->detail), "服务器拒绝目录请求，请检查 token 配置。");
+            } else if (result->http_status == 502 || result->http_status == 503) {
+                copy_string(result->detail, sizeof(result->detail), "EAMS 会话不可用，请在电脑端重新登录。");
+            } else if (result->err == ESP_ERR_INVALID_SIZE) {
+                copy_string(result->detail, sizeof(result->detail), "教室目录过大，设备无法完整读取。");
+            } else {
+                copy_string(result->detail, sizeof(result->detail), "无法加载真实教室目录，请检查网络和服务器。");
+            }
+        }
+        free(json);
+    }
+
+    app->updateFromCatalogWorker(result);
+    free(result->buildings);
+    free(result->rooms);
+    free(result);
+    ESP_LOGI(TAG, "Catalog task stack minimum: %u bytes",
+             static_cast<unsigned>(uxTaskGetStackHighWaterMark(NULL)));
+    vTaskDelete(NULL);
 }
 
 void ClassroomScheduleApp::startRefresh(void)
 {
     QuerySnapshot query = {};
-    if (_busy || _closing || _worker_done == NULL || !createQuerySnapshot(&query)) {
+    if (_closing || _worker_done == NULL || !createQuerySnapshot(&query)) {
         updateControls();
         return;
     }
 
-    _active_query = query;
-    _busy = true;
-    ESP_LOGI(TAG, "Schedule query start: host=%s port=%d path=%s classroom=%s date=%s",
-             query.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT,
-             CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_API_PATH, query.classroom, query.date);
-    if (_worker_done != NULL) {
-        xSemaphoreTake(_worker_done, 0);
-    }
     _schedule = {};
     _has_schedule = false;
     clearCourseList();
     setViewState(VIEW_LOADING, "正在获取课表", "正在从服务器读取所选日期的课程安排。", CLASSROOM_SCHEDULE_COLOR_ACCENT);
     if (_updated_label != NULL) {
         lv_label_set_text(_updated_label, "");
+    }
+
+    if (_busy) {
+        _pending_request_type = PENDING_SCHEDULE;
+        _pending_query = query;
+        updateControls();
+        return;
+    }
+    launchRefresh(query);
+}
+
+void ClassroomScheduleApp::launchRefresh(const QuerySnapshot &query)
+{
+    _active_query = query;
+    _busy = true;
+    ESP_LOGI(TAG, "Schedule query start: host=%s port=%d path=%s classroom=%s date=%s generation=%u",
+             query.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT,
+             CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_API_PATH, query.classroom, query.date,
+             static_cast<unsigned>(query.generation));
+    if (_worker_done != NULL) {
+        xSemaphoreTake(_worker_done, 0);
     }
 
     BaseType_t ret = xTaskCreatePinnedToCore(refreshTask, "ClassSchedule", CLASSROOM_SCHEDULE_WORKER_STACK_SIZE,
@@ -1682,6 +2078,26 @@ void ClassroomScheduleApp::startRefresh(void)
         _worker_task = NULL;
         renderError("任务错误", "无法启动课表刷新任务。");
         ESP_LOGE(TAG, "Failed to create refresh task");
+    }
+    updateControls();
+}
+
+void ClassroomScheduleApp::startPendingRequest(void)
+{
+    const PendingRequestType pending_type = _pending_request_type;
+    const QuerySnapshot pending_query = _pending_query;
+    const CatalogRequest pending_catalog = _pending_catalog_request;
+    _pending_request_type = PENDING_NONE;
+    _pending_query = {};
+    _pending_catalog_request = {};
+
+    if (_closing) {
+        return;
+    }
+    if (pending_type == PENDING_CATALOG) {
+        launchCatalogLoad(pending_catalog);
+    } else if (pending_type == PENDING_SCHEDULE) {
+        launchRefresh(pending_query);
     }
 }
 
@@ -1695,58 +2111,77 @@ void ClassroomScheduleApp::stopRefreshTimer(void)
 
 void ClassroomScheduleApp::applyBuildingDropdownFont(void)
 {
-    if (_building_dropdown == NULL) {
-        return;
-    }
-
-    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(_building_dropdown, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_FOCUSED);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_PRESSED);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_FOCUSED | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(_building_dropdown, &lv_font_montserrat_20,
-                               LV_PART_INDICATOR | LV_STATE_PRESSED | LV_STATE_CHECKED);
-    lv_obj_t *building_list = lv_dropdown_get_list(_building_dropdown);
-    if (building_list == NULL) {
-        return;
-    }
-
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_PRESSED);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_MAIN | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_SELECTED | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_SELECTED | LV_STATE_PRESSED);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_SELECTED | LV_STATE_CHECKED);
-    lv_obj_set_style_text_font(building_list, CLASSROOM_SCHEDULE_FONT_CN,
-                               LV_PART_SELECTED | LV_STATE_CHECKED | LV_STATE_PRESSED);
-
-    const uint32_t child_count = lv_obj_get_child_cnt(building_list);
-    for (uint32_t i = 0; i < child_count; ++i) {
-        lv_obj_t *child = lv_obj_get_child(building_list, i);
-        if (child != NULL) {
-            lv_obj_set_style_text_font(child, CLASSROOM_SCHEDULE_FONT_CN,
-                                       LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_t *dropdowns[] = {_building_dropdown, _room_dropdown};
+    for (size_t dropdown_index = 0; dropdown_index < sizeof(dropdowns) / sizeof(dropdowns[0]); ++dropdown_index) {
+        lv_obj_t *dropdown = dropdowns[dropdown_index];
+        if (dropdown == NULL) {
+            continue;
+        }
+        lv_obj_set_style_text_font(dropdown, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(dropdown, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_text_font(dropdown, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_MAIN | LV_STATE_CHECKED);
+        lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_20, LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_20, LV_PART_INDICATOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_20, LV_PART_INDICATOR | LV_STATE_PRESSED);
+        lv_obj_t *list = lv_dropdown_get_list(dropdown);
+        if (list == NULL) {
+            continue;
+        }
+        lv_obj_set_style_text_font(list, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(list, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_SELECTED | LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(list, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_SELECTED | LV_STATE_CHECKED);
+        const uint32_t child_count = lv_obj_get_child_cnt(list);
+        for (uint32_t i = 0; i < child_count; ++i) {
+            lv_obj_t *child = lv_obj_get_child(list, i);
+            if (child != NULL) {
+                lv_obj_set_style_text_font(child, CLASSROOM_SCHEDULE_FONT_CN, LV_PART_MAIN | LV_STATE_DEFAULT);
+            }
         }
     }
+}
+
+void ClassroomScheduleApp::updateCatalogDropdown(lv_obj_t *dropdown, const CatalogName *names, size_t count,
+                                                  size_t selected, const char *empty_text)
+{
+    if (dropdown == NULL) {
+        return;
+    }
+    if (names == NULL || count == 0) {
+        lv_dropdown_set_options(dropdown, empty_text != NULL ? empty_text : "暂无选项");
+        lv_dropdown_set_selected(dropdown, 0);
+        applyBuildingDropdownFont();
+        return;
+    }
+    const size_t capacity = count * (sizeof(CatalogName) + 1) + 1;
+    char *options = static_cast<char *>(calloc(capacity, 1));
+    if (options == NULL) {
+        lv_dropdown_set_options(dropdown, "内存不足");
+        return;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const int written = snprintf(options + used, capacity - used, "%s%s", i == 0 ? "" : "\n", names[i].value);
+        if (written <= 0 || (size_t)written >= capacity - used) {
+            free(options);
+            lv_dropdown_set_options(dropdown, "目录过大");
+            return;
+        }
+        used += (size_t)written;
+    }
+    lv_dropdown_set_options(dropdown, options);
+    lv_dropdown_set_selected(dropdown, (uint16_t)(selected < count ? selected : 0));
+    free(options);
+    applyBuildingDropdownFont();
+}
+
+void ClassroomScheduleApp::freeCatalog(void)
+{
+    free(_buildings);
+    free(_rooms);
+    _buildings = NULL;
+    _rooms = NULL;
+    _building_count = 0;
+    _room_count = 0;
 }
 
 void ClassroomScheduleApp::applyLabelStyle(lv_obj_t *label, uint32_t color, const lv_font_t *font)
@@ -1843,35 +2278,40 @@ void ClassroomScheduleApp::findCurrentAndNext(const ScheduleData &data, int *cur
 
 void ClassroomScheduleApp::updateFromWorker(const RefreshResult &result)
 {
-    if (_closing || _root == NULL || !queryMatchesCurrent(result.query)) {
-        return;
-    }
-    _busy = false;
-
     esp_err_t lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS));
     if (lock_err != ESP_OK && !_closing) {
         lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS));
     }
     if (lock_err != ESP_OK) {
         ESP_LOGW(TAG, "Skip schedule UI update because LVGL lock timed out");
+        if (_worker_done != NULL) {
+            xSemaphoreGive(_worker_done);
+        }
+        if (!_closing) {
+            _busy = false;
+        }
         return;
     }
 
-    if (_closing || _root == NULL || !queryMatchesCurrent(result.query)) {
-        esp_lv_adapter_unlock();
-        return;
+    if (!_closing && _root != NULL && queryMatchesCurrent(result.query)) {
+        if (result.has_data) {
+            renderSchedule(result.data);
+        } else {
+            renderError(result.err == ESP_ERR_INVALID_RESPONSE &&
+                        (result.http_status == 401 || result.http_status == 403) ?
+                        "认证失败" : "请求失败", result.detail);
+        }
     }
 
-    if (result.has_data) {
-        renderSchedule(result.data);
-    } else {
-        renderError(result.err == ESP_ERR_INVALID_RESPONSE && (result.http_status == 401 || result.http_status == 403) ?
-                    "认证失败" : "请求失败",
-                    result.detail);
+    if (_worker_done != NULL) {
+        xSemaphoreGive(_worker_done);
     }
-
+    _busy = false;
+    startPendingRequest();
     updateControls();
-    lv_refr_now(NULL);
+    if (_root != NULL) {
+        lv_refr_now(NULL);
+    }
     esp_lv_adapter_unlock();
 }
 
@@ -1887,11 +2327,29 @@ void ClassroomScheduleApp::refreshTask(void *arg)
     RefreshResult *result = static_cast<RefreshResult *>(calloc(1, sizeof(RefreshResult)));
     if (result == NULL) {
         ESP_LOGE(TAG, "Failed to allocate schedule refresh result");
-        app->_busy = false;
-        if (app->_worker_done != NULL) {
-            xSemaphoreGive(app->_worker_done);
+        esp_err_t lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_WAIT_MS));
+        if (lock_err != ESP_OK && !app->_closing) {
+            lock_err = esp_lv_adapter_lock(pdMS_TO_TICKS(CLASSROOM_SCHEDULE_UI_LOCK_RETRY_WAIT_MS));
         }
-        app->_worker_task = NULL;
+        if (lock_err == ESP_OK) {
+            if (!app->_closing && app->_root != NULL && app->queryMatchesCurrent(query)) {
+                app->renderError("内存不足", "无法创建课表刷新数据。");
+            }
+            if (app->_worker_done != NULL) {
+                xSemaphoreGive(app->_worker_done);
+            }
+            app->_busy = false;
+            app->startPendingRequest();
+            app->updateControls();
+            esp_lv_adapter_unlock();
+        } else {
+            if (app->_worker_done != NULL) {
+                xSemaphoreGive(app->_worker_done);
+            }
+            if (!app->_closing) {
+                app->_busy = false;
+            }
+        }
         ESP_LOGI(TAG, "Schedule task stack minimum: %u bytes",
                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(NULL)));
         vTaskDelete(NULL);
@@ -1925,15 +2383,21 @@ void ClassroomScheduleApp::refreshTask(void *arg)
                          (unsigned)result->data.course_count);
                 result->data.from_cache = false;
                 result->has_data = true;
-                esp_err_t cache_err = app->saveCacheJson(json);
-                if (cache_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to save schedule cache: %s", esp_err_to_name(cache_err));
-                } else {
-                    char cached_updated[sizeof(result->data.updated_at)];
-                    app->getNowText(cached_updated, sizeof(cached_updated));
-                    if (!app->saveCacheUpdatedAt(cached_updated) || !app->saveCacheServerHost(query.server_host)) {
-                        ESP_LOGW(TAG, "Failed to save schedule cache metadata");
+                if (app->queryMatchesCurrent(query)) {
+                    esp_err_t cache_err = app->saveCacheJson(json);
+                    if (cache_err != ESP_OK) {
+                        ESP_LOGW(TAG, "Failed to save schedule cache: %s", esp_err_to_name(cache_err));
+                    } else {
+                        char cached_updated[sizeof(result->data.updated_at)];
+                        app->getNowText(cached_updated, sizeof(cached_updated));
+                        if (!app->saveCacheUpdatedAt(cached_updated) ||
+                            !app->saveCacheServerHost(query.server_host)) {
+                            ESP_LOGW(TAG, "Failed to save schedule cache metadata");
+                        }
                     }
+                } else {
+                    ESP_LOGI(TAG, "Skip cache write for stale schedule generation=%u",
+                             static_cast<unsigned>(query.generation));
                 }
             } else if (result->detail[0] == '\0') {
                 copy_string(result->detail, sizeof(result->detail), "服务器返回的课表格式无法解析。");
@@ -1941,7 +2405,8 @@ void ClassroomScheduleApp::refreshTask(void *arg)
         }
 
         if (result->err != ESP_OK && !result->has_data) {
-            esp_err_t cache_err = app->loadCachedSchedule(query, &result->data);
+            const bool allow_cache = result->http_status == 0 || result->http_status >= 500;
+            esp_err_t cache_err = allow_cache ? app->loadCachedSchedule(query, &result->data) : ESP_ERR_NOT_ALLOWED;
             if (cache_err == ESP_OK) {
                 result->used_cache = true;
                 result->has_data = true;
@@ -1949,6 +2414,8 @@ void ClassroomScheduleApp::refreshTask(void *arg)
                          esp_err_to_name(result->err), result->http_status);
             } else if (result->http_status == 401 || result->http_status == 403) {
                 copy_string(result->detail, sizeof(result->detail), "服务器拒绝访问，请检查 token 配置。");
+            } else if (result->http_status == 400 || result->http_status == 404) {
+                copy_string(result->detail, sizeof(result->detail), "所选楼宇或教室已失效，请重新选择并保存。");
             } else if (result->err == ESP_ERR_INVALID_SIZE) {
                 copy_string(result->detail, sizeof(result->detail), "课表响应过大，设备无法缓存或解析。");
             } else if (result->err == ESP_ERR_HTTP_CONNECT) {
@@ -1978,17 +2445,13 @@ void ClassroomScheduleApp::refreshTask(void *arg)
     free(result);
     ESP_LOGI(TAG, "Schedule task stack minimum: %u bytes",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(NULL)));
-    if (app->_worker_done != NULL) {
-        xSemaphoreGive(app->_worker_done);
-    }
-    app->_worker_task = NULL;
     vTaskDelete(NULL);
 }
 
 void ClassroomScheduleApp::refreshTimerCallback(lv_timer_t *timer)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(timer != NULL ? timer->user_data : NULL);
-    if (app == NULL || app->_closing || !app->_classroom_config_valid) {
+    if (app == NULL || app->_closing || app->_busy || !app->_classroom_config_valid) {
         return;
     }
 
@@ -2006,33 +2469,73 @@ void ClassroomScheduleApp::refreshEventCb(lv_event_t *e)
 void ClassroomScheduleApp::buildingDropdownEventCb(lv_event_t *e)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
-    if (app != NULL) {
-        app->applyBuildingDropdownFont();
+    if (app == NULL) {
+        return;
     }
+    app->applyBuildingDropdownFont();
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || app->_updating_dropdowns ||
+        app->_building_count == 0) {
+        return;
+    }
+    const size_t selected = lv_dropdown_get_selected(app->_building_dropdown);
+    if (selected >= app->_building_count) {
+        return;
+    }
+    copy_string(app->_draft_building, sizeof(app->_draft_building), app->_buildings[selected].value);
+    app->_draft_classroom[0] = '\0';
+    app->advanceRequestGeneration();
+    app->_classroom_config_valid = false;
+    app->_schedule = {};
+    app->_has_schedule = false;
+    free(app->_rooms);
+    app->_rooms = NULL;
+    app->_room_count = 0;
+    app->_updating_dropdowns = true;
+    app->updateCatalogDropdown(app->_room_dropdown, NULL, 0, 0, "加载中");
+    app->_updating_dropdowns = false;
+    app->clearCourseList();
+    app->updateClassroomLabel();
+    app->startCatalogLoad(CATALOG_LOAD_ROOMS, app->_draft_building);
+}
+
+void ClassroomScheduleApp::roomDropdownEventCb(lv_event_t *e)
+{
+    ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
+    if (app == NULL) {
+        return;
+    }
+    app->applyBuildingDropdownFont();
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || app->_updating_dropdowns || app->_room_count == 0) {
+        return;
+    }
+    const size_t selected = lv_dropdown_get_selected(app->_room_dropdown);
+    if (selected >= app->_room_count) {
+        return;
+    }
+    copy_string(app->_draft_classroom, sizeof(app->_draft_classroom), app->_rooms[selected].value);
+    app->advanceRequestGeneration();
+    app->_classroom_config_valid = false;
+    app->_schedule = {};
+    app->_has_schedule = false;
+    app->clearCourseList();
+    app->updateClassroomLabel();
+    app->setViewState(VIEW_NO_CLASSROOM, "教室待保存", "保存后将刷新所选日期的真实课表。",
+                      CLASSROOM_SCHEDULE_COLOR_WARN);
 }
 
 void ClassroomScheduleApp::saveClassroomEventCb(lv_event_t *e)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
-    if (app == NULL || app->_building_dropdown == NULL || app->_room_ta == NULL ||
+    if (app == NULL || app->_building_dropdown == NULL || app->_room_dropdown == NULL ||
         app->_server_host_ta == NULL || app->_busy) {
         return;
     }
 
-    char classroom[sizeof(app->_classroom)];
-    char room[CLASSROOM_SCHEDULE_ROOM_MAX_LEN + 1];
-    copy_string(room, sizeof(room), lv_textarea_get_text(app->_room_ta));
-    app->trimClassroom(room);
-    const size_t building_index = lv_dropdown_get_selected(app->_building_dropdown);
     char server_host[sizeof(app->_server_host)];
     copy_string(server_host, sizeof(server_host), lv_textarea_get_text(app->_server_host_ta));
     app->trimServerHost(server_host);
-    if (!app->validateRoomNumber(room)) {
-        app->renderError("房间号无效", "房间号只能包含数字且不能为空。");
-        return;
-    }
-    if (!app->composeClassroom(building_index, room, classroom, sizeof(classroom))) {
-        app->renderError("教室无效", "楼宇与房间号组合超出设备支持范围。");
+    if (app->_draft_building[0] == '\0' || app->_draft_classroom[0] == '\0') {
+        app->renderError("教室无效", "请先从服务器目录选择楼宇和完整教室名。");
         return;
     }
     if (server_host[0] == '\0') {
@@ -2041,19 +2544,37 @@ void ClassroomScheduleApp::saveClassroomEventCb(lv_event_t *e)
     }
 
     const bool server_changed = strcmp(server_host, app->_server_host) != 0;
-    if (!app->saveClassroom(classroom)) {
-        app->renderError("保存失败", "无法保存教室标识，请检查 NVS 状态。");
-        return;
-    }
-    if (!app->saveServerHost(server_host)) {
+    if (server_changed && !app->saveServerHost(server_host)) {
         app->renderError("保存失败", "无法保存服务器 IP，请检查 NVS 状态。");
         return;
     }
     if (server_changed) {
+        app->advanceRequestGeneration();
         app->invalidateCacheServerHost();
+        app->_classroom_config_valid = false;
+        app->_catalog_server_host[0] = '\0';
+        app->freeCatalog();
+        app->_updating_dropdowns = true;
+        app->updateCatalogDropdown(app->_building_dropdown, NULL, 0, 0, "加载中");
+        app->updateCatalogDropdown(app->_room_dropdown, NULL, 0, 0, "加载中");
+        app->_updating_dropdowns = false;
+        lv_textarea_set_text(app->_server_host_ta, app->_server_host);
+        app->setKeyboardVisible(false);
+        app->startCatalogLoad(CATALOG_LOAD_ALL);
+        return;
     }
+    if (strcmp(app->_catalog_server_host, app->_server_host) != 0) {
+        app->renderError("目录已失效", "请重新加载当前服务器的教室目录。");
+        app->advanceRequestGeneration();
+        app->startCatalogLoad(CATALOG_LOAD_ALL);
+        return;
+    }
+    if (!app->saveSelection(app->_draft_building, app->_draft_classroom)) {
+        app->renderError("保存失败", "无法保存楼宇或教室，请检查 NVS 状态。");
+        return;
+    }
+    app->advanceRequestGeneration();
     app->_classroom_config_valid = true;
-    lv_textarea_set_text(app->_room_ta, room);
     lv_textarea_set_text(app->_server_host_ta, app->_server_host);
 
     app->setKeyboardVisible(false);
@@ -2065,22 +2586,10 @@ void ClassroomScheduleApp::saveClassroomEventCb(lv_event_t *e)
     app->startRefresh();
 }
 
-void ClassroomScheduleApp::roomInputEventCb(lv_event_t *e)
-{
-    ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
-    if (app == NULL || app->_keyboard == NULL || app->_room_ta == NULL || app->_busy) {
-        return;
-    }
-
-    lv_keyboard_set_mode(app->_keyboard, LV_KEYBOARD_MODE_NUMBER);
-    lv_keyboard_set_textarea(app->_keyboard, app->_room_ta);
-    app->setKeyboardVisible(true);
-}
-
 void ClassroomScheduleApp::serverHostInputEventCb(lv_event_t *e)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
-    if (app == NULL || app->_keyboard == NULL || app->_server_host_ta == NULL || app->_busy) {
+    if (app == NULL || app->_keyboard == NULL || app->_server_host_ta == NULL) {
         return;
     }
 
@@ -2109,7 +2618,7 @@ void ClassroomScheduleApp::dateButtonEventCb(lv_event_t *e)
 void ClassroomScheduleApp::todayButtonEventCb(lv_event_t *e)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
-    if (app == NULL || app->_busy) {
+    if (app == NULL) {
         return;
     }
 
@@ -2125,7 +2634,7 @@ void ClassroomScheduleApp::calendarEventCb(lv_event_t *e)
 {
     ClassroomScheduleApp *app = static_cast<ClassroomScheduleApp *>(lv_event_get_user_data(e));
     lv_obj_t *calendar = lv_event_get_current_target(e);
-    if (app == NULL || calendar == NULL || app->_busy) {
+    if (app == NULL || calendar == NULL) {
         return;
     }
 

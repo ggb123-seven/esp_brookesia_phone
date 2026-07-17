@@ -151,6 +151,8 @@ python tools/real_classroom_schedule_server.py \
 自测会验证：
 
 - fixture 能输出固件兼容 JSON。
+- 楼宇/教室目录接口能返回 fixture 中的真实选项，并校验 token 与未知楼宇。
+- 脱敏 EAMS HTML fixture 能解析楼宇下拉框、building id 和完整教室名，空占位与重复教室会被过滤。
 - 课程按开始时间排序。
 - `EMPTY` 返回空 `courses` 数组。
 - 未知教室返回空课表而不是解析失败。
@@ -228,24 +230,18 @@ python tools/real_classroom_schedule_server.py \
   --upstream-timeout-seconds 12
 ```
 
-`eams-session.json` 仍然必须放在未提交目录。除 `upstream_url` 和 `headers.Cookie` 外，真实占用 provider 支持这些非敏感配置：
+`eams-session.json` 仍然必须放在未提交目录。真实 provider 会从当前 EAMS 会话的标准 `class-details.action` 页面动态发现 `room.building.id`，再按所选楼宇读取完整教室名；源码和会话文件都不再需要静态楼宇 ID 映射。除 `upstream_url` 和 `headers.Cookie` 外，可保留这些非敏感配置：
 
 ```json
 {
   "first_week_start": "2026-03-02",
-  "buildings": {
-    "尔雅楼": "20"
-  },
-  "building_prefixes": {
-    "尔雅": "尔雅楼",
-    "尔雅楼": "尔雅楼"
-  }
+  "semesterId": "723",
+  "projectId": "1",
+  "syllabus_page_size": 500
 }
 ```
 
 - `first_week_start`: EAMS 当前学期第 1 周周一日期，用于按查询日期计算 `iWeek`。
-- `buildings`: EAMS 楼宇名称到 `room.building.id` 的映射。当前已确认 `尔雅楼` 为 `20`。
-- `building_prefixes`: 将设备传入的短教室名映射为 EAMS 教室名；例如 `尔雅103` 会规范化为 `尔雅楼103`。
 - `semesterId` / `semester_id`: EAMS 学期 ID，当前验证为 `723`。
 - `projectId` / `project_id`: 全校开课查询项目 ID，当前验证为 `1`。
 - `syllabus_page_size`: 全校开课查询分页大小；默认 `500`，用于减少分页请求次数。
@@ -256,13 +252,25 @@ python tools/real_classroom_schedule_server.py \
 
 - host: 云服务器公网 IP 或局域网 IP
 - port: `8080`
-- path: `/classroom-schedule/today`
+- schedule path: `/classroom-schedule/today`
+- building catalog path: `/classroom-schedule/buildings`
+- room catalog path: `/classroom-schedule/rooms`
 - token: 与服务器 `SCHEDULE_API_TOKEN` 一致
 - parent call alert path: `/parent-call-alert/trigger`
 - parent call alert token: 与服务器 `PARENT_CALL_ALERT_API_TOKEN` 一致
 - parent call alert transport: 默认仍建议 `Mock/demo only`；需要联调云端接收点时再切到 `HTTP middleware`
 
 MVP 可先用 `HTTP + IP:端口 + token` 跑通。后续有域名和证书后，再把传输层升级到 HTTPS 或反向代理。
+
+设备打开课表 App 后先请求楼宇目录，再以 `building=<完整楼宇名>` 请求该楼宇的教室目录，最后把选中的完整教室名原样传给课表接口。三个 GET 接口共用 `token` query 参数：
+
+```text
+GET /classroom-schedule/buildings?token=<redacted>
+GET /classroom-schedule/rooms?building=尔雅楼&token=<redacted>
+GET /classroom-schedule/today?classroom=尔雅楼103&date=2026-07-17&token=<redacted>
+```
+
+目录请求遇到未知楼宇/教室返回 HTTP 400，会话过期返回 HTTP 503，上游解析失败返回 HTTP 502；这些情况不能伪装成成功空课表。合法但当前没有教室的楼宇返回 `rooms: []`。
 
 ## 真实 WebVPN/EAMS 接入限制
 

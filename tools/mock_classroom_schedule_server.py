@@ -17,7 +17,15 @@ from urllib.parse import parse_qs, urlparse
 
 
 DEFAULT_PATH = "/classroom-schedule/today"
+BUILDINGS_PATH = "/classroom-schedule/buildings"
+ROOMS_PATH = "/classroom-schedule/rooms"
 DEFAULT_TOKEN = "change-me"
+MOCK_BUILDINGS = {
+    "博知楼": ["博知楼 A101", "博知楼 A102"],
+    "综合楼": ["综合楼 B202", "综合楼400（专）"],
+    "行知楼": ["行知楼 C303", "行知楼102-语音7"],
+    "空闲楼": [],
+}
 
 
 def guess_lan_ip() -> str:
@@ -30,16 +38,10 @@ def guess_lan_ip() -> str:
 
 
 def build_schedule(classroom: str, date_text: str) -> dict:
-    classroom_name = {
-        "A101": "博知楼 A101",
-        "B202": "综合楼 B202",
-        "C303": "行知楼 C303",
-    }.get(classroom, classroom)
-
     return {
         "date": date_text,
         "classroom": classroom,
-        "classroom_name": classroom_name,
+        "classroom_name": classroom,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "courses": [
             {
@@ -83,19 +85,45 @@ class ScheduleHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
             return
 
-        if parsed.path != self.server.api_path:
+        if parsed.path not in (self.server.api_path, BUILDINGS_PATH, ROOMS_PATH):
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return
 
         query = parse_qs(parsed.query)
         token = self.single(query, "token", "")
-        classroom = self.single(query, "classroom", "A101").strip() or "A101"
-        date_text = self.single(query, "date", datetime.now().strftime("%Y-%m-%d"))
-        mode = self.single(query, "mode", "")
-
         if token != self.server.api_token:
             self.send_json({"error": "invalid token"}, HTTPStatus.UNAUTHORIZED)
             return
+
+        if parsed.path == BUILDINGS_PATH:
+            self.send_json(
+                {
+                    "buildings": list(MOCK_BUILDINGS),
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            return
+
+        if parsed.path == ROOMS_PATH:
+            building = self.single(query, "building", "").strip()
+            if building not in MOCK_BUILDINGS:
+                self.send_json(
+                    {"error": "bad_request", "message": "building is not in the mock catalog"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self.send_json(
+                {
+                    "building": building,
+                    "rooms": MOCK_BUILDINGS[building],
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            return
+
+        classroom = self.single(query, "classroom", "博知楼 A101").strip() or "博知楼 A101"
+        date_text = self.single(query, "date", datetime.now().strftime("%Y-%m-%d"))
+        mode = self.single(query, "mode", "")
 
         if mode == "bad-json":
             body = b'{"date":'
@@ -114,6 +142,11 @@ class ScheduleHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         print("%s - %s" % (self.address_string(), fmt % args))
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        parsed = urlparse(self.path)
+        request_line = f"{self.command} {parsed.path} {self.request_version}"
+        self.log_message('"%s" %s %s', request_line, code, size)
 
     @staticmethod
     def single(query: dict[str, list[str]], name: str, default: str) -> str:

@@ -30,10 +30,18 @@ from urllib.error import HTTPError
 
 
 DEFAULT_PATH = "/classroom-schedule/today"
+BUILDINGS_PATH = "/classroom-schedule/buildings"
+ROOMS_PATH = "/classroom-schedule/rooms"
 DEFAULT_ALERT_PATH = "/parent-call-alert/trigger"
 DEFAULT_TOKEN = "change-me"
 DEFAULT_FIXTURE = Path(__file__).with_name("fixtures") / "classroom_schedule_fixture.json"
+DEFAULT_BUILDING_CATALOG_FIXTURE = Path(__file__).with_name("fixtures") / "eams_building_catalog_fixture.html"
+DEFAULT_ROOM_CATALOG_FIXTURE = Path(__file__).with_name("fixtures") / "eams_room_catalog_fixture.html"
 MAX_COURSES = 16
+MAX_BUILDINGS = 64
+MAX_ROOMS_PER_BUILDING = 512
+MAX_CATALOG_NAME_BYTES = 64
+EAMS_CATALOG_TTL_SECONDS = 600
 MAX_ALERT_BODY_BYTES = 2048
 ALERT_TEXT_RE = re.compile(r"^[\w .,:;!?+\-_/()\[\]\u4e00-\u9fff，。！？、；：（）【】]{0,160}$")
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -53,36 +61,6 @@ DEFAULT_SECTION_TIMES = {
 }
 EAMS_SYLLABUS_PAGE_SIZE = 500
 EAMS_SYLLABUS_MAX_PAGES = 12
-EAMS_BUILDING_IDS = {
-    "博文楼": "7",
-    "知行楼": "8",
-    "主楼机房": "9",
-    "静远楼": "11",
-    "博雅楼": "13",
-    "耘慧楼": "14",
-    "物理实验室": "15",
-    "葫芦岛物理实验室": "16",
-    "中和楼": "17",
-    "致远楼": "18",
-    "新华楼": "19",
-    "尔雅楼": "20",
-    "葫芦岛机房": "21",
-}
-EAMS_BUILDING_QUERY_NAMES = {
-    "博文楼": "null",
-    "知行楼": "育龙主楼",
-    "主楼机房": "主楼机房",
-    "静远楼": "静远楼",
-    "博雅楼": "博雅楼",
-    "耘慧楼": "耘慧楼",
-    "物理实验室": "物理实验室",
-    "葫芦岛物理实验室": "葫芦岛物理实验室",
-    "中和楼": "null",
-    "致远楼": "null",
-    "新华楼": "新华楼",
-    "尔雅楼": "尔雅楼",
-    "葫芦岛机房": "葫芦岛机房",
-}
 EAMS_WEEKDAY_NAMES = {
     "星期一": 1,
     "星期二": 2,
@@ -152,6 +130,12 @@ class CacheEntry:
     stored_at: float
 
 
+@dataclass(frozen=True)
+class BuildingCatalogEntry:
+    name: str
+    building_id: str
+
+
 class ScheduleCache:
     def __init__(self, ttl_seconds: int) -> None:
         self.ttl_seconds = max(0, ttl_seconds)
@@ -178,6 +162,12 @@ class ScheduleCache:
 class ScheduleProvider:
     name = "base"
 
+    def list_buildings(self) -> list[str]:
+        raise ProviderUnavailable("classroom catalog is unavailable for this provider")
+
+    def list_rooms(self, building_name: str) -> list[str]:
+        raise ProviderUnavailable("classroom catalog is unavailable for this provider")
+
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -188,6 +178,7 @@ class FixtureScheduleProvider(ScheduleProvider):
     def __init__(self, fixture_path: Path) -> None:
         self.fixture_path = fixture_path
         self._payload = self._load_fixture(fixture_path)
+        self._catalog = self._load_catalog(self._payload)
 
     @staticmethod
     def _load_fixture(fixture_path: Path) -> dict[str, Any]:
@@ -201,6 +192,28 @@ class FixtureScheduleProvider(ScheduleProvider):
         if not isinstance(payload, dict) or not isinstance(payload.get("classrooms"), dict):
             raise ProviderUnavailable("fixture file must contain classrooms object")
         return payload
+
+    @staticmethod
+    def _load_catalog(payload: dict[str, Any]) -> dict[str, list[str]]:
+        catalog = payload.get("buildings")
+        if not isinstance(catalog, dict):
+            return {"测试楼宇": sorted(str(name) for name in payload["classrooms"])}
+        normalized: dict[str, list[str]] = {}
+        for building_name, rooms in catalog.items():
+            building = validate_catalog_name(building_name, "building")
+            if not isinstance(rooms, list):
+                raise ProviderUnavailable("fixture building rooms must be an array")
+            normalized[building] = normalize_catalog_names(rooms, "room", MAX_ROOMS_PER_BUILDING)
+        return normalized
+
+    def list_buildings(self) -> list[str]:
+        return list(self._catalog)
+
+    def list_rooms(self, building_name: str) -> list[str]:
+        building = validate_catalog_name(building_name, "building")
+        if building not in self._catalog:
+            raise BadRequest("building is not in the current classroom catalog")
+        return list(self._catalog[building])
 
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         classrooms = self._payload["classrooms"]
@@ -337,27 +350,35 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         self.timeout_seconds = max(1, timeout_seconds)
         self.config = ManualSessionEamsProvider._load_session_config(session_file)
         self._syllabus_lock = threading.Lock()
+        self._catalog_lock = threading.Lock()
+        self._buildings: list[BuildingCatalogEntry] = []
+        self._buildings_loaded_at = 0.0
+        self._rooms: dict[str, tuple[float, list[str]]] = {}
+        self._room_index: dict[str, BuildingCatalogEntry] = {}
+
+    def list_buildings(self) -> list[str]:
+        with self._catalog_lock:
+            self._load_buildings_locked()
+            return [entry.name for entry in self._buildings]
+
+    def list_rooms(self, building_name: str) -> list[str]:
+        building = validate_catalog_name(building_name, "building")
+        with self._catalog_lock:
+            self._load_buildings_locked()
+            entry = next((item for item in self._buildings if item.name == building), None)
+            if entry is None:
+                raise BadRequest("building is not in the current classroom catalog")
+            return list(self._load_rooms_locked(entry))
 
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         classroom_name = normalize_eams_classroom_name(classroom)
+        building = self._resolve_classroom(classroom_name)
         target_week = self._week_for_date(date_text)
         target_day = datetime.strptime(date_text, "%Y-%m-%d").isoweekday()
         detailed_courses = self._fetch_syllabus_courses(classroom_name, target_week, target_day)
 
-        detail_url = self._build_detail_url(classroom_name, date_text)
-        request = Request(detail_url, headers=self._build_headers(), method="GET")
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                raw = response.read()
-                content_type = response.headers.get("Content-Type", "")
-        except HTTPError as exc:
-            if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) or 300 <= exc.code < 400:
-                raise ProviderUnavailable("EAMS room occupancy session is rejected or expired") from exc
-            raise UpstreamError("EAMS room occupancy upstream returned an error") from exc
-        except OSError as exc:
-            raise ProviderUnavailable("EAMS room occupancy upstream request failed") from exc
-
-        text = decode_eams_html(raw, content_type)
+        detail_url = self._build_detail_url(building, date_text)
+        text = self._fetch_eams_text(detail_url, "room occupancy")
         sections_by_day = extract_room_occupancy_sections(text, classroom_name)
         occupied_sections = sections_by_day.get(target_day, [])
         record = {
@@ -411,7 +432,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
                 break
         return dedupe_courses(courses)[:MAX_COURSES]
 
-    def _build_detail_url(self, classroom_name: str, date_text: str) -> str:
+    def _build_detail_url(self, building: BuildingCatalogEntry, date_text: str) -> str:
         upstream_url = str(self.config["upstream_url"]).strip()
         parsed = urlparse(upstream_url)
         if not parsed.scheme or not parsed.netloc:
@@ -420,11 +441,88 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         query = {
             "semesterId": str(self.config.get("semesterId") or self.config.get("semester_id") or "723"),
             "iWeek": str(self._week_for_date(date_text)),
-            "room.building.id": str(self._building_id_for(classroom_name)),
-            "buildingname": self._building_query_name_for(classroom_name),
+            "room.building.id": building.building_id,
         }
         path = prefix + "/eams/classroom/occupy/class-details!unitDetail.action"
         return urlunparse((parsed.scheme, parsed.netloc, path, "", urlencode(query), ""))
+
+    def _build_catalog_url(self) -> str:
+        upstream_url = str(self.config["upstream_url"]).strip()
+        parsed = urlparse(upstream_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ProviderUnavailable("EAMS session upstream_url must be absolute")
+        prefix = parsed.path.split("/eams/", 1)[0] if "/eams/" in parsed.path else ""
+        path = prefix + "/eams/classroom/occupy/class-details.action"
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+    def _fetch_eams_text(self, url: str, context: str) -> str:
+        request = Request(url, headers=self._build_headers(), method="GET")
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read()
+                content_type = response.headers.get("Content-Type", "")
+                final_url = response.geturl()
+        except HTTPError as exc:
+            if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) or 300 <= exc.code < 400:
+                raise ProviderUnavailable(f"EAMS {context} session is rejected or expired") from exc
+            raise UpstreamError(f"EAMS {context} upstream returned an error") from exc
+        except (OSError, TimeoutError) as exc:
+            raise ProviderUnavailable(f"EAMS {context} upstream request failed") from exc
+
+        text = decode_eams_html(raw, content_type)
+        if "authserver/login" in final_url.lower() or "统一身份认证" in text:
+            raise ProviderUnavailable(f"EAMS {context} session is rejected or expired")
+        return text
+
+    def _load_buildings_locked(self, force: bool = False) -> None:
+        if (
+            not force
+            and self._buildings
+            and time.time() - self._buildings_loaded_at <= EAMS_CATALOG_TTL_SECONDS
+        ):
+            return
+        text = self._fetch_eams_text(self._build_catalog_url(), "classroom catalog")
+        buildings = extract_eams_building_catalog(text)
+        self._buildings = buildings
+        self._buildings_loaded_at = time.time()
+        self._rooms.clear()
+        self._room_index.clear()
+
+    def _load_rooms_locked(self, building: BuildingCatalogEntry, force: bool = False) -> list[str]:
+        cached = self._rooms.get(building.name)
+        if cached is not None and not force and time.time() - cached[0] <= EAMS_CATALOG_TTL_SECONDS:
+            return cached[1]
+        url = self._build_detail_url(building, today_text())
+        rooms = extract_eams_room_names(self._fetch_eams_text(url, "classroom catalog"))
+        self._rooms[building.name] = (time.time(), rooms)
+        for room in rooms:
+            self._room_index[room] = building
+        return rooms
+
+    def _resolve_classroom(self, classroom_name: str) -> BuildingCatalogEntry:
+        with self._catalog_lock:
+            self._load_buildings_locked()
+            cached = self._room_index.get(classroom_name)
+            if cached is not None:
+                return cached
+
+            ordered = sorted(
+                self._buildings,
+                key=lambda entry: (not classroom_name.startswith(entry.name), -len(entry.name)),
+            )
+            for entry in ordered:
+                if classroom_name in self._load_rooms_locked(entry):
+                    return entry
+
+            self._load_buildings_locked(force=True)
+            ordered = sorted(
+                self._buildings,
+                key=lambda entry: (not classroom_name.startswith(entry.name), -len(entry.name)),
+            )
+            for entry in ordered:
+                if classroom_name in self._load_rooms_locked(entry, force=True):
+                    return entry
+        raise BadRequest("classroom is not in the current EAMS catalog")
 
     def _build_syllabus_url(self, page_no: int) -> str:
         upstream_url = str(self.config["upstream_url"]).strip()
@@ -459,41 +557,6 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             return int(self.config.get("iWeek") or self.config.get("week"))
         return 1
 
-    def _building_id_for(self, classroom_name: str) -> str:
-        buildings = self.config.get("buildings", {})
-        building_name = self._building_name_for(classroom_name)
-        if isinstance(buildings, dict):
-            configured = buildings.get(building_name) or buildings.get(classroom_name)
-            if configured:
-                return str(configured)
-        default_id = EAMS_BUILDING_IDS.get(building_name)
-        if default_id:
-            return default_id
-        raise ProviderUnavailable("EAMS room occupancy building id is not configured")
-
-    def _building_name_for(self, classroom_name: str) -> str:
-        buildings_by_prefix = self.config.get("building_prefixes", {})
-        if isinstance(buildings_by_prefix, dict):
-            for prefix, building_name in sorted(
-                buildings_by_prefix.items(), key=lambda item: len(str(item[0])), reverse=True
-            ):
-                if classroom_name.startswith(str(prefix)):
-                    return str(building_name)
-        for building_name in sorted(EAMS_BUILDING_IDS, key=len, reverse=True):
-            if classroom_name.startswith(building_name):
-                return building_name
-        raise ProviderUnavailable("EAMS room occupancy building name is not configured")
-
-    def _building_query_name_for(self, classroom_name: str) -> str:
-        building_name = self._building_name_for(classroom_name)
-        configured = self.config.get("building_query_names", {})
-        if isinstance(configured, dict) and building_name in configured:
-            return str(configured[building_name])
-        query_name = EAMS_BUILDING_QUERY_NAMES.get(building_name)
-        if query_name is not None:
-            return query_name
-        raise ProviderUnavailable("EAMS room occupancy building query name is not configured")
-
     def _build_headers(self) -> dict[str, str]:
         configured = self.config.get("headers", {})
         if not isinstance(configured, dict):
@@ -516,11 +579,10 @@ def sanitize_url(url: str | None) -> str | None:
     if not url:
         return None
     parsed = urlparse(url)
+    path = re.sub(r";jsessionid=[^/;?#]*", "", parsed.path or "/", flags=re.IGNORECASE)
     if parsed.scheme and parsed.netloc:
-        path = parsed.path or "/"
-        path = re.sub(r";jsessionid=[^/;?#]*", "", path, flags=re.IGNORECASE)
         return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
-    return str(url).split("?", 1)[0].split("#", 1)[0]
+    return path.split("?", 1)[0].split("#", 1)[0]
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -879,8 +941,21 @@ def run_eams_probe(args: argparse.Namespace) -> None:
 class FailingScheduleProvider(ScheduleProvider):
     name = "failing-self-test"
 
+    def list_buildings(self) -> list[str]:
+        raise ProviderUnavailable("self-test provider failure")
+
+    def list_rooms(self, building_name: str) -> list[str]:
+        raise ProviderUnavailable("self-test provider failure")
+
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         raise ProviderUnavailable("self-test provider failure")
+
+
+class RejectingScheduleProvider(FailingScheduleProvider):
+    name = "rejecting-self-test"
+
+    def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
+        raise BadRequest("self-test classroom rejection")
 
 
 class FakeUpstreamHandler(BaseHTTPRequestHandler):
@@ -995,6 +1070,74 @@ def normalize_eams_classroom_name(classroom: str) -> str:
         if suffix:
             return "尔雅楼" + suffix
     return classroom
+
+
+def validate_catalog_name(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise BadRequest(f"{field} must be text")
+    normalized = " ".join(value.replace("\xa0", " ").split())
+    if not normalized:
+        raise BadRequest(f"{field} is required")
+    if len(normalized.encode("utf-8")) >= MAX_CATALOG_NAME_BYTES:
+        raise BadRequest(f"{field} is too long")
+    return normalized
+
+
+def normalize_catalog_names(values: list[Any], field: str, limit: int) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        try:
+            name = validate_catalog_name(value, field)
+        except BadRequest:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+        if len(names) > limit:
+            raise PayloadTooLarge(f"{field} catalog is too large")
+    return names
+
+
+def extract_eams_building_catalog(text: str) -> list[BuildingCatalogEntry]:
+    buildings: list[BuildingCatalogEntry] = []
+    seen_names: set[str] = set()
+    for select_match in re.finditer(r"<select\b([^>]*)>(.*?)</select>", text, re.IGNORECASE | re.DOTALL):
+        attrs = html_attrs(select_match.group(1))
+        if attrs.get("name") != "room.building.id" and attrs.get("id") != "room.building.id":
+            continue
+        for option_match in re.finditer(
+            r"<option\b([^>]*)>(.*?)</option>", select_match.group(2), re.IGNORECASE | re.DOTALL
+        ):
+            option_attrs = html_attrs(option_match.group(1))
+            building_id = option_attrs.get("value", "").strip()
+            building_name = strip_html_text(option_match.group(2))
+            if not building_id or not building_name or building_name == "...":
+                continue
+            try:
+                name = validate_catalog_name(building_name, "building")
+                normalized_id = validate_catalog_name(building_id, "building id")
+            except BadRequest as exc:
+                raise UpstreamError("EAMS classroom catalog contains an invalid building") from exc
+            if not normalized_id.isdigit():
+                raise UpstreamError("EAMS classroom catalog contains an invalid building id")
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            buildings.append(BuildingCatalogEntry(name, normalized_id))
+            if len(buildings) > MAX_BUILDINGS:
+                raise PayloadTooLarge("building catalog is too large")
+        break
+    if not buildings:
+        raise UpstreamError("EAMS classroom catalog has no usable buildings")
+    return buildings
+
+
+def extract_eams_room_names(text: str) -> list[str]:
+    rows = extract_table_rows(text)
+    names = [row[0] for row in rows if row and row[0].strip() not in ("", "教室")]
+    return normalize_catalog_names(names, "room", MAX_ROOMS_PER_BUILDING)
 
 
 def strip_html_text(value: str) -> str:
@@ -1334,7 +1477,7 @@ def validate_classroom(classroom: str) -> str:
     classroom = classroom.strip()
     if not classroom:
         raise BadRequest("classroom is required")
-    if len(classroom) > 64:
+    if len(classroom.encode("utf-8")) >= MAX_CATALOG_NAME_BYTES:
         raise BadRequest("classroom is too long")
     return classroom
 
@@ -1459,6 +1602,12 @@ class ScheduleHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parsed.path == BUILDINGS_PATH:
+                self.handle_buildings(parse_qs(parsed.query))
+                return
+            if parsed.path == ROOMS_PATH:
+                self.handle_rooms(parse_qs(parsed.query))
+                return
             if parsed.path != self.server.api_path:
                 raise NotFound("not found")
             self.handle_schedule(parse_qs(parsed.query))
@@ -1480,10 +1629,26 @@ class ScheduleHandler(BaseHTTPRequestHandler):
             self.log_message("unexpected alert server error")
             self.send_error_json(ScheduleError("internal server error"))
 
-    def handle_schedule(self, query: dict[str, list[str]]) -> None:
+    def require_api_token(self, query: dict[str, list[str]]) -> None:
         token = single(query, "token")
         if token != self.server.api_token:
             raise Unauthorized("invalid token")
+
+    def handle_buildings(self, query: dict[str, list[str]]) -> None:
+        self.require_api_token(query)
+        buildings = self.server.provider.list_buildings()
+        self.log_message("classroom building catalog returned count=%d", len(buildings))
+        self.send_json({"buildings": buildings, "updated_at": updated_at_text()})
+
+    def handle_rooms(self, query: dict[str, list[str]]) -> None:
+        self.require_api_token(query)
+        building = validate_catalog_name(single(query, "building"), "building")
+        rooms = self.server.provider.list_rooms(building)
+        self.log_message("classroom room catalog returned building=%s count=%d", building, len(rooms))
+        self.send_json({"building": building, "rooms": rooms, "updated_at": updated_at_text()})
+
+    def handle_schedule(self, query: dict[str, list[str]]) -> None:
+        self.require_api_token(query)
 
         classroom = validate_classroom(single(query, "classroom"))
         date_text = validate_date(single(query, "date", today_text()))
@@ -1492,7 +1657,7 @@ class ScheduleHandler(BaseHTTPRequestHandler):
             data = self.server.provider.fetch_schedule(classroom, date_text)
             self.server.cache.set(classroom, date_text, data)
             self.send_json(data)
-        except ScheduleError as exc:
+        except (ProviderUnavailable, UpstreamError) as exc:
             cached = self.server.cache.get(classroom, date_text)
             if cached is not None:
                 self.send_json(cached)
@@ -1575,6 +1740,33 @@ def make_provider(args: argparse.Namespace) -> ScheduleProvider:
     raise BadRequest(f"unsupported provider: {args.provider}")
 
 
+def run_catalog_parser_self_test() -> None:
+    building_html = DEFAULT_BUILDING_CATALOG_FIXTURE.read_text(encoding="utf-8")
+    buildings = extract_eams_building_catalog(building_html)
+    assert buildings == [
+        BuildingCatalogEntry("博文楼", "7"),
+        BuildingCatalogEntry("知行楼", "8"),
+        BuildingCatalogEntry("中和楼", "17"),
+    ]
+
+    room_html = DEFAULT_ROOM_CATALOG_FIXTURE.read_text(encoding="utf-8")
+    assert extract_eams_room_names(room_html) == ["知行楼102-语音7", "中和楼400（专）"]
+    assert validate_catalog_name("教" * 21, "room") == "教" * 21
+    try:
+        validate_catalog_name("教" * 22, "room")
+    except BadRequest:
+        pass
+    else:
+        raise AssertionError("catalog names must fit the firmware UTF-8 byte buffer")
+
+    try:
+        extract_eams_building_catalog("<html><title>统一身份认证</title></html>")
+    except UpstreamError:
+        pass
+    else:
+        raise AssertionError("invalid EAMS catalog should fail")
+
+
 def run_self_test(args: argparse.Namespace) -> None:
     if args.provider not in ("fixture", "manual-session"):
         raise BadRequest("self-test only supports fixture or manual-session providers")
@@ -1587,6 +1779,9 @@ def run_self_test(args: argparse.Namespace) -> None:
     sanitized = sanitize_url("https://example.invalid/eams/home;jsessionid=secret?token=secret")
     assert sanitized == "https://example.invalid/eams/home"
     assert "secret" not in sanitized
+    relative_sanitized = sanitize_url("/eams/home;jsessionid=secret?token=secret")
+    assert relative_sanitized == "/eams/home"
+    assert "secret" not in relative_sanitized
 
     if provider.name == "fixture":
         for date_text in ("2026-07-16", "2026-07-17"):
@@ -1611,6 +1806,7 @@ def run_self_test(args: argparse.Namespace) -> None:
         raise AssertionError("invalid date should fail")
 
     run_http_self_test(args)
+    run_catalog_parser_self_test()
     run_syllabus_parser_self_test()
     print("Self-test passed.")
 
@@ -1644,6 +1840,31 @@ def run_http_self_test(args: argparse.Namespace) -> None:
         assert status == HTTPStatus.OK
         assert body["ok"] is True
         assert body["provider"] == provider.name
+
+        if provider.name == "fixture":
+            status, body = read_json_url(f"{base_url}{BUILDINGS_PATH}?token=self-test-token")
+            assert status == HTTPStatus.OK
+            assert body["buildings"] == ["尔雅楼", "博学楼", "综合楼", "空闲楼"]
+            assert body["updated_at"]
+
+            room_query = urlencode({"building": "尔雅楼", "token": "self-test-token"})
+            status, body = read_json_url(f"{base_url}{ROOMS_PATH}?{room_query}")
+            assert status == HTTPStatus.OK
+            assert body["building"] == "尔雅楼"
+            assert body["rooms"] == ["尔雅楼103"]
+
+            unknown_query = urlencode({"building": "未知楼", "token": "self-test-token"})
+            status, body = read_json_url(f"{base_url}{ROOMS_PATH}?{unknown_query}")
+            assert status == HTTPStatus.BAD_REQUEST
+            assert body["error"] == "bad_request"
+
+            status, body = read_json_url(f"{base_url}{ROOMS_PATH}?token=self-test-token")
+            assert status == HTTPStatus.BAD_REQUEST
+            assert body["error"] == "bad_request"
+
+            status, body = read_json_url(f"{base_url}{BUILDINGS_PATH}?token=wrong")
+            assert status == HTTPStatus.UNAUTHORIZED
+            assert body["error"] == "unauthorized"
 
         status, body = read_json_url(
             f"{base_url}{args.path}?classroom=A101&date=2026-07-05&token=self-test-token"
@@ -1779,12 +2000,23 @@ def run_http_self_test(args: argparse.Namespace) -> None:
         assert body["error"] == "bad_request"
 
         server.provider = FailingScheduleProvider()
+        status, body = read_json_url(f"{base_url}{BUILDINGS_PATH}?token=self-test-token")
+        assert status == HTTPStatus.SERVICE_UNAVAILABLE
+        assert body["error"] == "provider_unavailable"
         status, body = read_json_url(
             f"{base_url}{args.path}?classroom=A101&date=2026-07-05&token=self-test-token"
         )
         assert status == HTTPStatus.OK
         assert body["cached"] is True
         assert body["classroom"] == "A101"
+
+        server.provider = RejectingScheduleProvider()
+        status, body = read_json_url(
+            f"{base_url}{args.path}?classroom=A101&date=2026-07-05&token=self-test-token"
+        )
+        assert status == HTTPStatus.BAD_REQUEST
+        assert body["error"] == "bad_request"
+        assert body.get("cached") is not True
     finally:
         server.shutdown()
         server.server_close()
@@ -1947,15 +2179,6 @@ def run_syllabus_parser_self_test() -> None:
     assert provider._week_for_date("2026-03-02") == 1
     assert provider._week_for_date("2026-04-06") == 6
     assert provider._week_for_date("2026-07-16") == 20
-    for building_name, building_id in EAMS_BUILDING_IDS.items():
-        assert provider._building_name_for(f"{building_name}103") == building_name
-        assert provider._building_id_for(f"{building_name}103") == building_id
-        assert provider._building_query_name_for(f"{building_name}103") == EAMS_BUILDING_QUERY_NAMES[building_name]
-
-    provider.config["buildings"] = {"博文楼": "107"}
-    provider.config["building_query_names"] = {"博文楼": "自定义博文楼"}
-    assert provider._building_id_for("博文楼105") == "107"
-    assert provider._building_query_name_for("博文楼105") == "自定义博文楼"
 
     parity_arrangements = iter_syllabus_arrangements(
         "韩旭 星期一 9-10 [6-12]双 尔雅楼101"

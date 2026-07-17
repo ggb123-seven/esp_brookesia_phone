@@ -3,84 +3,161 @@
 ## 1. Scope / Trigger
 
 Use this contract when changing the classroom schedule firmware client, the
-Windows middleware, EAMS session handling, building mappings, or schedule
-fixtures. These pieces form one cross-layer request path and must be validated
-together.
+Windows middleware, EAMS session handling, classroom catalogs, mock/fixture
+data, or the app-local LVGL font. The catalog and schedule APIs form one
+cross-layer path and must be validated together.
 
 ## 2. Signatures
 
-- Device API: `GET /classroom-schedule/today`
-- Query: `classroom=<UTF-8 name>&date=YYYY-MM-DD&token=<secret>`
-- Health API: `GET /health`
-- Provider entry point:
-  `EamsRoomOccupancyProvider.fetch_schedule(classroom, date_text)`
+- Health: `GET /health`
+- Building catalog:
+  `GET /classroom-schedule/buildings?token=<secret>`
+- Room catalog:
+  `GET /classroom-schedule/rooms?building=<UTF-8 display name>&token=<secret>`
+- Schedule:
+  `GET /classroom-schedule/today?classroom=<full UTF-8 room name>&date=YYYY-MM-DD&token=<secret>`
+- Provider methods:
+
+```python
+ScheduleProvider.list_buildings() -> list[str]
+ScheduleProvider.list_rooms(building_name: str) -> list[str]
+ScheduleProvider.fetch_schedule(classroom: str, date_text: str) -> dict[str, Any]
+```
+
+- Firmware paths are independently configured by
+  `CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_BUILDINGS_PATH`,
+  `CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_ROOMS_PATH`, and
+  `CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_API_PATH`.
 
 ## 3. Contracts
 
-A successful response is HTTP 200 JSON with matching `classroom` and `date`, a
-display `classroom_name`, an `updated_at` string, and a `courses` array. Each
-course contains `start`, `end`, `name`, `teacher`, and `group` strings.
+The middleware discovers buildings from the current EAMS
+`class-details.action` page. Each usable `room.building.id` option becomes a
+`BuildingCatalogEntry(name, building_id)`. It fetches that building's complete
+room names with only `semesterId`, `iWeek`, and `room.building.id`; do not send
+or infer the obsolete `buildingname` parameter.
 
-The firmware must reject a response whose `classroom` or `date` differs from
-the active query. Offline cache reuse also requires the same server host,
-classroom, and date.
+Building catalog HTTP 200:
 
-EAMS building routing has three independent values: the firmware display name,
-`room.building.id`, and the upstream `buildingname` query value. Never derive
-the last two from the display name. For example, `知行楼` uses `buildingname=育龙主楼`,
-while `博文楼`, `中和楼`, and `致远楼` use the literal value `null`.
+```json
+{"buildings":["博文楼","知行楼","尔雅楼"],"updated_at":"2026-07-17T18:00:00+08:00"}
+```
 
-The local session file may reference a Playwright storage-state file. Cookie
-values and API tokens must stay in ignored local files and must never be logged.
+Room catalog HTTP 200:
+
+```json
+{"building":"尔雅楼","rooms":["尔雅楼101","尔雅楼102"],"updated_at":"2026-07-17T18:00:00+08:00"}
+```
+
+Catalog order is stable, empty placeholders are removed, duplicates are
+removed without reordering, and a legal building with no rooms returns
+`rooms: []`. A catalog name must occupy at most 63 UTF-8 bytes so it fits the
+firmware's NUL-terminated `char[64]`; Python character count is not the
+cross-layer limit. The middleware caches buildings and per-building rooms for
+a bounded TTL under one catalog lock. Refreshing the building generation
+invalidates all per-building room caches and the room-to-building index.
+
+A schedule HTTP 200 contains matching `classroom` and `date`, a
+`classroom_name` for the same target, `updated_at`, and `courses`. Each course
+contains `start`, `end`, `name`, `teacher`, and `group`. The EAMS provider must
+resolve the complete room name through the current catalog before querying;
+after one forced catalog refresh, a missing room is HTTP 400 rather than an
+empty successful schedule.
+
+The firmware stores building and classroom in one NVS commit. It keeps saved
+configuration, dropdown drafts, and received schedule data separate. Every
+catalog or schedule request carries a monotonically increasing generation plus
+its server/building/classroom/date snapshot. While one worker is active, only
+the latest pending request is retained. A stale result cannot update dropdowns,
+UI, or the schedule cache. Completion must be signaled before a pending worker
+is launched, and an old worker must not clear the new task handle.
+
+Offline schedule cache reuse requires the same server host, classroom, and
+date. Only transport failures or HTTP 5xx may fall back to cache; HTTP 4xx is a
+configuration/authentication result and must remain visible. Catalog responses
+are never synthesized from schedule cache.
+
+Cookie values, API tokens, storage state, JSESSIONID values, full query strings,
+and complete WebVPN URLs stay in ignored local files and sanitized logs.
 
 ## 4. Validation & Error Matrix
 
 | Condition | Middleware result | Firmware behavior |
 | --- | --- | --- |
-| Missing/invalid token | HTTP 401 | Show token configuration error |
-| Invalid classroom/date | HTTP 400 | Show request/configuration error |
-| EAMS 3xx login redirect, 401, or 403 | HTTP 503 | Ask for EAMS re-login |
-| Other upstream failure | HTTP 502 | Report upstream service unavailable |
-| Response classroom/date mismatch | HTTP 200 rejected locally | Do not display or cache |
+| Missing/invalid token | HTTP 401 | Show authentication/configuration error; no cache fallback |
+| Missing, overlong, or unknown building | HTTP 400 | Preserve NVS selection and require a valid catalog choice |
+| Unknown room after forced refresh | HTTP 400 | Show invalid selection; never display an empty schedule |
+| EAMS login page, redirect, 401, or 403 | HTTP 503 | Ask for EAMS re-login; schedule cache may be shown if the snapshot matches |
+| Other upstream network/parse failure | HTTP 502/503 | Show retryable error or matching schedule cache |
+| Legal building with zero rooms | HTTP 200 and `rooms: []` | Disable room save and show the zero-room state |
+| Room response building mismatch | HTTP 200 rejected locally | Keep the current room list unchanged |
+| Response generation/snapshot mismatch | Result discarded locally | Run only the latest pending request |
 | Valid empty `courses` | HTTP 200 | Show explicit no-course state |
+| Catalog or JSON exceeds firmware bounds | HTTP 413 or local size error | Show catalog/response-too-large error |
 
-EAMS login redirects must terminate the syllabus scan immediately. Continuing
-through all pages while holding the provider lock can exceed the device HTTP
-timeout and make unrelated requests wait behind the expired session.
+EAMS login responses must terminate catalog or syllabus scanning immediately.
+Do not continue through every building/page while holding the provider lock.
 
 ## 5. Good / Base / Bad Cases
 
-- Good: `尔雅楼103 / 2026-06-04` returns HTTP 200 with the real three-entry
-  schedule and matching query fields.
-- Base: a valid room/date with no courses returns HTTP 200 and `courses: []`.
-- Bad: an expired storage state redirects to login; middleware returns HTTP 503
-  promptly without exposing redirect URLs, cookies, or tokens.
+- Good: select two rooms in one building and one room in another building;
+  every response target matches exactly and the returned schedules follow the
+  selected rooms.
+- Base: a valid building returns zero rooms, or a valid room/date returns
+  `courses: []`; both remain successful but distinct UI states.
+- Bad: source constants map display names to EAMS IDs, a late response replaces
+  a newer draft, a 400 response displays old cached courses, or a worker signals
+  completion and then clears a newly created task handle.
 
 ## 6. Tests Required
 
-- Run `real_classroom_schedule_server.py --self-test` and assert 200/400/401/404
-  behavior plus fixture date propagation.
-- Unit-check every built-in building display name, id, and upstream query name;
-  also assert local config overrides win.
-- Query `/health`, then one real EAMS room/date; assert HTTP 200, matching fields,
-  and a bounded response time below the firmware timeout.
-- Run the firmware font coverage check, `idf.py build`, flash COM3, and verify
-  schedule refresh on hardware.
+- Run `python -B -X utf8 -m py_compile` for both schedule servers.
+- Run `real_classroom_schedule_server.py --self-test`; assert catalog
+  200/400/401/404/503 behavior, existing schedule fields, and that cached data
+  is used for provider/5xx failure but not for `BadRequest`.
+- Start the mock server and call all three APIs; assert UTF-8 building/room
+  round-trips, exact `classroom`/`date`, and 401/400/404 errors.
+- With an ignored current session, list real buildings, list at least two
+  buildings' rooms, and query two same-building rooms plus one cross-building
+  room. Log only counts and exact-target booleans.
+- Search the real provider for static building ID/query-name tables and
+  `buildingname`; none may remain on the query path.
+- Compare app copy plus mock/fixture and current real catalog CJK characters
+  with `classroom_schedule_font_20.c`; assert `missing=0` without changing the
+  UTF-8 query value for future unknown glyphs.
+- Run `git diff --check`, `idf.py build`, flash COM3, then test rapid selection,
+  close/reopen, NVS restoration, same/cross-building rooms, and error states.
 
 ## 7. Wrong vs Correct
 
 Wrong:
 
 ```python
-query["buildingname"] = displayed_building_name
+building_id = EAMS_BUILDING_IDS[displayed_building]
+query["buildingname"] = EAMS_BUILDING_QUERY_NAMES[displayed_building]
 ```
 
 Correct:
 
 ```python
-building_name = provider._building_name_for(classroom_name)
-query["room.building.id"] = provider._building_id_for(classroom_name)
-query["buildingname"] = provider._building_query_name_for(classroom_name)
+entry = next(item for item in provider._buildings if item.name == displayed_building)
+query["room.building.id"] = entry.building_id
+```
+
+Wrong:
+
+```cpp
+_busy = false;
+xSemaphoreGive(_worker_done);
+_worker_task = NULL; // Can erase the handle of a pending worker.
+```
+
+Correct:
+
+```cpp
+xSemaphoreGive(_worker_done);
+_busy = false;
+startPendingRequest(); // The old worker never clears the replacement handle.
 ```
 
 ## 8. Windows Session Refresh Launcher

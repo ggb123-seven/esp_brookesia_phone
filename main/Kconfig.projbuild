@@ -76,6 +76,18 @@ menu "Example Configurations"
                 Path for the schedule JSON endpoint. The app appends classroom,
                 date, and token query parameters.
 
+        config EXAMPLE_CLASSROOM_SCHEDULE_BUILDINGS_PATH
+            string "Classroom schedule buildings API path"
+            default "/classroom-schedule/buildings"
+            help
+                Path for the server-discovered EAMS building catalog.
+
+        config EXAMPLE_CLASSROOM_SCHEDULE_ROOMS_PATH
+            string "Classroom schedule rooms API path"
+            default "/classroom-schedule/rooms"
+            help
+                Path for the selected building's complete room catalog.
+
         config EXAMPLE_CLASSROOM_SCHEDULE_TOKEN
             string "Classroom schedule API token"
             default "change-me"
