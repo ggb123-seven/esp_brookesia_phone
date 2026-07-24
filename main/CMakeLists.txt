@@ -8,6 +8,7 @@ set(MAIN_REQUIRES
     esp_hw_support
     esp_lvgl_adapter
     heap
+    local_dashboard
     lvgl__lvgl
     mq2
     nvs_flash

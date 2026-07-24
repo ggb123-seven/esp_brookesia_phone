@@ -4,10 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -19,6 +26,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "driver/ppa.h"
+#include "sdkconfig.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_lv_adapter.h"
@@ -38,6 +46,13 @@
 #define CAMERA_INIT_TASK_WAIT_MS            (1000)
 #define DETECT_NUM_MAX                      (10)
 #define FPS_PRINT                           (1)
+#define CAMERA_BMP_HEADER_SIZE              (54)
+#define CAMERA_BMP_BYTES_PER_PIXEL          (3)
+#define CAMERA_PHOTO_PATH_MAX               (128)
+
+#if CONFIG_EXAMPLE_ENABLE_SD_CARD
+#define CAMERA_PHOTO_DIR                    CONFIG_BSP_SD_MOUNT_POINT "/camera"
+#endif
 
 using namespace std;
 
@@ -73,6 +88,155 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
                                        size_t camera_buf_len);
 
 static bool ppa_trans_done_cb(ppa_client_handle_t ppa_client, ppa_event_data_t *event_data, void *user_data);
+
+static void camera_put_le16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFF);
+    dst[1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static void camera_put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xFF);
+    dst[1] = (uint8_t)((value >> 8) & 0xFF);
+    dst[2] = (uint8_t)((value >> 16) & 0xFF);
+    dst[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static esp_err_t camera_write_all(FILE *file, const void *data, size_t size)
+{
+    if (fwrite(data, 1, size, file) != size)
+    {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+#if CONFIG_EXAMPLE_ENABLE_SD_CARD
+static esp_err_t camera_ensure_photo_dir(void)
+{
+    struct stat st;
+    if (stat(CAMERA_PHOTO_DIR, &st) == 0)
+    {
+        if (S_ISDIR(st.st_mode))
+        {
+            return ESP_OK;
+        }
+
+        ESP_LOGE(TAG, "Camera photo path exists but is not a directory: %s", CAMERA_PHOTO_DIR);
+        return ESP_FAIL;
+    }
+
+    if (mkdir(CAMERA_PHOTO_DIR, 0775) != 0)
+    {
+        ESP_LOGE(TAG, "Failed to create camera photo directory %s: errno=%d", CAMERA_PHOTO_DIR, errno);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+#endif
+
+static esp_err_t camera_save_rgb565_bmp_to_sd(const uint8_t *frame, uint32_t width,
+                                             uint32_t height, char *out_path,
+                                             size_t out_path_len)
+{
+    if (frame == NULL || width == 0 || height == 0 || out_path == NULL || out_path_len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+#if !CONFIG_EXAMPLE_ENABLE_SD_CARD
+    (void)width;
+    (void)height;
+    snprintf(out_path, out_path_len, "%s", "SD card disabled");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    esp_err_t err = camera_ensure_photo_dir();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    int path_len = snprintf(out_path, out_path_len, "%s/photo_%lld_%08" PRIx32 ".bmp",
+                            CAMERA_PHOTO_DIR, (long long)esp_timer_get_time(), esp_random());
+    if (path_len < 0 || (size_t)path_len >= out_path_len)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const uint32_t row_stride = (width * CAMERA_BMP_BYTES_PER_PIXEL + 3U) & ~3U;
+    const uint32_t pixel_data_size = row_stride * height;
+    const uint32_t file_size = CAMERA_BMP_HEADER_SIZE + pixel_data_size;
+
+    uint8_t header[CAMERA_BMP_HEADER_SIZE] = {0};
+    header[0] = 'B';
+    header[1] = 'M';
+    camera_put_le32(&header[2], file_size);
+    camera_put_le32(&header[10], CAMERA_BMP_HEADER_SIZE);
+    camera_put_le32(&header[14], 40);
+    camera_put_le32(&header[18], width);
+    camera_put_le32(&header[22], height);
+    camera_put_le16(&header[26], 1);
+    camera_put_le16(&header[28], 24);
+    camera_put_le32(&header[34], pixel_data_size);
+
+    FILE *file = fopen(out_path, "wb");
+    if (file == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to open camera photo file %s: errno=%d", out_path, errno);
+        return ESP_FAIL;
+    }
+
+    uint8_t *row = (uint8_t *)heap_caps_malloc(row_stride, MALLOC_CAP_8BIT);
+    if (row == NULL)
+    {
+        fclose(file);
+        remove(out_path);
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = camera_write_all(file, header, sizeof(header));
+    for (int32_t y = (int32_t)height - 1; err == ESP_OK && y >= 0; --y)
+    {
+        const uint16_t *src = (const uint16_t *)frame + ((size_t)y * width);
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            uint16_t pixel = src[x];
+            uint8_t r = (uint8_t)(((pixel >> 11) & 0x1F) << 3);
+            uint8_t g = (uint8_t)(((pixel >> 5) & 0x3F) << 2);
+            uint8_t b = (uint8_t)((pixel & 0x1F) << 3);
+
+            row[x * CAMERA_BMP_BYTES_PER_PIXEL + 0] = (uint8_t)(b | (b >> 5));
+            row[x * CAMERA_BMP_BYTES_PER_PIXEL + 1] = (uint8_t)(g | (g >> 6));
+            row[x * CAMERA_BMP_BYTES_PER_PIXEL + 2] = (uint8_t)(r | (r >> 5));
+        }
+
+        if (row_stride > width * CAMERA_BMP_BYTES_PER_PIXEL)
+        {
+            memset(row + width * CAMERA_BMP_BYTES_PER_PIXEL, 0,
+                   row_stride - width * CAMERA_BMP_BYTES_PER_PIXEL);
+        }
+
+        err = camera_write_all(file, row, row_stride);
+    }
+
+    heap_caps_free(row);
+
+    if (fclose(file) != 0 && err == ESP_OK)
+    {
+        err = ESP_FAIL;
+    }
+
+    if (err != ESP_OK)
+    {
+        remove(out_path);
+    }
+
+    return err;
+#endif
+}
 
 Camera::Camera(uint16_t hor_res, uint16_t ver_res):
     ESP_Brookesia_PhoneApp("Camera", &img_app_camera, false),  // auto_resize_visual_area
@@ -346,7 +510,8 @@ void Camera::onScreenCameraShotBtnClick(lv_event_t *e)
 {
     Camera *camera = (Camera *)e->user_data;
 
-    if (camera == NULL) {
+    if (camera == NULL)
+    {
         return;
     }
 
@@ -358,6 +523,23 @@ void Camera::onScreenCameraShotBtnClick(lv_event_t *e)
     memcpy(camera->_img_album_buffer, camera->_img_refresh_dsc.data,
            camera->_img_refresh_dsc.data_size);
     xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
+
+    char photo_path[CAMERA_PHOTO_PATH_MAX] = {0};
+    esp_err_t save_err = camera_save_rgb565_bmp_to_sd(
+        camera->_img_album_buffer, camera->_hor_res, camera->_ver_res,
+        photo_path, sizeof(photo_path));
+    if (save_err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Saved camera photo to %s", photo_path);
+    }
+    else if (save_err == ESP_ERR_NOT_SUPPORTED)
+    {
+        ESP_LOGW(TAG, "Skip camera photo save: SD card support is disabled");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Failed to save camera photo to SD card: %s", esp_err_to_name(save_err));
+    }
 }
 
 static bool ppa_trans_done_cb(ppa_client_handle_t ppa_client, ppa_event_data_t *event_data, void *user_data)

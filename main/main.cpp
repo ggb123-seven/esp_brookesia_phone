@@ -6,6 +6,8 @@
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
 #include "bsp_board_extra.h"
+#include <stdio.h>
+
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
@@ -32,6 +34,8 @@
 #include "parent_call_alert_service.h"
 #endif
 
+#include "local_dashboard_service.h"
+
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
 #include "as608_validation.h"
 #endif
@@ -40,6 +44,73 @@
 #include "esp_brookesia.hpp"
 
 static const char *TAG = "main";
+
+#if CONFIG_EXAMPLE_ENABLE_MQ2_SERVICE &&                                    \
+    CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
+#define ENVIRONMENT_ALERT_MONITOR_TASK_NAME       "env_alert"
+#define ENVIRONMENT_ALERT_MONITOR_TASK_STACK_SIZE (3072U)
+#define ENVIRONMENT_ALERT_MONITOR_TASK_PRIORITY   (4U)
+#define ENVIRONMENT_ALERT_MONITOR_PERIOD_MS       (500U)
+
+static TaskHandle_t s_environment_alert_monitor_task;
+
+static void environment_alert_monitor_task(void *arg)
+{
+    (void)arg;
+    bool last_alarm = false;
+
+    while (true)
+    {
+        mq2_service_snapshot_t snapshot = {};
+        if (mq2_service_get_snapshot(&snapshot) == ESP_OK && snapshot.valid)
+        {
+            const bool alarm = snapshot.state == MQ2_SERVICE_STATE_ALARM;
+            if (alarm && !last_alarm)
+            {
+                parent_call_alert_event_t event = {};
+                snprintf(event.reason, sizeof(event.reason), "%s", "mq2_alarm");
+                snprintf(event.detail, sizeof(event.detail), "%s",
+                         "MQ-2 detected smoke or combustible gas");
+                snprintf(event.message, sizeof(event.message), "%s",
+                         "环境监测检测到烟雾或可燃气体异常，请及时确认。");
+
+                esp_err_t err = parent_call_alert_service_trigger(&event);
+                if (err == ESP_OK)
+                {
+                    last_alarm = true;
+                    ESP_LOGW(TAG, "Queued parent call alert from MQ-2 background monitor");
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Failed to queue MQ-2 parent call alert: %s",
+                             esp_err_to_name(err));
+                }
+            }
+            else if (!alarm)
+            {
+                last_alarm = false;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ENVIRONMENT_ALERT_MONITOR_PERIOD_MS));
+    }
+}
+
+static esp_err_t start_environment_alert_monitor(void)
+{
+    if (s_environment_alert_monitor_task != NULL)
+    {
+        return ESP_OK;
+    }
+
+    BaseType_t created = xTaskCreate(
+        environment_alert_monitor_task, ENVIRONMENT_ALERT_MONITOR_TASK_NAME,
+        ENVIRONMENT_ALERT_MONITOR_TASK_STACK_SIZE, NULL,
+        ENVIRONMENT_ALERT_MONITOR_TASK_PRIORITY,
+        &s_environment_alert_monitor_task);
+    return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
+#endif
 
 #if !CONFIG_EXAMPLE_ENABLE_SD_CARD
 static esp_ldo_channel_handle_t sd_ldo_handle = NULL;
@@ -173,12 +244,16 @@ extern "C" void app_main(void) {
           CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_COMMAND_TIMEOUT_MS,
       .air780e_call_hold_ms =
           CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_CALL_HOLD_MS,
+      .v100c_call_timeout_ms =
+          CONFIG_EXAMPLE_PARENT_CALL_ALERT_V100C_CALL_TIMEOUT_MS,
       .task_stack_size = CONFIG_EXAMPLE_PARENT_CALL_ALERT_TASK_STACK_SIZE,
       .task_priority = CONFIG_EXAMPLE_PARENT_CALL_ALERT_TASK_PRIORITY,
       .queue_length = CONFIG_EXAMPLE_PARENT_CALL_ALERT_QUEUE_LENGTH,
       .enabled = true,
 #if CONFIG_EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_HTTP
       .transport = PARENT_CALL_ALERT_TRANSPORT_HTTP,
+#elif CONFIG_EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_V100C_UART
+      .transport = PARENT_CALL_ALERT_TRANSPORT_V100C_UART,
 #elif CONFIG_EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT
       .transport = PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT,
 #else
@@ -186,18 +261,30 @@ extern "C" void app_main(void) {
 #endif
   };
   err = parent_call_alert_service_init(&parent_call_config);
-  if (err != ESP_OK) {
+  if (err != ESP_OK)
+  {
     ESP_LOGE(TAG, "Failed to start parent call alert service: %s",
              esp_err_to_name(err));
   }
+  else
+  {
 #if CONFIG_EXAMPLE_PARENT_CALL_ALERT_AIR780E_SELF_TEST_ON_BOOT
-  else {
-    err = parent_call_alert_service_air780e_self_test();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "Air780E self-test failed: %s", esp_err_to_name(err));
+    err = parent_call_alert_service_modem_self_test();
+    if (err != ESP_OK)
+    {
+      ESP_LOGW(TAG, "Phone modem self-test failed: %s", esp_err_to_name(err));
     }
-  }
 #endif
+
+#if CONFIG_EXAMPLE_ENABLE_MQ2_SERVICE
+    err = start_environment_alert_monitor();
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "Failed to start environment alert monitor: %s",
+               esp_err_to_name(err));
+    }
+#endif
+  }
 #endif
 
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
@@ -207,6 +294,13 @@ extern "C" void app_main(void) {
              esp_err_to_name(err));
   }
 #endif
+
+  err = local_dashboard_service_start();
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to start local dashboard service: %s",
+             esp_err_to_name(err));
+  }
 
   bsp_display_cfg_t cfg = {
       .hw_cfg =

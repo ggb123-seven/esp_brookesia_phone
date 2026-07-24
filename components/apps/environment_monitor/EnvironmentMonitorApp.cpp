@@ -78,8 +78,7 @@ EnvironmentMonitorApp::EnvironmentMonitorApp():
     _gas_pulse(NULL),
     _mq2_level_label(NULL),
     _mq2_status_label(NULL),
-    _alert_status_label(NULL),
-    _last_mq2_alarm(false)
+    _alert_status_label(NULL)
 {
 }
 
@@ -126,7 +125,6 @@ bool EnvironmentMonitorApp::close(void)
     _mq2_level_label = NULL;
     _mq2_status_label = NULL;
     _alert_status_label = NULL;
-    _last_mq2_alarm = false;
 
     return true;
 }
@@ -315,24 +313,6 @@ void EnvironmentMonitorApp::stopVisualAnimations(void)
     }
 }
 
-void EnvironmentMonitorApp::triggerGasAlertIfNeeded(bool alarm)
-{
-#if CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
-    if (alarm && !_last_mq2_alarm) {
-        parent_call_alert_event_t event = {};
-        snprintf(event.reason, sizeof(event.reason), "%s", "mq2_alarm");
-        snprintf(event.detail, sizeof(event.detail), "%s", "MQ-2 detected smoke or combustible gas");
-        snprintf(event.message, sizeof(event.message), "%s", "环境监测检测到烟雾或可燃气体异常，请及时确认。");
-
-        esp_err_t err = parent_call_alert_service_trigger(&event);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to queue parent call alert: %s", esp_err_to_name(err));
-        }
-    }
-#endif
-    _last_mq2_alarm = alarm;
-}
-
 void EnvironmentMonitorApp::updateAlertStatus(void)
 {
     if (_alert_status_label == NULL) {
@@ -350,6 +330,7 @@ void EnvironmentMonitorApp::updateAlertStatus(void)
         uint32_t color = ENV_MONITOR_COLOR_MUTED;
         switch (alert_snapshot.status) {
         case PARENT_CALL_ALERT_STATUS_SENT:
+        case PARENT_CALL_ALERT_STATUS_TTS_DONE:
             color = ENV_MONITOR_COLOR_OK;
             break;
         case PARENT_CALL_ALERT_STATUS_SIMULATED:
@@ -357,10 +338,14 @@ void EnvironmentMonitorApp::updateAlertStatus(void)
             break;
         case PARENT_CALL_ALERT_STATUS_QUEUED:
         case PARENT_CALL_ALERT_STATUS_SENDING:
+        case PARENT_CALL_ALERT_STATUS_DIALING:
+        case PARENT_CALL_ALERT_STATUS_CONNECTED:
+        case PARENT_CALL_ALERT_STATUS_TTS_PLAYING:
         case PARENT_CALL_ALERT_STATUS_SKIPPED_COOLDOWN:
         case PARENT_CALL_ALERT_STATUS_SKIPPED_NO_IP:
             color = ENV_MONITOR_COLOR_WARN;
             break;
+        case PARENT_CALL_ALERT_STATUS_MODEM_NOT_READY:
         case PARENT_CALL_ALERT_STATUS_FAILED:
             color = ENV_MONITOR_COLOR_ERROR;
             break;
@@ -433,19 +418,16 @@ void EnvironmentMonitorApp::updateUi(void)
 
         snprintf(text, sizeof(text), "%d", mq2_snapshot.digital_level);
         lv_label_set_text(_mq2_level_label, text);
-        triggerGasAlertIfNeeded(alarm);
     } else {
         lv_label_set_text(_mq2_status_label, "--");
         lv_obj_set_style_text_color(_mq2_status_label, lv_color_hex(ENV_MONITOR_COLOR_MUTED), 0);
         lv_obj_set_style_border_color(_gas_pulse, lv_color_hex(ENV_MONITOR_COLOR_GAS), 0);
         lv_obj_set_style_bg_color(_gas_pulse, lv_color_hex(ENV_MONITOR_COLOR_GAS), 0);
         lv_label_set_text(_mq2_level_label, "--");
-        triggerGasAlertIfNeeded(false);
     }
 #else
     lv_label_set_text(_mq2_status_label, "--");
     lv_label_set_text(_mq2_level_label, "--");
-    triggerGasAlertIfNeeded(false);
 #endif
 
     updateAlertStatus();

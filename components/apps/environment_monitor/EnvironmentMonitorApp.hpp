@@ -28,7 +28,6 @@ private:
     void applyLabelStyle(lv_obj_t *label, uint32_t color, const lv_font_t *font);
     void startVisualAnimations(void);
     void stopVisualAnimations(void);
-    void triggerGasAlertIfNeeded(bool alarm);
     void updateAlertStatus(void);
 
     static void refreshTimerCallback(lv_timer_t *timer);
@@ -46,5 +45,4 @@ private:
     lv_obj_t *_mq2_level_label;
     lv_obj_t *_mq2_status_label;
     lv_obj_t *_alert_status_label;
-    bool _last_mq2_alarm;
 };

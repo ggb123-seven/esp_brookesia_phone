@@ -29,6 +29,11 @@
 #define PARENT_CALL_ALERT_AT_TX_WAIT_MS       (1000U)
 #define PARENT_CALL_ALERT_AT_COMMAND_MAX_LEN  (64U)
 #define PARENT_CALL_ALERT_AT_RESPONSE_MAX_LEN (256U)
+#define PARENT_CALL_ALERT_V100C_PROTOCOL_VERSION (1)
+#define PARENT_CALL_ALERT_V100C_LINE_MAX_LEN     (256U)
+#define PARENT_CALL_ALERT_V100C_TX_MAX_LEN       (PARENT_CALL_ALERT_V100C_LINE_MAX_LEN + 2U)
+#define PARENT_CALL_ALERT_V100C_READ_WAIT_MS     (100U)
+#define PARENT_CALL_ALERT_UART_MUTEX_WAIT_MS     (2000U)
 
 static const char *TAG = "ParentCallAlert";
 
@@ -43,11 +48,13 @@ static parent_call_alert_service_config_t s_config;
 static parent_call_alert_snapshot_t s_snapshot;
 static TaskHandle_t s_task_handle;
 static SemaphoreHandle_t s_done_sem;
+static SemaphoreHandle_t s_uart_mutex;
 static QueueHandle_t s_queue;
 static portMUX_TYPE s_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_stop_requested;
 static bool s_initialized;
 static bool s_air780e_uart_installed;
+static uint32_t s_v100c_next_request_id = 1;
 
 static void copy_string(char *dest, size_t dest_size, const char *src)
 {
@@ -82,6 +89,8 @@ static const char *transport_name(parent_call_alert_transport_t transport)
         return "mock";
     case PARENT_CALL_ALERT_TRANSPORT_HTTP:
         return "http";
+    case PARENT_CALL_ALERT_TRANSPORT_V100C_UART:
+        return "v100c_uart";
     case PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT:
         return "air780e_at";
     default:
@@ -124,6 +133,45 @@ static void update_snapshot(parent_call_alert_status_t status,
     default:
         break;
     }
+    taskEXIT_CRITICAL(&s_snapshot_lock);
+}
+
+static uint32_t next_v100c_request_id(void)
+{
+    taskENTER_CRITICAL(&s_snapshot_lock);
+    uint32_t request_id = s_v100c_next_request_id++;
+    if (request_id == 0)
+    {
+        request_id = s_v100c_next_request_id++;
+    }
+    taskEXIT_CRITICAL(&s_snapshot_lock);
+    return request_id;
+}
+
+static void update_v100c_runtime(uint32_t request_id, bool busy, const char *failure_reason)
+{
+    taskENTER_CRITICAL(&s_snapshot_lock);
+    s_snapshot.active_request_id = request_id;
+    s_snapshot.modem_busy = busy;
+    copy_string(s_snapshot.modem_failure_reason, sizeof(s_snapshot.modem_failure_reason),
+                failure_reason);
+    taskEXIT_CRITICAL(&s_snapshot_lock);
+}
+
+static void update_v100c_status(bool ready, bool busy, bool cc_ready, bool network_registered,
+                                bool audio_ready, bool firmware_supported, const char *firmware,
+                                const char *failure_reason)
+{
+    taskENTER_CRITICAL(&s_snapshot_lock);
+    s_snapshot.modem_ready = ready;
+    s_snapshot.modem_busy = busy;
+    s_snapshot.modem_audio_ready = audio_ready;
+    s_snapshot.modem_cc_ready = cc_ready;
+    s_snapshot.modem_network_registered = network_registered;
+    s_snapshot.modem_firmware_supported = firmware_supported;
+    copy_string(s_snapshot.modem_firmware, sizeof(s_snapshot.modem_firmware), firmware);
+    copy_string(s_snapshot.modem_failure_reason, sizeof(s_snapshot.modem_failure_reason),
+                failure_reason);
     taskEXIT_CRITICAL(&s_snapshot_lock);
 }
 
@@ -382,7 +430,7 @@ static esp_err_t air780e_at_command(const char *command,
     return air780e_at_read_until(expect, NULL, timeout_ms, response, response_size);
 }
 
-static esp_err_t send_alert_air780e_at(const parent_call_alert_event_t *event)
+static esp_err_t send_alert_air780e_at_unlocked(const parent_call_alert_event_t *event)
 {
     char response[PARENT_CALL_ALERT_AT_RESPONSE_MAX_LEN];
     const uint32_t timeout_ms = s_config.air780e_command_timeout_ms;
@@ -418,6 +466,401 @@ static esp_err_t send_alert_air780e_at(const parent_call_alert_event_t *event)
         ESP_LOGW(TAG, "Air780E hangup command failed after dial: err=%s", esp_err_to_name(hangup_err));
     }
     return ESP_OK;
+}
+
+static esp_err_t alert_uart_lock(void)
+{
+    ESP_RETURN_ON_FALSE(s_uart_mutex != NULL, ESP_ERR_INVALID_STATE, TAG,
+                        "Alert UART mutex is not initialized");
+    return xSemaphoreTake(s_uart_mutex, pdMS_TO_TICKS(PARENT_CALL_ALERT_UART_MUTEX_WAIT_MS)) ==
+                   pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
+}
+
+static void alert_uart_unlock(void)
+{
+    if (s_uart_mutex != NULL)
+    {
+        xSemaphoreGive(s_uart_mutex);
+    }
+}
+
+static esp_err_t send_alert_air780e_at(const parent_call_alert_event_t *event)
+{
+    ESP_RETURN_ON_ERROR(alert_uart_lock(), TAG, "Failed to lock Air780E AT UART");
+    const esp_err_t err = send_alert_air780e_at_unlocked(event);
+    alert_uart_unlock();
+    return err;
+}
+
+static esp_err_t v100c_write_request(uint32_t request_id, const char *command,
+                                     const char *phone_number)
+{
+    char line[PARENT_CALL_ALERT_V100C_TX_MAX_LEN];
+    cJSON *root = cJSON_CreateObject();
+    ESP_RETURN_ON_FALSE(root != NULL, ESP_ERR_NO_MEM, TAG, "Failed to allocate V100C request JSON");
+
+    bool ok =
+        cJSON_AddNumberToObject(root, "v", PARENT_CALL_ALERT_V100C_PROTOCOL_VERSION) != NULL &&
+        cJSON_AddNumberToObject(root, "id", request_id) != NULL &&
+        cJSON_AddStringToObject(root, "cmd", command) != NULL;
+    if (ok && phone_number != NULL)
+    {
+        ok = cJSON_AddStringToObject(root, "phone", phone_number) != NULL;
+    }
+    if (!ok)
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    const bool printed = cJSON_PrintPreallocated(root, line, sizeof(line), false);
+    cJSON_Delete(root);
+    if (!printed)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t line_len = strlen(line);
+    if (line_len >= PARENT_CALL_ALERT_V100C_LINE_MAX_LEN)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    line[line_len++] = '\n';
+
+    const int written = uart_write_bytes(s_config.air780e_uart_num, line, line_len);
+    if (written != (int)line_len)
+    {
+        return ESP_FAIL;
+    }
+    return uart_wait_tx_done(s_config.air780e_uart_num,
+                             pdMS_TO_TICKS(PARENT_CALL_ALERT_AT_TX_WAIT_MS));
+}
+
+static bool v100c_json_bool(const cJSON *root, const char *name, bool *value)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsBool(item))
+    {
+        return false;
+    }
+    *value = cJSON_IsTrue(item);
+    return true;
+}
+
+typedef enum
+{
+    V100C_CALL_EVENT_WAIT_DIALING = 0,
+    V100C_CALL_EVENT_DIALING,
+    V100C_CALL_EVENT_CONNECTED,
+    V100C_CALL_EVENT_TTS_STARTED,
+    V100C_CALL_EVENT_TTS_DONE,
+} v100c_call_event_state_t;
+
+static esp_err_t v100c_apply_status(const cJSON *root)
+{
+    bool ready = false;
+    bool busy = false;
+    bool audio_ready = false;
+    bool cc_ready = false;
+    bool network_registered = false;
+    bool firmware_supported = false;
+    const cJSON *firmware = cJSON_GetObjectItemCaseSensitive(root, "firmware");
+
+    if (!v100c_json_bool(root, "ready", &ready) || !v100c_json_bool(root, "busy", &busy) ||
+        !v100c_json_bool(root, "audio_ready", &audio_ready) ||
+        !v100c_json_bool(root, "cc_ready", &cc_ready) ||
+        !v100c_json_bool(root, "network_registered", &network_registered) ||
+        !v100c_json_bool(root, "firmware_supported", &firmware_supported) ||
+        !cJSON_IsString(firmware) || firmware->valuestring == NULL)
+    {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const bool usable = ready && !busy && audio_ready && cc_ready && network_registered &&
+                        firmware_supported;
+    const char *reason = NULL;
+    if (!firmware_supported)
+    {
+        reason = "unsupported_firmware";
+    }
+    else if (!audio_ready)
+    {
+        reason = "audio_not_ready";
+    }
+    else if (!cc_ready)
+    {
+        reason = "cc_not_ready";
+    }
+    else if (!network_registered)
+    {
+        reason = "network_not_registered";
+    }
+    else if (busy)
+    {
+        reason = "busy";
+    }
+    else if (!ready)
+    {
+        reason = "not_ready";
+    }
+    update_v100c_status(ready, busy, cc_ready, network_registered, audio_ready,
+                        firmware_supported,
+                        firmware->valuestring, reason);
+    return usable ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t v100c_process_line(char *line, uint32_t request_id,
+                                    const parent_call_alert_event_t *alert_event, bool status_only,
+                                    bool *terminal, v100c_call_event_state_t *call_state)
+{
+    cJSON *root = cJSON_Parse(line);
+    if (root == NULL || !cJSON_IsObject(root))
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "v");
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    const cJSON *event = cJSON_GetObjectItemCaseSensitive(root, "event");
+    if (!cJSON_IsNumber(version) ||
+        version->valuedouble != PARENT_CALL_ALERT_V100C_PROTOCOL_VERSION || !cJSON_IsNumber(id) ||
+        id->valuedouble < 0 || id->valuedouble > UINT32_MAX ||
+        (double)(uint32_t)id->valuedouble != id->valuedouble || !cJSON_IsString(event) ||
+        event->valuestring == NULL)
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if ((uint32_t)id->valuedouble != request_id)
+    {
+        ESP_LOGW(TAG, "Ignore stale V100C event: expected_id=%" PRIu32 " received_id=%" PRIu32,
+                 request_id, (uint32_t)id->valuedouble);
+        cJSON_Delete(root);
+        return ESP_OK;
+    }
+
+    esp_err_t result = ESP_OK;
+    if (strcmp(event->valuestring, "failed") == 0)
+    {
+        const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+        const char *reason_text = cJSON_IsString(reason) && reason->valuestring != NULL
+                                      ? reason->valuestring
+                                      : "unknown_failure";
+        update_v100c_runtime(0, false, reason_text);
+        ESP_LOGE(TAG, "V100C request failed: id=%" PRIu32 " reason=%s", request_id, reason_text);
+        *terminal = true;
+        result = ESP_FAIL;
+    }
+    else if (status_only)
+    {
+        if (strcmp(event->valuestring, "status") == 0)
+        {
+            result = v100c_apply_status(root);
+            *terminal = true;
+        }
+        else
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+    else if (strcmp(event->valuestring, "dialing") == 0)
+    {
+        if (*call_state != V100C_CALL_EVENT_WAIT_DIALING)
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        else
+        {
+            *call_state = V100C_CALL_EVENT_DIALING;
+            update_snapshot(PARENT_CALL_ALERT_STATUS_DIALING, ESP_OK, 0, alert_event);
+        }
+    }
+    else if (strcmp(event->valuestring, "connected") == 0)
+    {
+        if (*call_state != V100C_CALL_EVENT_DIALING)
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        else
+        {
+            *call_state = V100C_CALL_EVENT_CONNECTED;
+            update_snapshot(PARENT_CALL_ALERT_STATUS_CONNECTED, ESP_OK, 0, alert_event);
+        }
+    }
+    else if (strcmp(event->valuestring, "tts_started") == 0)
+    {
+        if (*call_state != V100C_CALL_EVENT_CONNECTED)
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        else
+        {
+            *call_state = V100C_CALL_EVENT_TTS_STARTED;
+            update_snapshot(PARENT_CALL_ALERT_STATUS_TTS_PLAYING, ESP_OK, 0, alert_event);
+        }
+    }
+    else if (strcmp(event->valuestring, "tts_done") == 0)
+    {
+        if (*call_state != V100C_CALL_EVENT_TTS_STARTED)
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        else
+        {
+            *call_state = V100C_CALL_EVENT_TTS_DONE;
+            update_snapshot(PARENT_CALL_ALERT_STATUS_TTS_DONE, ESP_OK, 0, alert_event);
+        }
+    }
+    else if (strcmp(event->valuestring, "completed") == 0)
+    {
+        if (*call_state != V100C_CALL_EVENT_TTS_DONE)
+        {
+            result = ESP_ERR_INVALID_RESPONSE;
+        }
+        else
+        {
+            update_v100c_runtime(0, false, NULL);
+            *terminal = true;
+        }
+    }
+    else
+    {
+        result = ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON_Delete(root);
+    return result;
+}
+
+static esp_err_t v100c_wait_for_terminal(uint32_t request_id, uint32_t timeout_ms,
+                                         const parent_call_alert_event_t *alert_event,
+                                         bool status_only)
+{
+    char line[PARENT_CALL_ALERT_V100C_LINE_MAX_LEN + 1U];
+    size_t line_len = 0;
+    bool line_overflow = false;
+    bool terminal = false;
+    v100c_call_event_state_t call_state = V100C_CALL_EVENT_WAIT_DIALING;
+    const int64_t deadline_ms = (esp_timer_get_time() / 1000) + timeout_ms;
+
+    while (!terminal && (esp_timer_get_time() / 1000) < deadline_ms)
+    {
+        uint8_t byte = 0;
+        const int read_len = uart_read_bytes(s_config.air780e_uart_num, &byte, 1,
+                                             pdMS_TO_TICKS(PARENT_CALL_ALERT_V100C_READ_WAIT_MS));
+        if (read_len <= 0)
+        {
+            continue;
+        }
+        if (byte == '\r')
+        {
+            continue;
+        }
+        if (byte != '\n')
+        {
+            if (line_len < (PARENT_CALL_ALERT_V100C_LINE_MAX_LEN - 1U))
+            {
+                line[line_len++] = (char)byte;
+            }
+            else
+            {
+                line_overflow = true;
+            }
+            continue;
+        }
+
+        if (line_overflow)
+        {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (line_len == 0)
+        {
+            continue;
+        }
+        line[line_len] = '\0';
+        esp_err_t err =
+            v100c_process_line(line, request_id, alert_event, status_only, &terminal, &call_state);
+        line_len = 0;
+        line_overflow = false;
+        if (err != ESP_OK || terminal)
+        {
+            return err;
+        }
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t send_alert_v100c(const parent_call_alert_event_t *event)
+{
+    ESP_RETURN_ON_FALSE(air780e_phone_number_is_safe(s_config.air780e_phone_number),
+                        ESP_ERR_INVALID_ARG, TAG, "V100C parent phone number is not configured");
+    ESP_RETURN_ON_ERROR(alert_uart_lock(), TAG, "Failed to lock V100C UART");
+    esp_err_t err = air780e_uart_init();
+    if (err != ESP_OK)
+    {
+        alert_uart_unlock();
+        return err;
+    }
+
+    const uint32_t request_id = next_v100c_request_id();
+    uart_flush_input(s_config.air780e_uart_num);
+    update_v100c_runtime(request_id, true, NULL);
+    err = v100c_write_request(request_id, "call", s_config.air780e_phone_number);
+    if (err == ESP_OK)
+    {
+        err = v100c_wait_for_terminal(request_id, s_config.v100c_call_timeout_ms, event, false);
+    }
+    if (err != ESP_OK && err != ESP_FAIL)
+    {
+        esp_err_t hangup_err = v100c_write_request(request_id, "hangup", NULL);
+        if (hangup_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "V100C hangup request failed after call error: id=%" PRIu32 " err=%s",
+                     request_id, esp_err_to_name(hangup_err));
+        }
+        update_v100c_runtime(0, false,
+                             err == ESP_ERR_TIMEOUT ? "response_timeout" : "protocol_error");
+    }
+    alert_uart_unlock();
+    return err;
+}
+
+static esp_err_t v100c_self_test(void)
+{
+    ESP_RETURN_ON_ERROR(alert_uart_lock(), TAG, "Failed to lock V100C UART for self-test");
+    esp_err_t err = air780e_uart_init();
+    if (err != ESP_OK)
+    {
+        alert_uart_unlock();
+        return err;
+    }
+
+    const uint32_t request_id = next_v100c_request_id();
+    uart_flush_input(s_config.air780e_uart_num);
+    err = v100c_write_request(request_id, "status", NULL);
+    if (err == ESP_OK)
+    {
+        err = v100c_wait_for_terminal(request_id, s_config.air780e_command_timeout_ms, NULL, true);
+    }
+    alert_uart_unlock();
+
+    update_snapshot(err == ESP_OK ? PARENT_CALL_ALERT_STATUS_IDLE
+                                  : PARENT_CALL_ALERT_STATUS_MODEM_NOT_READY,
+                    err, 0, NULL);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "V100C status self-test passed: id=%" PRIu32, request_id);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "V100C status self-test failed: id=%" PRIu32 " err=%s", request_id,
+                 esp_err_to_name(err));
+    }
+    return err;
 }
 
 static void simulate_alert_send(const parent_call_alert_event_t *event)
@@ -476,25 +919,37 @@ static void alert_task(void *arg)
         update_snapshot(PARENT_CALL_ALERT_STATUS_SENDING, ESP_OK, 0, &event);
         int http_status = 0;
         esp_err_t err = ESP_ERR_INVALID_STATE;
-        if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_HTTP) {
+        if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_HTTP)
+        {
             err = send_alert_http(&event, &http_status);
-        } else if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT) {
+        }
+        else if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_V100C_UART)
+        {
+            err = send_alert_v100c(&event);
+        }
+        else if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT)
+        {
             err = send_alert_air780e_at(&event);
         }
 
-        if (err == ESP_OK) {
+        if (err == ESP_OK)
+        {
             update_snapshot(PARENT_CALL_ALERT_STATUS_SENT, ESP_OK, http_status, &event);
-            ESP_LOGI(TAG, "Parent call alert sent: reason=%s transport=%s http=%d",
-                     event.reason, transport_name(s_config.transport), http_status);
-        } else {
+            ESP_LOGI(TAG, "Parent call alert sent: reason=%s transport=%s http=%d", event.reason,
+                     transport_name(s_config.transport), http_status);
+        }
+        else
+        {
             update_snapshot(PARENT_CALL_ALERT_STATUS_FAILED, err, http_status, &event);
             ESP_LOGE(TAG, "Parent call alert failed: reason=%s transport=%s err=%s http=%d",
-                     event.reason, transport_name(s_config.transport), esp_err_to_name(err), http_status);
+                     event.reason, transport_name(s_config.transport), esp_err_to_name(err),
+                     http_status);
         }
     }
 
     ESP_LOGI(TAG, "Parent call alert task stopped");
-    if (s_done_sem != NULL) {
+    if (s_done_sem != NULL)
+    {
         xSemaphoreGive(s_done_sem);
     }
     s_task_handle = NULL;
@@ -511,10 +966,12 @@ static esp_err_t validate_config(const parent_call_alert_service_config_t *confi
     ESP_RETURN_ON_FALSE(config->queue_length > 0, ESP_ERR_INVALID_ARG, TAG,
                         "Alert queue length must be greater than zero");
     ESP_RETURN_ON_FALSE((config->transport == PARENT_CALL_ALERT_TRANSPORT_MOCK) ||
-                        (config->transport == PARENT_CALL_ALERT_TRANSPORT_HTTP) ||
-                        (config->transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT),
+                            (config->transport == PARENT_CALL_ALERT_TRANSPORT_HTTP) ||
+                            (config->transport == PARENT_CALL_ALERT_TRANSPORT_V100C_UART) ||
+                            (config->transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT),
                         ESP_ERR_INVALID_ARG, TAG, "Invalid alert transport");
-    if (config->transport == PARENT_CALL_ALERT_TRANSPORT_HTTP) {
+    if (config->transport == PARENT_CALL_ALERT_TRANSPORT_HTTP)
+    {
         ESP_RETURN_ON_FALSE(config->server_host != NULL && config->server_host[0] != '\0',
                             ESP_ERR_INVALID_ARG, TAG, "Alert server host is required");
         ESP_RETURN_ON_FALSE(config->server_port > 0, ESP_ERR_INVALID_ARG, TAG,
@@ -522,11 +979,11 @@ static esp_err_t validate_config(const parent_call_alert_service_config_t *confi
         ESP_RETURN_ON_FALSE(config->api_path != NULL && config->api_path[0] == '/',
                             ESP_ERR_INVALID_ARG, TAG, "Alert API path must start with /");
     }
-    if (config->transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT) {
-        ESP_RETURN_ON_FALSE(air780e_phone_number_is_safe(config->air780e_phone_number),
-                            ESP_ERR_INVALID_ARG, TAG, "Air780E phone number is invalid");
+    if (config->transport == PARENT_CALL_ALERT_TRANSPORT_V100C_UART ||
+        config->transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT)
+    {
         ESP_RETURN_ON_FALSE(config->air780e_uart_num > UART_NUM_0 &&
-                            config->air780e_uart_num < UART_NUM_MAX,
+                                config->air780e_uart_num < UART_NUM_MAX,
                             ESP_ERR_INVALID_ARG, TAG, "Air780E UART port is invalid");
         ESP_RETURN_ON_FALSE(config->air780e_tx_gpio >= 0 && config->air780e_rx_gpio >= 0,
                             ESP_ERR_INVALID_ARG, TAG, "Air780E TX/RX GPIO must be configured");
@@ -534,6 +991,20 @@ static esp_err_t validate_config(const parent_call_alert_service_config_t *confi
                             "Air780E baud rate is invalid");
         ESP_RETURN_ON_FALSE(config->air780e_command_timeout_ms > 0, ESP_ERR_INVALID_ARG, TAG,
                             "Air780E command timeout is invalid");
+        if (config->transport == PARENT_CALL_ALERT_TRANSPORT_V100C_UART)
+        {
+            ESP_RETURN_ON_FALSE(
+                config->air780e_phone_number == NULL || config->air780e_phone_number[0] == '\0' ||
+                    air780e_phone_number_is_safe(config->air780e_phone_number),
+                ESP_ERR_INVALID_ARG, TAG, "V100C phone number contains invalid characters");
+            ESP_RETURN_ON_FALSE(config->v100c_call_timeout_ms >= 30000, ESP_ERR_INVALID_ARG, TAG,
+                                "V100C call timeout must allow the modem dial timeout");
+        }
+        else
+        {
+            ESP_RETURN_ON_FALSE(air780e_phone_number_is_safe(config->air780e_phone_number),
+                                ESP_ERR_INVALID_ARG, TAG, "Air780E phone number is invalid");
+        }
     }
     return ESP_OK;
 }
@@ -558,8 +1029,17 @@ esp_err_t parent_call_alert_service_init(const parent_call_alert_service_config_
     s_queue = xQueueCreate(s_config.queue_length, sizeof(parent_call_alert_event_t));
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create alert queue");
 
+    s_uart_mutex = xSemaphoreCreateMutex();
+    if (s_uart_mutex == NULL) {
+        vQueueDelete(s_queue);
+        s_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     s_done_sem = xSemaphoreCreateBinary();
     if (s_done_sem == NULL) {
+        vSemaphoreDelete(s_uart_mutex);
+        s_uart_mutex = NULL;
         vQueueDelete(s_queue);
         s_queue = NULL;
         return ESP_ERR_NO_MEM;
@@ -574,6 +1054,8 @@ esp_err_t parent_call_alert_service_init(const parent_call_alert_service_config_
     if (ret != pdPASS) {
         vSemaphoreDelete(s_done_sem);
         s_done_sem = NULL;
+        vSemaphoreDelete(s_uart_mutex);
+        s_uart_mutex = NULL;
         vQueueDelete(s_queue);
         s_queue = NULL;
         return ESP_ERR_NO_MEM;
@@ -613,6 +1095,10 @@ esp_err_t parent_call_alert_service_deinit(void)
         s_queue = NULL;
     }
     air780e_uart_deinit();
+    if (s_uart_mutex != NULL) {
+        vSemaphoreDelete(s_uart_mutex);
+        s_uart_mutex = NULL;
+    }
 
     s_initialized = false;
     taskENTER_CRITICAL(&s_snapshot_lock);
@@ -643,27 +1129,43 @@ esp_err_t parent_call_alert_service_trigger(const parent_call_alert_event_t *eve
     return ESP_OK;
 }
 
-esp_err_t parent_call_alert_service_air780e_self_test(void)
+esp_err_t parent_call_alert_service_modem_self_test(void)
 {
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG,
                         "Parent call alert service is not initialized");
+    if (s_config.transport == PARENT_CALL_ALERT_TRANSPORT_V100C_UART)
+    {
+        return v100c_self_test();
+    }
     ESP_RETURN_ON_FALSE(s_config.transport == PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT,
-                        ESP_ERR_INVALID_STATE, TAG, "Parent call alert transport is not Air780E AT");
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "Parent call alert transport has no modem self-test");
 
     char response[PARENT_CALL_ALERT_AT_RESPONSE_MAX_LEN];
-    esp_err_t err = air780e_at_command("AT\r\n", "OK", s_config.air780e_command_timeout_ms,
-                                       response, sizeof(response));
-    if (err == ESP_OK) {
+    ESP_RETURN_ON_ERROR(alert_uart_lock(), TAG, "Failed to lock Air780E AT UART for self-test");
+    const esp_err_t err = air780e_at_command("AT\r\n", "OK", s_config.air780e_command_timeout_ms,
+                                             response, sizeof(response));
+    alert_uart_unlock();
+    if (err == ESP_OK)
+    {
         ESP_LOGI(TAG, "Air780E AT self-test passed");
-    } else {
+    }
+    else
+    {
         ESP_LOGE(TAG, "Air780E AT self-test failed: err=%s", esp_err_to_name(err));
     }
     return err;
 }
 
+esp_err_t parent_call_alert_service_air780e_self_test(void)
+{
+    return parent_call_alert_service_modem_self_test();
+}
+
 esp_err_t parent_call_alert_service_get_snapshot(parent_call_alert_snapshot_t *snapshot)
 {
-    ESP_RETURN_ON_FALSE(snapshot != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid alert snapshot output");
+    ESP_RETURN_ON_FALSE(snapshot != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "Invalid alert snapshot output");
     ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG,
                         "Parent call alert service is not initialized");
 
@@ -682,6 +1184,16 @@ const char *parent_call_alert_service_status_name(parent_call_alert_status_t sta
         return "QUEUED";
     case PARENT_CALL_ALERT_STATUS_SENDING:
         return "SENDING";
+    case PARENT_CALL_ALERT_STATUS_MODEM_NOT_READY:
+        return "MODEM_NOT_READY";
+    case PARENT_CALL_ALERT_STATUS_DIALING:
+        return "DIALING";
+    case PARENT_CALL_ALERT_STATUS_CONNECTED:
+        return "CONNECTED";
+    case PARENT_CALL_ALERT_STATUS_TTS_PLAYING:
+        return "TTS_PLAYING";
+    case PARENT_CALL_ALERT_STATUS_TTS_DONE:
+        return "TTS_DONE";
     case PARENT_CALL_ALERT_STATUS_SENT:
         return "SENT";
     case PARENT_CALL_ALERT_STATUS_SIMULATED:
@@ -708,8 +1220,18 @@ const char *parent_call_alert_service_status_text(parent_call_alert_status_t sta
         return "已排队";
     case PARENT_CALL_ALERT_STATUS_SENDING:
         return "发送中";
+    case PARENT_CALL_ALERT_STATUS_MODEM_NOT_READY:
+        return "模块未就绪";
+    case PARENT_CALL_ALERT_STATUS_DIALING:
+        return "拨号中";
+    case PARENT_CALL_ALERT_STATUS_CONNECTED:
+        return "已接通";
+    case PARENT_CALL_ALERT_STATUS_TTS_PLAYING:
+        return "播报中";
+    case PARENT_CALL_ALERT_STATUS_TTS_DONE:
+        return "播报完成";
     case PARENT_CALL_ALERT_STATUS_SENT:
-        return "已发送";
+        return "播报完成";
     case PARENT_CALL_ALERT_STATUS_SIMULATED:
         return "模拟";
     case PARENT_CALL_ALERT_STATUS_SKIPPED_COOLDOWN:

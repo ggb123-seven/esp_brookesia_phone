@@ -155,6 +155,8 @@ menu "Example Configurations"
             help
                 Select MOCK until the real phone module or cloud voice middleware
                 is connected. HTTP sends POST requests to the configured endpoint.
+                V100C UART uses the companion JSON protocol and waits for real
+                connected/TTS/completed events.
                 Air780E AT sends ATD/ATH over UART and can place real calls when
                 the module/SIM/operator support voice service.
 
@@ -168,6 +170,13 @@ menu "Example Configurations"
                 help
                     Send alert events to the configured HTTP middleware.
 
+            config EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_V100C_UART
+                bool "Yinerda V100C UART companion"
+                help
+                    Send versioned JSON commands to the V100C LuatOS companion.
+                    Success requires a real call connection, in-call TTS completion,
+                    and a final completed event with the same request ID.
+
             config EXAMPLE_PARENT_CALL_ALERT_TRANSPORT_AIR780E_AT
                 bool "Air780E AT voice call"
                 help
@@ -178,22 +187,22 @@ menu "Example Configurations"
         endchoice
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_PHONE_NUMBER
-            string "Air780E parent phone number"
+            string "V100C/Air780E parent phone number"
             default ""
             help
-                Parent phone number used only by Air780E AT transport. Keep this
-                empty in committed defaults and set it locally before real dialing.
-                Digits are allowed, with an optional leading +.
+                Parent phone number used by the V100C UART and Air780E AT transports.
+                Keep this empty in committed defaults and set it locally before real
+                dialing. Digits are allowed, with an optional leading +.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_UART_NUM
-            int "Air780E UART port"
+            int "V100C/Air780E UART port"
             range 1 5
             default 2
             help
                 UART0 is reserved for the console. Avoid UART1 when AS608 is enabled.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_TX_GPIO
-            int "Air780E UART TX GPIO"
+            int "V100C/Air780E UART TX GPIO"
             range 0 54
             default 34
             help
@@ -202,7 +211,7 @@ menu "Example Configurations"
                 be changed to match the actual wiring.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_RX_GPIO
-            int "Air780E UART RX GPIO"
+            int "V100C/Air780E UART RX GPIO"
             range 0 54
             default 35
             help
@@ -210,17 +219,25 @@ menu "Example Configurations"
                 actual wiring before enabling Air780E AT mode.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_BAUD_RATE
-            int "Air780E UART baud rate"
+            int "V100C/Air780E UART baud rate"
             default 115200
             help
                 Common Air780E AT examples use 115200 bps.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_COMMAND_TIMEOUT_MS
-            int "Air780E AT command timeout in milliseconds"
+            int "V100C status/AT command timeout in milliseconds"
             range 1000 30000
             default 8000
             help
                 Timeout for one Air780E AT command response.
+
+        config EXAMPLE_PARENT_CALL_ALERT_V100C_CALL_TIMEOUT_MS
+            int "V100C complete call timeout in milliseconds"
+            range 30000 180000
+            default 60000
+            help
+                Maximum time to wait for dialing, connection, TTS playback, and
+                completed. On timeout the ESP32-P4 sends a hangup command.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_CALL_HOLD_MS
             int "Air780E call hold time in milliseconds"
@@ -230,11 +247,12 @@ menu "Example Configurations"
                 Time to keep the call active after ATD is accepted before sending ATH.
 
         config EXAMPLE_PARENT_CALL_ALERT_AIR780E_SELF_TEST_ON_BOOT
-            bool "Run Air780E AT self-test on boot"
+            bool "Run phone modem self-test on boot"
             default n
             help
-                When Air780E AT transport is selected, send only AT on boot to verify
-                UART communication. This does not dial the phone number.
+                V100C UART sends only status and verifies protocol, firmware, CC READY,
+                network registration, and idle state. Air780E AT sends only AT. Neither
+                path dials the phone number.
 
         config EXAMPLE_PARENT_CALL_ALERT_COOLDOWN_MS
             int "Parent call alert cooldown in milliseconds"
@@ -248,21 +266,22 @@ menu "Example Configurations"
             range 1000 30000
             default 8000
             help
-                HTTP request timeout for one alert trigger.
+                HTTP request timeout for one alert trigger. V100C status uses the
+                modem command timeout configured above.
 
         config EXAMPLE_PARENT_CALL_ALERT_TASK_STACK_SIZE
             int "Parent call alert task stack size"
             range 4096 16384
             default 6144
             help
-                Stack size for the alert HTTP worker task.
+                Stack size for the alert worker task.
 
         config EXAMPLE_PARENT_CALL_ALERT_TASK_PRIORITY
             int "Parent call alert task priority"
             range 1 10
             default 5
             help
-                FreeRTOS priority for the alert HTTP worker task.
+                FreeRTOS priority for the alert worker task.
 
         config EXAMPLE_PARENT_CALL_ALERT_QUEUE_LENGTH
             int "Parent call alert queue length"
