@@ -601,6 +601,12 @@ function Invoke-Launcher {
         $loginTimeoutSeconds -lt 30 -or $loginTimeoutSeconds -gt 3600) {
         throw "EAMS_LOGIN_TIMEOUT_SECONDS must be between 30 and 3600."
     }
+    $keepaliveText = Get-ProcessSetting -Name "EAMS_KEEPALIVE_SECONDS" -Default "120"
+    $keepaliveSeconds = 0
+    if (-not [int]::TryParse($keepaliveText, [ref]$keepaliveSeconds) -or
+        $keepaliveSeconds -lt 0 -or $keepaliveSeconds -gt 3600) {
+        throw "EAMS_KEEPALIVE_SECONDS must be between 0 and 3600."
+    }
     $browserProfile = Resolve-ProjectFile `
         -ProjectDirectory $projectDirectory `
         -PathText (Get-ProcessSetting -Name "EAMS_BROWSER_PROFILE" -Default ".local-secrets\eams-edge-profile")
@@ -640,6 +646,9 @@ function Invoke-Launcher {
     Write-Host "LAN IP:   $displayAddress" -ForegroundColor Green
     Write-Host "Device:   http://${displayAddress}:$serverPort"
     Write-Host "Provider: $provider"
+    if ($provider -ne "fixture") {
+        Write-Host "Keepalive: every $keepaliveSeconds seconds"
+    }
     Write-Host "Tokens:   configured (values are hidden)"
 
     $sessionRefreshed = $false
@@ -758,6 +767,8 @@ function Invoke-Launcher {
     $env:SCHEDULE_EAMS_SESSION_FILE = $sessionFile
     $env:SCHEDULE_EAMS_LOGIN_FILE = $loginFile
     $env:SCHEDULE_UPSTREAM_TIMEOUT_SECONDS = "$timeoutSeconds"
+    $env:SCHEDULE_EAMS_KEEPALIVE_SECONDS = "$keepaliveSeconds"
+    $env:PYTHONUNBUFFERED = "1"
 
     Write-Host "Status:   starting; keep this window open" -ForegroundColor Green
     Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
@@ -765,7 +776,7 @@ function Invoke-Launcher {
 
     Push-Location $projectDirectory
     try {
-        $arguments = @($python.Prefix) + @("-B", "-X", "utf8", $serverScript)
+        $arguments = @($python.Prefix) + @("-u", "-B", "-X", "utf8", $serverScript)
         & $python.Executable @arguments
         return $LASTEXITCODE
     } finally {

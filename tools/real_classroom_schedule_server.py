@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -22,12 +25,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 from socket import AF_INET, SOCK_DGRAM, socket
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.error import HTTPError, URLError
 
 
 DEFAULT_PATH = "/classroom-schedule/today"
@@ -43,6 +47,7 @@ MAX_BUILDINGS = 64
 MAX_ROOMS_PER_BUILDING = 512
 MAX_CATALOG_NAME_BYTES = 64
 EAMS_CATALOG_TTL_SECONDS = 600
+DEFAULT_EAMS_KEEPALIVE_SECONDS = 120
 MAX_ALERT_BODY_BYTES = 2048
 ALERT_TEXT_RE = re.compile(r"^[\w .,:;!?+\-_/()\[\]\u4e00-\u9fff，。！？、；：（）【】]{0,160}$")
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -62,6 +67,8 @@ DEFAULT_SECTION_TIMES = {
 }
 EAMS_SYLLABUS_PAGE_SIZE = 500
 EAMS_SYLLABUS_MAX_PAGES = 12
+PLAYWRIGHT_COOKIE_JAR_KEY = "_playwright_cookie_jar"
+PLAYWRIGHT_STORAGE_STATE_PATH_KEY = "_playwright_storage_state_path"
 EAMS_WEEKDAY_NAMES = {
     "星期一": 1,
     "星期二": 2,
@@ -131,6 +138,28 @@ class CacheEntry:
     stored_at: float
 
 
+class CurlResponse:
+    def __init__(self, status: int, final_url: str, content_type: str, body: bytes) -> None:
+        self.status = status
+        self._final_url = final_url
+        self._body = body
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self) -> "CurlResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            return self._body
+        return self._body[:size]
+
+    def geturl(self) -> str:
+        return self._final_url
+
+
 @dataclass(frozen=True)
 class BuildingCatalogEntry:
     name: str
@@ -164,6 +193,9 @@ class ScheduleProvider:
     name = "base"
 
     def validate_schedule_target(self, classroom: str, date_text: str) -> None:
+        return
+
+    def keep_alive(self) -> None:
         return
 
     def list_buildings(self) -> list[str]:
@@ -257,7 +289,7 @@ class ManualSessionEamsProvider(ScheduleProvider):
         headers = self._build_headers()
         request = Request(upstream_url, headers=headers, method="GET")
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with open_session_request(self.config, request, self.timeout_seconds) as response:
                 raw = response.read()
                 content_type = response.headers.get("Content-Type", "")
         except HTTPError as exc:
@@ -270,6 +302,25 @@ class ManualSessionEamsProvider(ScheduleProvider):
         text = decode_response_text(raw, content_type)
         record = parse_upstream_payload(text, content_type)
         return normalize_schedule(classroom, date_text, record)
+
+    def keep_alive(self) -> None:
+        upstream_url = strip_url_jsessionid(str(self.config["upstream_url"]).strip())
+        request = Request(upstream_url, headers=self._build_headers(), method="GET")
+        try:
+            with open_session_request(self.config, request, self.timeout_seconds) as response:
+                raw = response.read(300_000)
+                content_type = response.headers.get("Content-Type", "")
+                final_url = response.geturl()
+        except HTTPError as exc:
+            if exc.code in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN) or 300 <= exc.code < 400:
+                raise ProviderUnavailable("manual WebVPN/EAMS keepalive session is rejected or expired") from exc
+            raise UpstreamError("manual WebVPN/EAMS keepalive returned an error") from exc
+        except (OSError, TimeoutError) as exc:
+            raise ProviderUnavailable("manual WebVPN/EAMS keepalive request failed") from exc
+
+        text = decode_probe_text(raw, content_type)
+        if "authserver/login" in final_url.lower() or "统一身份认证" in text:
+            raise ProviderUnavailable("manual WebVPN/EAMS keepalive session is rejected or expired")
 
     def _build_url(self, classroom: str, date_text: str) -> str:
         upstream_url = str(self.config["upstream_url"]).strip()
@@ -297,7 +348,7 @@ class ManualSessionEamsProvider(ScheduleProvider):
             if isinstance(key, str) and value is not None
         }
         headers.setdefault("User-Agent", "ClassroomScheduleMiddleware/0.1")
-        return headers
+        return session_request_headers(self.config, headers)
 
 
 def apply_playwright_storage_state(config: dict[str, Any], session_file: Path) -> None:
@@ -319,13 +370,15 @@ def apply_playwright_storage_state(config: dict[str, Any], session_file: Path) -
         raise ProviderUnavailable("Playwright EAMS storage state has no cookies array")
 
     upstream_host = (urlparse(str(config["upstream_url"])).hostname or "").lower()
+    cookie_jar = CookieJar()
     cookie_pairs: list[str] = []
     now = time.time()
     for cookie in state["cookies"]:
         if not isinstance(cookie, dict):
             continue
-        domain = str(cookie.get("domain") or "").lstrip(".").lower()
-        if not domain or (upstream_host != domain and not upstream_host.endswith("." + domain)):
+        raw_domain = str(cookie.get("domain") or "").strip().lower()
+        domain = raw_domain.lstrip(".")
+        if not domain:
             continue
         expires = cookie.get("expires")
         if isinstance(expires, (int, float)) and expires > 0 and expires <= now:
@@ -334,7 +387,33 @@ def apply_playwright_storage_state(config: dict[str, Any], session_file: Path) -
         value = cookie.get("value")
         if not isinstance(name, str) or not name or not isinstance(value, str):
             continue
-        cookie_pairs.append(f"{name}={value}")
+
+        cookie_jar.set_cookie(
+            Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=domain,
+                domain_specified=raw_domain.startswith("."),
+                domain_initial_dot=raw_domain.startswith("."),
+                path=str(cookie.get("path") or "/"),
+                path_specified=bool(cookie.get("path")),
+                secure=bool(cookie.get("secure")),
+                expires=int(expires) if isinstance(expires, (int, float)) and expires > 0 else None,
+                discard=not (isinstance(expires, (int, float)) and expires > 0),
+                comment=None,
+                comment_url=None,
+                rest={
+                    "HttpOnly": bool(cookie.get("httpOnly")),
+                    "SameSite": str(cookie.get("sameSite") or ""),
+                },
+                rfc2109=False,
+            )
+        )
+        if upstream_host == domain or upstream_host.endswith("." + domain):
+            cookie_pairs.append(f"{name}={value}")
     if not cookie_pairs:
         raise ProviderUnavailable("Playwright EAMS storage state has no usable upstream cookies")
 
@@ -345,6 +424,222 @@ def apply_playwright_storage_state(config: dict[str, Any], session_file: Path) -
         raise ProviderUnavailable("manual WebVPN/EAMS headers config must be an object")
     configured_headers["Cookie"] = "; ".join(cookie_pairs)
     config["headers"] = configured_headers
+    config[PLAYWRIGHT_COOKIE_JAR_KEY] = cookie_jar
+    config[PLAYWRIGHT_STORAGE_STATE_PATH_KEY] = state_file
+
+
+def session_request_headers(config: dict[str, Any], headers: dict[str, str]) -> dict[str, str]:
+    if isinstance(config.get(PLAYWRIGHT_COOKIE_JAR_KEY), CookieJar):
+        headers = dict(headers)
+        headers.pop("Cookie", None)
+    return headers
+
+
+def write_netscape_cookie_file(cookie_jar: CookieJar, path: Path) -> None:
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in cookie_jar:
+        domain = cookie.domain
+        include_subdomains = "TRUE" if cookie.domain_initial_dot else "FALSE"
+        secure = "TRUE" if cookie.secure else "FALSE"
+        expires = str(int(cookie.expires or 0))
+        lines.append(
+            "\t".join(
+                [
+                    domain,
+                    include_subdomains,
+                    cookie.path or "/",
+                    secure,
+                    expires,
+                    cookie.name,
+                    cookie.value,
+                ]
+            )
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def merge_netscape_cookie_file(cookie_jar: CookieJar, path: Path) -> None:
+    if not path.exists():
+        return
+    now = time.time()
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, include_subdomains, cookie_path, secure, expires_text, name, value = parts[:7]
+        try:
+            expires = int(expires_text)
+        except ValueError:
+            expires = 0
+        if expires > 0 and expires <= now:
+            continue
+        raw_domain = domain.strip().lower()
+        cookie_jar.set_cookie(
+            Cookie(
+                version=0,
+                name=name,
+                value=value,
+                port=None,
+                port_specified=False,
+                domain=raw_domain.lstrip("."),
+                domain_specified=include_subdomains.upper() == "TRUE",
+                domain_initial_dot=raw_domain.startswith(".") or include_subdomains.upper() == "TRUE",
+                path=cookie_path or "/",
+                path_specified=True,
+                secure=secure.upper() == "TRUE",
+                expires=expires if expires > 0 else None,
+                discard=expires <= 0,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+        )
+
+
+def persist_playwright_storage_state(config: dict[str, Any]) -> None:
+    cookie_jar = config.get(PLAYWRIGHT_COOKIE_JAR_KEY)
+    state_file = config.get(PLAYWRIGHT_STORAGE_STATE_PATH_KEY)
+    if not isinstance(cookie_jar, CookieJar) or not isinstance(state_file, Path):
+        return
+    try:
+        state = load_json_file(state_file)
+    except (OSError, ScheduleError):
+        return
+
+    try:
+        cookies: list[dict[str, Any]] = []
+        for cookie in cookie_jar:
+            domain = cookie.domain or ""
+            if cookie.domain_initial_dot and not domain.startswith("."):
+                domain = "." + domain
+            payload: dict[str, Any] = {
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": domain,
+                "path": cookie.path or "/",
+                "expires": cookie.expires if cookie.expires is not None else -1,
+                "httpOnly": bool(cookie._rest.get("HttpOnly")),
+                "secure": bool(cookie.secure),
+            }
+            same_site = cookie._rest.get("SameSite")
+            if same_site:
+                payload["sameSite"] = same_site
+            cookies.append(payload)
+
+        state["cookies"] = cookies
+        temporary = state_file.with_name(state_file.name + ".tmp")
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, state_file)
+    except OSError:
+        return
+
+
+def parse_curl_write_out(stdout: str) -> tuple[int, str, str] | None:
+    status = 0
+    final_url = ""
+    content_type = ""
+    for line in stdout.splitlines():
+        if line.startswith("CURL_HTTP_CODE:"):
+            try:
+                status = int(line.split(":", 1)[1])
+            except ValueError:
+                status = 0
+        elif line.startswith("CURL_URL:"):
+            final_url = line.split(":", 1)[1]
+        elif line.startswith("CURL_CONTENT_TYPE:"):
+            content_type = line.split(":", 1)[1]
+    if status <= 0:
+        return None
+    return status, final_url, content_type
+
+
+def open_session_request_with_curl(
+    config: dict[str, Any],
+    request: Request,
+    timeout: int,
+    original_error: BaseException,
+) -> CurlResponse:
+    cookie_jar = config.get(PLAYWRIGHT_COOKIE_JAR_KEY)
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if curl is None or not isinstance(cookie_jar, CookieJar) or request.data is not None:
+        raise original_error
+
+    with tempfile.TemporaryDirectory(prefix="eams-curl-") as directory:
+        root = Path(directory)
+        cookie_file = root / "cookies.txt"
+        body_file = root / "body.bin"
+        write_netscape_cookie_file(cookie_jar, cookie_file)
+
+        arguments = [
+            curl,
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(max(1, timeout)),
+            "--cookie",
+            str(cookie_file),
+            "--cookie-jar",
+            str(cookie_file),
+            "--output",
+            str(body_file),
+            "--write-out",
+            "CURL_HTTP_CODE:%{http_code}\nCURL_URL:%{url_effective}\nCURL_CONTENT_TYPE:%{content_type}\n",
+            "--request",
+            request.get_method(),
+        ]
+        for key, value in request.header_items():
+            if key.lower() == "cookie":
+                continue
+            arguments.extend(["--header", f"{key}: {value}"])
+        arguments.append(request.full_url)
+
+        try:
+            completed = subprocess.run(
+                arguments,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout + 5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise original_error from exc
+
+        if completed.returncode != 0:
+            raise original_error
+
+        parsed = parse_curl_write_out(completed.stdout)
+        if parsed is None:
+            raise original_error
+        status, final_url, content_type = parsed
+        body = body_file.read_bytes() if body_file.exists() else b""
+        merge_netscape_cookie_file(cookie_jar, cookie_file)
+        persist_playwright_storage_state(config)
+        response = CurlResponse(status, final_url, content_type, body)
+        if status >= 400 or 300 <= status < 400:
+            raise HTTPError(final_url or request.full_url, status, "curl HTTP error", response.headers, io.BytesIO(body))
+        return response
+
+
+def open_session_request(config: dict[str, Any], request: Request, timeout: int):
+    cookie_jar = config.get(PLAYWRIGHT_COOKIE_JAR_KEY)
+    if isinstance(cookie_jar, CookieJar):
+        try:
+            response = build_opener(HTTPCookieProcessor(cookie_jar)).open(request, timeout=timeout)
+            persist_playwright_storage_state(config)
+            return response
+        except HTTPError:
+            raise
+        except (OSError, TimeoutError, URLError) as exc:
+            return open_session_request_with_curl(config, request, timeout, exc)
+    return urlopen(request, timeout=timeout)
 
 
 class EamsRoomOccupancyProvider(ScheduleProvider):
@@ -404,6 +699,9 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         del date_text
         self._resolve_classroom(normalize_eams_classroom_name(classroom))
 
+    def keep_alive(self) -> None:
+        self._fetch_eams_text(self._build_catalog_url(), "session keepalive")
+
     def _fetch_syllabus_courses(self, classroom_name: str, target_week: int, target_day: int) -> list[dict[str, str]]:
         with self._syllabus_lock:
             return self._fetch_syllabus_courses_locked(classroom_name, target_week, target_day)
@@ -420,7 +718,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             page_url = self._build_syllabus_url(page_no)
             request = Request(page_url, headers=self._build_headers(), method="GET")
             try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
+                with open_session_request(self.config, request, self.timeout_seconds) as response:
                     raw = response.read()
                     content_type = response.headers.get("Content-Type", "")
             except HTTPError as exc:
@@ -475,7 +773,7 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
     def _fetch_eams_text(self, url: str, context: str) -> str:
         request = Request(url, headers=self._build_headers(), method="GET")
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with open_session_request(self.config, request, self.timeout_seconds) as response:
                 raw = response.read()
                 content_type = response.headers.get("Content-Type", "")
                 final_url = response.geturl()
@@ -586,18 +884,24 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         }
         headers.setdefault("User-Agent", "ClassroomScheduleMiddleware/0.1")
         headers.setdefault("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-        return headers
+        return session_request_headers(self.config, headers)
 
 
 class EamsProbeResult(dict[str, Any]):
     """Dictionary marker for sanitized EAMS probe output."""
 
 
+def strip_url_jsessionid(url: str) -> str:
+    parsed = urlparse(url)
+    path = re.sub(r";jsessionid=[^/;?#]*", "", parsed.path or "/", flags=re.IGNORECASE)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, parsed.fragment))
+
+
 def sanitize_url(url: str | None) -> str | None:
     if not url:
         return None
-    parsed = urlparse(url)
-    path = re.sub(r";jsessionid=[^/;?#]*", "", parsed.path or "/", flags=re.IGNORECASE)
+    parsed = urlparse(strip_url_jsessionid(url))
+    path = parsed.path or "/"
     if parsed.scheme and parsed.netloc:
         return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
     return path.split("?", 1)[0].split("#", 1)[0]
@@ -851,11 +1155,11 @@ def probe_session_config(
         result["status"] = "placeholder_headers"
         return result
 
-    url = render_query_url(upstream_url, config.get("query", {}), classroom, date_text)
-    headers = build_probe_headers(headers_config)
+    url = strip_url_jsessionid(render_query_url(upstream_url, config.get("query", {}), classroom, date_text))
+    headers = session_request_headers(config, build_probe_headers(headers_config))
     try:
         request = Request(url, headers=headers, method="GET")
-        with urlopen(request, timeout=timeout_seconds) as response:
+        with open_session_request(config, request, timeout_seconds) as response:
             raw = response.read(1_000_000)
             content_type = response.headers.get("Content-Type", "")
             final_url = response.geturl()
@@ -1028,6 +1332,7 @@ class FakeUpstreamHandler(BaseHTTPRequestHandler):
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
+        self.send_header("Set-Cookie", "SESSION=refreshed-self-test; Path=/")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2122,11 +2427,21 @@ def run_manual_session_self_test(args: argparse.Namespace) -> None:
             }
             session_path.write_text(json.dumps(session), encoding="utf-8")
             provider = ManualSessionEamsProvider(session_path, timeout_seconds=5)
-            assert provider._build_headers()["Cookie"] == "SESSION=fresh-self-test"
+            assert "Cookie" not in provider._build_headers()
+            cookie_jar = provider.config.get(PLAYWRIGHT_COOKIE_JAR_KEY)
+            assert isinstance(cookie_jar, CookieJar)
+            assert any(cookie.name == "SESSION" and cookie.value == "fresh-self-test" for cookie in cookie_jar)
             data = provider.fetch_schedule("A101", "2026-07-05")
             assert data["classroom"] == "A101"
             assert data["classroom_name"] == "真实接入测试 A101"
             assert data["courses"][0]["name"] == "真实接入路径测试"
+            updated_state = json.loads(storage_state_path.read_text(encoding="utf-8"))
+            updated_session_cookie = next(
+                cookie
+                for cookie in updated_state["cookies"]
+                if cookie["name"] == "SESSION" and cookie["domain"] == "127.0.0.1"
+            )
+            assert updated_session_cookie["value"] == "refreshed-self-test"
 
             session["upstream_url"] = f"http://127.0.0.1:{upstream.server_port}/html"
             session_path.write_text(json.dumps(session), encoding="utf-8")
@@ -2252,6 +2567,26 @@ def run_syllabus_parser_self_test() -> None:
     assert syllabus_total_pages(html_text, EAMS_SYLLABUS_PAGE_SIZE) == 7
 
 
+def run_eams_keepalive_loop(provider: ScheduleProvider, interval_seconds: int, stop_event: threading.Event) -> None:
+    if interval_seconds <= 0:
+        return
+    next_delay = 0.0
+    while not stop_event.wait(next_delay):
+        try:
+            provider.keep_alive()
+            print(f"EAMS keepalive ok; next check in {interval_seconds}s", flush=True)
+        except ProviderUnavailable as exc:
+            print(
+                f"EAMS keepalive unavailable: {exc.message}; run the launcher to refresh the session.",
+                flush=True,
+            )
+        except UpstreamError as exc:
+            print(f"EAMS keepalive upstream error: {exc.message}", flush=True)
+        except Exception:
+            print("EAMS keepalive failed unexpectedly.", flush=True)
+        next_delay = float(interval_seconds)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the real classroom schedule middleware.")
     parser.add_argument("--host", default=os.getenv("SCHEDULE_HOST", "0.0.0.0"))
@@ -2291,6 +2626,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--cache-ttl-seconds",
         default=int(os.getenv("SCHEDULE_CACHE_TTL_SECONDS", "600")),
         type=int,
+    )
+    parser.add_argument(
+        "--eams-keepalive-seconds",
+        default=int(os.getenv("SCHEDULE_EAMS_KEEPALIVE_SECONDS", str(DEFAULT_EAMS_KEEPALIVE_SECONDS))),
+        type=int,
+        help="Seconds between EAMS keepalive requests; use 0 to disable.",
     )
     parser.add_argument("--self-test", action="store_true", help="Run fixture/provider contract checks.")
     parser.add_argument(
@@ -2353,6 +2694,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Alert: http://{lan_ip}:{args.port}{args.alert_path} X-Alert-Token=<redacted>")
     print(f"  Provider: {provider.name}")
     print(f"  Alert mode: {args.alert_mode}")
+    keepalive_stop = threading.Event()
+    keepalive_thread: threading.Thread | None = None
+    if provider.name != "fixture" and args.eams_keepalive_seconds > 0:
+        keepalive_thread = threading.Thread(
+            target=run_eams_keepalive_loop,
+            args=(provider, args.eams_keepalive_seconds, keepalive_stop),
+            daemon=True,
+        )
+        keepalive_thread.start()
+        print(f"  EAMS keepalive: every {args.eams_keepalive_seconds}s")
     print("Press Ctrl+C to stop.")
 
     try:
@@ -2360,6 +2711,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nStopping real classroom schedule middleware.")
     finally:
+        keepalive_stop.set()
+        if keepalive_thread is not None:
+            keepalive_thread.join(timeout=5)
         server.server_close()
     return 0
 

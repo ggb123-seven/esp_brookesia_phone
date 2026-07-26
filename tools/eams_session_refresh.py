@@ -6,12 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from real_classroom_schedule_server import (
     ScheduleError,
@@ -23,6 +24,7 @@ from real_classroom_schedule_server import (
 
 DEFAULT_LOGIN_TIMEOUT_SECONDS = 600
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 12
+ACCOUNT_LOGIN_SELECTORS = ("#userNameLogin_a", "a:has-text('账号登录')")
 USERNAME_SELECTORS = ("#username", "input[name='username']", "input[type='text']")
 PASSWORD_SELECTORS = ("#password", "input[name='password']", "input[type='password']")
 
@@ -64,15 +66,36 @@ def resolve_storage_state_path(session_file: Path, session_config: dict[str, Any
     return path.resolve()
 
 
+def strip_url_jsessionid(url: str) -> str:
+    parsed = urlparse(url)
+    path = re.sub(r";jsessionid=[^/;?#]*", "", parsed.path or "/", flags=re.IGNORECASE)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, parsed.fragment))
+
+
+def site_root_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return urlunparse((parsed.scheme, parsed.netloc, "/", "", "", ""))
+
+
 def is_login_url(current_url: str, login_url: str) -> bool:
     current = urlparse(current_url)
     login = urlparse(login_url)
-    return bool(
+    if not current.hostname or not login.hostname:
+        return False
+    if (
         current.hostname
-        and login.hostname
         and current.hostname.lower() == login.hostname.lower()
         and current.path.startswith(login.path.rsplit("/", 1)[0])
-    )
+    ):
+        return True
+    # WebVPN can proxy the CAS login page under the VPN host, e.g.
+    # /https/<encoded-host>/authserver/login. Treat that as the same login form
+    # so credentials can be filled while the user still completes the slider.
+    current_path = current.path.lower()
+    login_path = login.path.lower().rstrip("/")
+    return bool(login_path and current_path.endswith(login_path))
 
 
 def is_eams_url(current_url: str, start_url: str) -> bool:
@@ -96,8 +119,16 @@ def page_looks_like_eams(page: Any, start_url: str) -> bool:
     if is_eams_url(page.url, start_url):
         return True
     try:
-        return title_looks_like_eams(page.title(timeout=1_000))
+        return title_looks_like_eams(page.title())
     except Exception:
+        return False
+
+
+def navigate_or_ignore(page: Any, url: str, playwright_error: type[BaseException]) -> bool:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        return True
+    except playwright_error:
         return False
 
 
@@ -113,9 +144,26 @@ def fill_first_visible(page: Any, selectors: tuple[str, ...], value: str) -> boo
     return False
 
 
+def show_account_login_form(page: Any) -> bool:
+    for selector in ACCOUNT_LOGIN_SELECTORS:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() and locator.is_visible(timeout=250):
+                locator.click(timeout=2_000)
+                page.wait_for_timeout(300)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def fill_login_credentials(page: Any, username: str, password: str) -> bool:
     username_filled = fill_first_visible(page, USERNAME_SELECTORS, username)
     password_filled = fill_first_visible(page, PASSWORD_SELECTORS, password)
+    if not (username_filled and password_filled):
+        show_account_login_form(page)
+        username_filled = fill_first_visible(page, USERNAME_SELECTORS, username)
+        password_filled = fill_first_visible(page, PASSWORD_SELECTORS, password)
     return username_filled and password_filled
 
 
@@ -125,6 +173,15 @@ def session_probe_is_valid(result: dict[str, Any]) -> bool:
         and not result.get("looks_like_login")
         and (result.get("looks_like_eams") or result.get("starts_json"))
     )
+
+
+def summarize_probe_result(result: dict[str, Any]) -> str:
+    fields: list[str] = []
+    for key in ("status", "http_status", "final_url", "title", "looks_like_login", "looks_like_eams"):
+        value = result.get(key)
+        if value is not None and value != "":
+            fields.append(f"{key}={value}")
+    return ", ".join(fields) if fields else "no probe detail"
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -162,7 +219,8 @@ def validate_and_replace_storage_state(
         if not session_probe_is_valid(result):
             raise SessionRefreshError(
                 "candidate_rejected",
-                "The updated browser session was not accepted by EAMS.",
+                "The updated browser session was not accepted by EAMS: "
+                + summarize_probe_result(result),
             )
 
         final_state.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +244,7 @@ def refresh_session(args: argparse.Namespace) -> dict[str, Any]:
     username = str(login_config.get("username") or "")
     password = str(login_config.get("password") or "")
     login_url = str(login_config.get("login_url") or "")
-    start_url = str(login_config.get("start_url") or "")
+    start_url = strip_url_jsessionid(str(login_config.get("start_url") or ""))
     classroom = str(login_config.get("classroom") or "A101")
     date_text = str(login_config.get("date") or "auto")
     if date_text == "auto":
@@ -222,18 +280,17 @@ def refresh_session(args: argparse.Namespace) -> dict[str, Any]:
                 executable_path=str(edge_executable),
                 headless=False,
                 no_viewport=True,
-                args=("--start-maximized",),
+                args=("--start-maximized", "--no-proxy-server"),
             )
             page = context.pages[0] if context.pages else context.new_page()
-            try:
-                page.goto(start_url, wait_until="domcontentloaded", timeout=30_000)
-            except PlaywrightError:
-                # A slow WebVPN redirect can outlive the navigation timeout; keep waiting visibly.
-                pass
+            if not navigate_or_ignore(page, start_url, PlaywrightError):
+                navigate_or_ignore(page, site_root_url(start_url), PlaywrightError)
 
             deadline = time.monotonic() + args.timeout_seconds
             credentials_filled = False
             next_candidate_probe_at = 0.0
+            next_start_navigation_at = time.monotonic() + 10.0
+            last_candidate_error = ""
             while time.monotonic() < deadline:
                 pages = context.pages
                 if not pages:
@@ -264,6 +321,7 @@ def refresh_session(args: argparse.Namespace) -> dict[str, Any]:
                     except SessionRefreshError as exc:
                         if exc.code != "candidate_rejected":
                             raise
+                        last_candidate_error = str(exc)
                         candidate_state.unlink(missing_ok=True)
                         candidate_state = None
                         next_candidate_probe_at = time.monotonic() + 5.0
@@ -273,8 +331,20 @@ def refresh_session(args: argparse.Namespace) -> dict[str, Any]:
 
                 if not credentials_filled and is_login_url(current_url, login_url):
                     credentials_filled = fill_login_credentials(page, username, password)
+                elif now >= next_start_navigation_at:
+                    current = urlparse(current_url)
+                    start = urlparse(start_url)
+                    if current.scheme == "chrome-error" or current.hostname == start.hostname:
+                        if not navigate_or_ignore(page, start_url, PlaywrightError):
+                            navigate_or_ignore(page, site_root_url(start_url), PlaywrightError)
+                        next_start_navigation_at = time.monotonic() + 20.0
                 time.sleep(0.5)
 
+        if last_candidate_error:
+            raise SessionRefreshError(
+                "login_timeout",
+                "Timed out waiting for a reusable EAMS session. Last check: " + last_candidate_error,
+            )
         raise SessionRefreshError("login_timeout", "Timed out waiting for the user to complete EAMS login.")
     except SessionRefreshError:
         raise
@@ -293,6 +363,10 @@ def refresh_session(args: argparse.Namespace) -> dict[str, Any]:
 def run_self_test() -> None:
     assert is_login_url(
         "https://authserver.lntu.edu.cn/authserver/login?service=test",
+        "https://authserver.lntu.edu.cn/authserver/login",
+    )
+    assert is_login_url(
+        "https://webvpn.lntu.edu.cn/https/example/authserver/login",
         "https://authserver.lntu.edu.cn/authserver/login",
     )
     assert is_eams_url(
