@@ -24,6 +24,7 @@
 #include "esp_netif_ip_addr.h"
 #include "esp_timer.h"
 #include "mq2_service.h"
+#include "onenet_cloud_service.h"
 #include "parent_call_alert_service.h"
 #include "sdkconfig.h"
 
@@ -99,24 +100,24 @@ static const char LOCAL_DASHBOARD_INDEX_HTML[] =
     "if(n>1024)return(n/1024).toFixed(1)+' KB';return n+' B';}"
     "function card(label,value,cls=''){return `<article class=\"card\"><div class=\"label\">${label}</div>"
     "<div class=\"value ${cls}\">${value}</div></article>`;}"
-    "function renderCloud(c,st){cloudPanel.innerHTML=`<div class=\"cloud-title\"><div><h2>云同步演示</h2>"
+    "function renderCloud(c,st){const uuid=c.latest_photo_uuid?esc(c.latest_photo_uuid):'--';"
+    "cloudPanel.innerHTML=`<div class=\"cloud-title\"><div><h2>OneNET 云端</h2>"
     "<div class=\"label\">${esc(c.provider)} · ${esc(c.device_id)}</div></div>"
     "<span class=\"pill\">${esc(c.sync_status)}</span></div><div class=\"cloud-flow\">"
     "<div class=\"cloud-step\"><b>边缘采集</b><span>传感器与相机本地实时采集</span></div>"
-    "<div class=\"cloud-step\"><b>本地缓存</b><span>${st.photo_count} 张照片待同步</span></div>"
-    "<div class=\"cloud-step\"><b>云端通道</b><span>${c.ready?'已接入':'演示模式 / API 预留'}</span></div>"
-    "<div class=\"cloud-step\"><b>手机查看</b><span>局域网网页实时访问</span></div></div>`;}"
+    "<div class=\"cloud-step\"><b>本地缓存</b><span>${st.photo_count} 张照片</span></div>"
+    "<div class=\"cloud-step\"><b>云端通道</b><span>${c.ready?'已接入 OneNET':esc(c.sync_status)}</span></div>"
+    "<div class=\"cloud-step\"><b>最新照片</b><span>${esc(c.latest_photo_name||'--')} / ${uuid}</span></div></div>`;}"
     "async function loadStatus(){const r=await fetch('/api/status',{cache:'no-store'});"
     "const s=await r.json();ipEl.textContent='IP: '+(s.network.ip||'no_ip');"
-    "const d=s.sensors.dht11,m=s.sensors.mq2,a=s.alert,st=s.storage,c=s.cloud;"
+    "const d=s.sensors.dht11,m=s.sensors.mq2,st=s.storage,c=s.cloud;"
     "renderCloud(c,st);"
     "cards.innerHTML=[card('Wi-Fi',s.network.connected?'已获取 IP':'未获取 IP',s.network.connected?'ok':'warn'),"
     "card('温度',d.valid?d.temperature_c.toFixed(1)+' °C':'--',d.valid?'ok':'warn'),"
     "card('湿度',d.valid?d.humidity_percent.toFixed(1)+' %':'--',d.valid?'ok':'warn'),"
     "card('MQ-2',m.enabled?(m.state+(m.alarm?' / ALARM':'')):'disabled',m.alarm?'bad':(m.valid?'ok':'warn')),"
-    "card('呼叫服务',a.enabled?a.status:'disabled',a.last_error===0?'ok':'warn'),"
     "card('照片数量',st.sd_enabled?String(st.photo_count):'SD disabled',st.sd_enabled?'ok':'warn'),"
-    "card('云同步',c.ready?'ready':'演示模式','warn')].join('');}"
+    "card('OneNET',c.ready?'已接入':c.sync_status,c.ready?'ok':'warn')].join('');}"
     "async function loadPhotos(){const r=await fetch('/api/photos',{cache:'no-store'});"
     "const data=await r.json();if(!data.photos||data.photos.length===0){gallery.innerHTML="
     "'<div class=\"card\">暂无照片，先在 Camera App 里拍一张。</div>';return;}"
@@ -636,17 +637,75 @@ static esp_err_t local_dashboard_status_handler(httpd_req_t *req)
                         TAG, "Failed to send photo dir JSON");
     ESP_RETURN_ON_ERROR(local_dashboard_send_chunkf(
                             req,
-                            ",\"photo_count\":%lu,\"photo_limit\":%u},"
-                            "\"cloud\":{\"ready\":false,\"mode\":\"demo\","
-                            "\"provider\":\"ESP Cloud Demo\","
-                            "\"device_id\":\"esp32p4-local-gallery\","
-                            "\"sync_status\":\"演示同步 / API 预留\","
-                            "\"upload_queue\":%lu,\"last_sync_ms\":%lld}}",
+                            ",\"photo_count\":%lu,\"photo_limit\":%u},\"cloud\":{",
                             (unsigned long)photo_count,
-                            (unsigned int)LOCAL_DASHBOARD_MAX_PHOTOS,
+                            (unsigned int)LOCAL_DASHBOARD_MAX_PHOTOS),
+                        TAG, "Failed to send storage count JSON");
+
+    onenet_cloud_snapshot_t cloud_snapshot = {};
+    esp_err_t cloud_err = onenet_cloud_service_get_snapshot(&cloud_snapshot);
+    const bool cloud_ready = cloud_err == ESP_OK &&
+                             (cloud_snapshot.mqtt_connected ||
+                              cloud_snapshot.status == ONENET_CLOUD_STATUS_PUBLISHED ||
+                              cloud_snapshot.status == ONENET_CLOUD_STATUS_UPLOAD_OK);
+    const char *cloud_mode = cloud_snapshot.enabled ? "onenet" : "disabled";
+    const char *cloud_status_name =
+        onenet_cloud_service_status_name(cloud_err == ESP_OK ? cloud_snapshot.status
+                                                             : ONENET_CLOUD_STATUS_INTERNAL_ERROR);
+    const char *cloud_status_text =
+        onenet_cloud_service_status_text(cloud_err == ESP_OK ? cloud_snapshot.status
+                                                             : ONENET_CLOUD_STATUS_INTERNAL_ERROR);
+
+    ESP_RETURN_ON_ERROR(local_dashboard_send_chunkf(
+                            req,
+                            "\"ready\":%s,\"mode\":\"%s\",\"provider\":\"OneNET Studio\","
+                            "\"configured\":%s,\"mqtt_connected\":%s,"
+                            "\"status\":\"%s\",\"sync_status\":",
+                            cloud_ready ? "true" : "false",
+                            cloud_mode,
+                            (cloud_err == ESP_OK && cloud_snapshot.configured) ? "true" : "false",
+                            (cloud_err == ESP_OK && cloud_snapshot.mqtt_connected) ? "true" : "false",
+                            cloud_status_name),
+                        TAG, "Failed to send cloud status JSON");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_json_string(req, cloud_status_text),
+                        TAG, "Failed to send cloud status text JSON");
+    ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, ",\"product_id\":"),
+                        TAG, "Failed to send cloud product key");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_json_string(
+                            req, cloud_err == ESP_OK ? cloud_snapshot.product_id : ""),
+                        TAG, "Failed to send cloud product JSON");
+    ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, ",\"device_id\":"),
+                        TAG, "Failed to send cloud device key");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_json_string(
+                            req, (cloud_err == ESP_OK && cloud_snapshot.device_name[0] != '\0')
+                                     ? cloud_snapshot.device_name
+                                     : "esp32p4-onenet"),
+                        TAG, "Failed to send cloud device JSON");
+    ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, ",\"latest_photo_name\":"),
+                        TAG, "Failed to send cloud photo name key");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_json_string(
+                            req, cloud_err == ESP_OK ? cloud_snapshot.last_photo_name : ""),
+                        TAG, "Failed to send cloud photo name JSON");
+    ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, ",\"latest_photo_uuid\":"),
+                        TAG, "Failed to send cloud uuid key");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_json_string(
+                            req, cloud_err == ESP_OK ? cloud_snapshot.last_photo_uuid : ""),
+                        TAG, "Failed to send cloud uuid JSON");
+    ESP_RETURN_ON_ERROR(local_dashboard_send_chunkf(
+                            req,
+                            ",\"upload_queue\":%lu,\"publish_count\":%lu,"
+                            "\"failed_publish_count\":%lu,\"photo_upload_count\":%lu,"
+                            "\"failed_photo_upload_count\":%lu,\"last_sync_ms\":%lld,"
+                            "\"last_photo_upload_ms\":%lld,\"last_http_status\":%d}}",
                             (unsigned long)photo_count,
-                            (long long)(esp_timer_get_time() / 1000)),
-                        TAG, "Failed to send final status JSON");
+                            cloud_err == ESP_OK ? (unsigned long)cloud_snapshot.publish_count : 0UL,
+                            cloud_err == ESP_OK ? (unsigned long)cloud_snapshot.failed_publish_count : 0UL,
+                            cloud_err == ESP_OK ? (unsigned long)cloud_snapshot.photo_upload_count : 0UL,
+                            cloud_err == ESP_OK ? (unsigned long)cloud_snapshot.failed_photo_upload_count : 0UL,
+                            cloud_err == ESP_OK ? (long long)cloud_snapshot.last_publish_ms : 0LL,
+                            cloud_err == ESP_OK ? (long long)cloud_snapshot.last_photo_upload_ms : 0LL,
+                            cloud_err == ESP_OK ? cloud_snapshot.last_http_status : 0),
+                        TAG, "Failed to send final cloud JSON");
 
     return httpd_resp_sendstr_chunk(req, NULL);
 }

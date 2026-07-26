@@ -9,5 +9,6 @@ idf_component_register(
         esp_netif
         esp_timer
         mq2
+        onenet_cloud
         parent_call_alert
 )

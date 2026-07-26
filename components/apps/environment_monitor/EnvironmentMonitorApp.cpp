@@ -19,10 +19,6 @@
 #include "mq2_service.h"
 #endif
 
-#if CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
-#include "parent_call_alert_service.h"
-#endif
-
 #define ENV_MONITOR_REFRESH_MS            (1000)
 #define ENV_MONITOR_COLOR_BG              0x06141B
 #define ENV_MONITOR_COLOR_PANEL           0x102631
@@ -77,8 +73,7 @@ EnvironmentMonitorApp::EnvironmentMonitorApp():
     _dht_humidity_label(NULL),
     _gas_pulse(NULL),
     _mq2_level_label(NULL),
-    _mq2_status_label(NULL),
-    _alert_status_label(NULL)
+    _mq2_status_label(NULL)
 {
 }
 
@@ -124,7 +119,6 @@ bool EnvironmentMonitorApp::close(void)
     _gas_pulse = NULL;
     _mq2_level_label = NULL;
     _mq2_status_label = NULL;
-    _alert_status_label = NULL;
 
     return true;
 }
@@ -248,9 +242,6 @@ void EnvironmentMonitorApp::buildUi(void)
     lv_obj_set_style_text_align(_mq2_level_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(_mq2_level_label, LV_ALIGN_CENTER, 0, 36);
 
-    _alert_status_label = createMetricLabel(gas_panel, "电话：待命", ENV_MONITOR_COLOR_MUTED);
-    lv_obj_set_style_text_align(_alert_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(_alert_status_label, LV_ALIGN_BOTTOM_MID, 0, -4);
 }
 
 lv_obj_t *EnvironmentMonitorApp::createMetricPanel(lv_obj_t *parent, const char *title)
@@ -311,57 +302,6 @@ void EnvironmentMonitorApp::stopVisualAnimations(void)
     if (_gas_pulse != NULL) {
         lv_anim_del(_gas_pulse, pulseAnimCallback);
     }
-}
-
-void EnvironmentMonitorApp::updateAlertStatus(void)
-{
-    if (_alert_status_label == NULL) {
-        return;
-    }
-
-#if CONFIG_EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
-    parent_call_alert_snapshot_t alert_snapshot = {};
-    esp_err_t err = parent_call_alert_service_get_snapshot(&alert_snapshot);
-    if (err == ESP_OK) {
-        char text[64];
-        snprintf(text, sizeof(text), "电话：%s", parent_call_alert_service_status_text(alert_snapshot.status));
-        lv_label_set_text(_alert_status_label, text);
-
-        uint32_t color = ENV_MONITOR_COLOR_MUTED;
-        switch (alert_snapshot.status) {
-        case PARENT_CALL_ALERT_STATUS_SENT:
-        case PARENT_CALL_ALERT_STATUS_TTS_DONE:
-            color = ENV_MONITOR_COLOR_OK;
-            break;
-        case PARENT_CALL_ALERT_STATUS_SIMULATED:
-            color = ENV_MONITOR_COLOR_WARN;
-            break;
-        case PARENT_CALL_ALERT_STATUS_QUEUED:
-        case PARENT_CALL_ALERT_STATUS_SENDING:
-        case PARENT_CALL_ALERT_STATUS_DIALING:
-        case PARENT_CALL_ALERT_STATUS_CONNECTED:
-        case PARENT_CALL_ALERT_STATUS_TTS_PLAYING:
-        case PARENT_CALL_ALERT_STATUS_SKIPPED_COOLDOWN:
-        case PARENT_CALL_ALERT_STATUS_SKIPPED_NO_IP:
-            color = ENV_MONITOR_COLOR_WARN;
-            break;
-        case PARENT_CALL_ALERT_STATUS_MODEM_NOT_READY:
-        case PARENT_CALL_ALERT_STATUS_FAILED:
-            color = ENV_MONITOR_COLOR_ERROR;
-            break;
-        default:
-            color = ENV_MONITOR_COLOR_MUTED;
-            break;
-        }
-        lv_obj_set_style_text_color(_alert_status_label, lv_color_hex(color), 0);
-    } else {
-        lv_label_set_text(_alert_status_label, "电话：未启用");
-        lv_obj_set_style_text_color(_alert_status_label, lv_color_hex(ENV_MONITOR_COLOR_MUTED), 0);
-    }
-#else
-    lv_label_set_text(_alert_status_label, "电话：未启用");
-    lv_obj_set_style_text_color(_alert_status_label, lv_color_hex(ENV_MONITOR_COLOR_MUTED), 0);
-#endif
 }
 
 void EnvironmentMonitorApp::updateUi(void)
@@ -429,8 +369,6 @@ void EnvironmentMonitorApp::updateUi(void)
     lv_label_set_text(_mq2_status_label, "--");
     lv_label_set_text(_mq2_level_label, "--");
 #endif
-
-    updateAlertStatus();
 }
 
 void EnvironmentMonitorApp::refreshTimerCallback(lv_timer_t *timer)

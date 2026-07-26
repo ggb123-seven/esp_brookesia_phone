@@ -291,6 +291,101 @@ menu "Example Configurations"
                 Maximum pending alert events waiting for the worker task.
     endif
 
+    config EXAMPLE_ENABLE_ONENET_CLOUD
+        bool "Enable OneNET cloud upload service"
+        default n
+        help
+            Enabling this option starts the OneNET Studio MQTT/file upload service.
+            Keep it disabled until a dedicated ESP32-P4 OneNET product/device and
+            local credentials are configured.
+
+    if EXAMPLE_ENABLE_ONENET_CLOUD
+        config EXAMPLE_ONENET_PRODUCT_ID
+            string "OneNET product ID"
+            default ""
+            help
+                Product ID for the new ESP32-P4 OneNET Studio product. Do not reuse
+                the legacy smart-lock product.
+
+        config EXAMPLE_ONENET_DEVICE_NAME
+            string "OneNET device name"
+            default ""
+            help
+                Device name for the new ESP32-P4 OneNET Studio device. Do not reuse
+                the legacy smart-lock device.
+
+        config EXAMPLE_ONENET_AUTH_TOKEN
+            string "OneNET device auth token"
+            default ""
+            help
+                Generated OneNET device token used as the MQTT password and HTTP
+                Authorization header. Keep real values local and out of Git.
+
+        config EXAMPLE_ONENET_MQTT_HOST
+            string "OneNET MQTT host"
+            default "mqtts.heclouds.com"
+            help
+                MQTT host for OneNET device access. Do not include a product/device
+                path. A full mqtt:// URI is also accepted.
+
+        config EXAMPLE_ONENET_MQTT_PORT
+            int "OneNET MQTT port"
+            range 1 65535
+            default 1883
+            help
+                MQTT port for OneNET device access.
+
+        config EXAMPLE_ONENET_API_HOST
+            string "OneNET HTTP API host"
+            default "iot-api.heclouds.com"
+            help
+                HTTP API host used for OneNET file upload. Do not include the
+                /studio path. A full http:// or https:// base URL is also accepted.
+
+        config EXAMPLE_ONENET_UPLOAD_INTERVAL_MS
+            int "OneNET property upload interval in milliseconds"
+            range 5000 3600000
+            default 30000
+            help
+                Period for publishing environment and alert properties to OneNET.
+
+        config EXAMPLE_ONENET_ENABLE_PHOTO_UPLOAD
+            bool "Enable OneNET latest photo upload"
+            default n
+            depends on EXAMPLE_ENABLE_SD_CARD
+            help
+                Upload only the latest photo from the SD-card camera directory.
+
+        config EXAMPLE_ONENET_PHOTO_UPLOAD_COOLDOWN_MS
+            int "OneNET photo upload cooldown in milliseconds"
+            range 10000 3600000
+            default 60000
+            help
+                Minimum interval between automatic latest-photo upload attempts.
+
+        config EXAMPLE_ONENET_PHOTO_MAX_BYTES
+            int "OneNET photo max upload size"
+            range 1024 5242880
+            default 1572864
+            help
+                Skip photos larger than this limit to protect RAM, network time,
+                and OneNET file quotas.
+
+        config EXAMPLE_ONENET_TASK_STACK_SIZE
+            int "OneNET task stack size"
+            range 4096 16384
+            default 8192
+            help
+                Stack size for the OneNET worker task.
+
+        config EXAMPLE_ONENET_TASK_PRIORITY
+            int "OneNET task priority"
+            range 1 10
+            default 5
+            help
+                FreeRTOS priority for the OneNET worker task.
+    endif
+
     config EXAMPLE_ENABLE_AS608_VALIDATION
         bool "Enable AS608 hardware validation task"
         depends on !EXAMPLE_ENABLE_APP_FINGERPRINT

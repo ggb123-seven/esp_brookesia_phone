@@ -35,6 +35,7 @@
 #endif
 
 #include "local_dashboard_service.h"
+#include "onenet_cloud_service.h"
 
 #if CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION
 #include "as608_validation.h"
@@ -291,6 +292,34 @@ extern "C" void app_main(void) {
   err = as608_validation_start();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to start AS608 validation task: %s",
+             esp_err_to_name(err));
+  }
+#endif
+
+#if CONFIG_EXAMPLE_ENABLE_ONENET_CLOUD
+  onenet_cloud_config_t onenet_config = {
+      .enabled = true,
+      .product_id = CONFIG_EXAMPLE_ONENET_PRODUCT_ID,
+      .device_name = CONFIG_EXAMPLE_ONENET_DEVICE_NAME,
+      .auth_token = CONFIG_EXAMPLE_ONENET_AUTH_TOKEN,
+      .mqtt_host = CONFIG_EXAMPLE_ONENET_MQTT_HOST,
+      .mqtt_port = CONFIG_EXAMPLE_ONENET_MQTT_PORT,
+      .api_host = CONFIG_EXAMPLE_ONENET_API_HOST,
+      .upload_interval_ms = CONFIG_EXAMPLE_ONENET_UPLOAD_INTERVAL_MS,
+#if CONFIG_EXAMPLE_ONENET_ENABLE_PHOTO_UPLOAD
+      .photo_upload_enabled = true,
+#else
+      .photo_upload_enabled = false,
+#endif
+      .photo_upload_cooldown_ms = CONFIG_EXAMPLE_ONENET_PHOTO_UPLOAD_COOLDOWN_MS,
+      .photo_max_bytes = CONFIG_EXAMPLE_ONENET_PHOTO_MAX_BYTES,
+      .task_stack_size = CONFIG_EXAMPLE_ONENET_TASK_STACK_SIZE,
+      .task_priority = CONFIG_EXAMPLE_ONENET_TASK_PRIORITY,
+  };
+  err = onenet_cloud_service_init(&onenet_config);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "Failed to start OneNET cloud service: %s",
              esp_err_to_name(err));
   }
 #endif

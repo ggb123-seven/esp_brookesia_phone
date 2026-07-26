@@ -12,6 +12,7 @@ set(MAIN_REQUIRES
     lvgl__lvgl
     mq2
     nvs_flash
+    onenet_cloud
     parent_call_alert)
 
 if(CONFIG_EXAMPLE_ENABLE_AS608_VALIDATION)
