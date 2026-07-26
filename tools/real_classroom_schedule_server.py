@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from http import HTTPStatus
@@ -161,6 +162,9 @@ class ScheduleCache:
 
 class ScheduleProvider:
     name = "base"
+
+    def validate_schedule_target(self, classroom: str, date_text: str) -> None:
+        return
 
     def list_buildings(self) -> list[str]:
         raise ProviderUnavailable("classroom catalog is unavailable for this provider")
@@ -375,10 +379,19 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
         building = self._resolve_classroom(classroom_name)
         target_week = self._week_for_date(date_text)
         target_day = datetime.strptime(date_text, "%Y-%m-%d").isoweekday()
-        detailed_courses = self._fetch_syllabus_courses(classroom_name, target_week, target_day)
-
         detail_url = self._build_detail_url(building, date_text)
-        text = self._fetch_eams_text(detail_url, "room occupancy")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            syllabus_future = executor.submit(
+                self._fetch_syllabus_courses,
+                classroom_name,
+                target_week,
+                target_day,
+            )
+            occupancy_future = executor.submit(self._fetch_eams_text, detail_url, "room occupancy")
+            detailed_courses = syllabus_future.result()
+            text = occupancy_future.result()
+
         sections_by_day = extract_room_occupancy_sections(text, classroom_name)
         occupied_sections = sections_by_day.get(target_day, [])
         record = {
@@ -386,6 +399,10 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             "courses": merge_syllabus_and_occupancy_courses(detailed_courses, occupied_sections),
         }
         return normalize_schedule(classroom, date_text, record)
+
+    def validate_schedule_target(self, classroom: str, date_text: str) -> None:
+        del date_text
+        self._resolve_classroom(normalize_eams_classroom_name(classroom))
 
     def _fetch_syllabus_courses(self, classroom_name: str, target_week: int, target_day: int) -> list[dict[str, str]]:
         with self._syllabus_lock:
@@ -506,20 +523,21 @@ class EamsRoomOccupancyProvider(ScheduleProvider):
             if cached is not None:
                 return cached
 
-            ordered = sorted(
-                self._buildings,
-                key=lambda entry: (not classroom_name.startswith(entry.name), -len(entry.name)),
-            )
-            for entry in ordered:
+            candidates = candidate_buildings_for_classroom(self._buildings, classroom_name)
+            if not candidates:
+                raise BadRequest("classroom must be selected from the current EAMS room catalog")
+
+            for entry in candidates:
                 if classroom_name in self._load_rooms_locked(entry):
                     return entry
 
             self._load_buildings_locked(force=True)
-            ordered = sorted(
-                self._buildings,
-                key=lambda entry: (not classroom_name.startswith(entry.name), -len(entry.name)),
-            )
-            for entry in ordered:
+            cached = self._room_index.get(classroom_name)
+            if cached is not None:
+                return cached
+
+            candidates = candidate_buildings_for_classroom(self._buildings, classroom_name)
+            for entry in candidates:
                 if classroom_name in self._load_rooms_locked(entry, force=True):
                     return entry
         raise BadRequest("classroom is not in the current EAMS catalog")
@@ -941,6 +959,9 @@ def run_eams_probe(args: argparse.Namespace) -> None:
 class FailingScheduleProvider(ScheduleProvider):
     name = "failing-self-test"
 
+    def validate_schedule_target(self, classroom: str, date_text: str) -> None:
+        raise ProviderUnavailable("self-test provider failure")
+
     def list_buildings(self) -> list[str]:
         raise ProviderUnavailable("self-test provider failure")
 
@@ -953,6 +974,9 @@ class FailingScheduleProvider(ScheduleProvider):
 
 class RejectingScheduleProvider(FailingScheduleProvider):
     name = "rejecting-self-test"
+
+    def validate_schedule_target(self, classroom: str, date_text: str) -> None:
+        raise BadRequest("self-test classroom rejection")
 
     def fetch_schedule(self, classroom: str, date_text: str) -> dict[str, Any]:
         raise BadRequest("self-test classroom rejection")
@@ -1070,6 +1094,15 @@ def normalize_eams_classroom_name(classroom: str) -> str:
         if suffix:
             return "尔雅楼" + suffix
     return classroom
+
+
+def candidate_buildings_for_classroom(
+    buildings: list[BuildingCatalogEntry], classroom_name: str
+) -> list[BuildingCatalogEntry]:
+    return sorted(
+        (entry for entry in buildings if classroom_name.startswith(entry.name)),
+        key=lambda entry: -len(entry.name),
+    )
 
 
 def validate_catalog_name(value: Any, field: str) -> str:
@@ -1222,16 +1255,16 @@ def build_occupancy_courses(sections: list[int]) -> list[dict[str, str]]:
         start_time = DEFAULT_SECTION_TIMES[start_section][0]
         end_time = DEFAULT_SECTION_TIMES[end_section][1]
         if start_section == end_section:
-            name = f"第{start_section}节占用"
+            name = f"仅占用：第{start_section}节"
         else:
-            name = f"第{start_section}-{end_section}节占用"
+            name = f"仅占用：第{start_section}-{end_section}节"
         courses.append(
             {
                 "start": start_time,
                 "end": end_time,
                 "name": name,
-                "teacher": "EAMS 教室资源",
-                "group": "真实占用",
+                "teacher": "教室占用",
+                "group": "EAMS未匹配课程信息",
             }
         )
     return courses
@@ -1653,6 +1686,16 @@ class ScheduleHandler(BaseHTTPRequestHandler):
         classroom = validate_classroom(single(query, "classroom"))
         date_text = validate_date(single(query, "date", today_text()))
 
+        cached = self.server.cache.get(classroom, date_text)
+        if cached is not None:
+            try:
+                self.server.provider.validate_schedule_target(classroom, date_text)
+            except (ProviderUnavailable, UpstreamError):
+                self.send_json(cached)
+                return
+            self.send_json(cached)
+            return
+
         try:
             data = self.server.provider.fetch_schedule(classroom, date_text)
             self.server.cache.set(classroom, date_text, data)
@@ -1748,6 +1791,10 @@ def run_catalog_parser_self_test() -> None:
         BuildingCatalogEntry("知行楼", "8"),
         BuildingCatalogEntry("中和楼", "17"),
     ]
+    assert candidate_buildings_for_classroom(buildings, "知行楼102-语音7") == [
+        BuildingCatalogEntry("知行楼", "8")
+    ]
+    assert candidate_buildings_for_classroom(buildings, "A101") == []
 
     room_html = DEFAULT_ROOM_CATALOG_FIXTURE.read_text(encoding="utf-8")
     assert extract_eams_room_names(room_html) == ["知行楼102-语音7", "中和楼400（专）"]
@@ -2140,9 +2187,9 @@ def run_syllabus_parser_self_test() -> None:
         {
             "start": "08:00",
             "end": "11:50",
-            "name": "第1-4节占用",
-            "teacher": "EAMS 教室资源",
-            "group": "真实占用",
+            "name": "仅占用：第1-4节",
+            "teacher": "教室占用",
+            "group": "EAMS未匹配课程信息",
         },
         {
             "start": "16:10",
@@ -2154,9 +2201,9 @@ def run_syllabus_parser_self_test() -> None:
         {
             "start": "19:00",
             "end": "20:40",
-            "name": "第9-10节占用",
-            "teacher": "EAMS 教室资源",
-            "group": "真实占用",
+            "name": "仅占用：第9-10节",
+            "teacher": "教室占用",
+            "group": "EAMS未匹配课程信息",
         },
     ]
 
@@ -2165,9 +2212,9 @@ def run_syllabus_parser_self_test() -> None:
         {
             "start": "14:00",
             "end": "17:50",
-            "name": "第5-8节占用",
-            "teacher": "EAMS 教室资源",
-            "group": "真实占用",
+            "name": "仅占用：第5-8节",
+            "teacher": "教室占用",
+            "group": "EAMS未匹配课程信息",
         }
     ]
 

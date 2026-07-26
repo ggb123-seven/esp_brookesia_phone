@@ -37,6 +37,8 @@
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_SERVER    "cache_server"
 #define CLASSROOM_SCHEDULE_NVS_KEY_CACHE_JSON      "cache_json"
 #define CLASSROOM_SCHEDULE_CACHE_PATH              "/spiffs/class_schedule.json"
+#define CLASSROOM_SCHEDULE_DEFAULT_HOST_CAMPUS     "10.96.111.246"
+#define CLASSROOM_SCHEDULE_DEFAULT_HOST_HOME       "192.168.1.5"
 #define CLASSROOM_SCHEDULE_MAX_BUILDINGS           (64)
 #define CLASSROOM_SCHEDULE_MAX_ROOMS               (512)
 
@@ -69,6 +71,13 @@ static bool hasNetworkIp(void)
     esp_netif_ip_info_t ip_info = {};
     esp_err_t err = esp_netif_get_ip_info(sta_netif, &ip_info);
     return err == ESP_OK && ip_info.ip.addr != 0;
+}
+
+static bool isKnownDefaultServerHost(const char *host)
+{
+    return host != NULL &&
+           (strcmp(host, CLASSROOM_SCHEDULE_DEFAULT_HOST_CAMPUS) == 0 ||
+            strcmp(host, CLASSROOM_SCHEDULE_DEFAULT_HOST_HOME) == 0);
 }
 
 typedef struct {
@@ -394,6 +403,12 @@ bool ClassroomScheduleApp::loadServerHost(void)
     if (_server_host[0] == '\0') {
         copy_string(_server_host, sizeof(_server_host), CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST);
         return false;
+    }
+    if (isKnownDefaultServerHost(_server_host) &&
+        strcmp(_server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST) != 0) {
+        ESP_LOGW(TAG, "Migrating schedule server host from previous default to current config");
+        copy_string(_server_host, sizeof(_server_host), CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST);
+        saveServerHost(CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_HOST);
     }
     return true;
 }
@@ -1317,7 +1332,6 @@ void ClassroomScheduleApp::buildUi(void)
     lv_dropdown_set_options(_building_dropdown, "加载中");
     lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_READY, this);
     lv_obj_add_event_cb(_building_dropdown, buildingDropdownEventCb, LV_EVENT_VALUE_CHANGED, this);
-    applyBuildingDropdownFont();
 
     lv_obj_t *room_label = lv_label_create(input_row);
     lv_label_set_text(room_label, "教室");
@@ -1330,6 +1344,7 @@ void ClassroomScheduleApp::buildUi(void)
     lv_dropdown_set_options(_room_dropdown, "加载中");
     lv_obj_add_event_cb(_room_dropdown, roomDropdownEventCb, LV_EVENT_READY, this);
     lv_obj_add_event_cb(_room_dropdown, roomDropdownEventCb, LV_EVENT_VALUE_CHANGED, this);
+    applyBuildingDropdownFont();
 
     lv_obj_t *server_label = lv_label_create(input_row);
     lv_label_set_text(server_label, "服务器");
@@ -1520,7 +1535,13 @@ void ClassroomScheduleApp::renderCourseList(const ScheduleData &data, int curren
 
         lv_obj_t *meta_label = lv_label_create(info);
         char meta[160];
-        if (course.teacher[0] != '\0' && course.group[0] != '\0') {
+        const bool occupancy_only =
+            (strcmp(course.teacher, "教室占用") == 0 && strcmp(course.group, "EAMS未匹配课程信息") == 0) ||
+            (strcmp(course.teacher, "教室占用") == 0 && strcmp(course.group, "EAMS未匹配课程详情") == 0) ||
+            (strcmp(course.teacher, "EAMS 教室资源") == 0 && strcmp(course.group, "真实占用") == 0);
+        if (occupancy_only) {
+            snprintf(meta, sizeof(meta), "EAMS只返回教室占用，未匹配课程信息");
+        } else if (course.teacher[0] != '\0' && course.group[0] != '\0') {
             snprintf(meta, sizeof(meta), "教师：%s  班级：%s", course.teacher, course.group);
         } else if (course.teacher[0] != '\0') {
             snprintf(meta, sizeof(meta), "教师：%s", course.teacher);
@@ -2017,6 +2038,10 @@ void ClassroomScheduleApp::catalogTask(void *arg)
                 copy_string(result->detail, sizeof(result->detail), "EAMS 会话不可用，请在电脑端重新登录。");
             } else if (result->err == ESP_ERR_INVALID_SIZE) {
                 copy_string(result->detail, sizeof(result->detail), "教室目录过大，设备无法完整读取。");
+            } else if (result->err == ESP_ERR_INVALID_STATE) {
+                copy_string(result->detail, sizeof(result->detail), "设备尚未获取Wi-Fi IP，请先在Settings重新连接Wi-Fi。");
+            } else if (result->http_status == 0) {
+                copy_string(result->detail, sizeof(result->detail), "无法连接服务器，请检查电脑防火墙和设备Wi-Fi。");
             } else {
                 copy_string(result->detail, sizeof(result->detail), "无法加载真实教室目录，请检查网络和服务器。");
             }

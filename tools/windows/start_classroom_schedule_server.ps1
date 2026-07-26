@@ -242,10 +242,34 @@ function Test-ExistingScheduleServer {
     return $false
 }
 
+function Test-ScheduleServerHealth {
+    param(
+        [Parameter(Mandatory = $true)][string]$HostAddress,
+        [int]$Port,
+        [int]$TimeoutSeconds = 3
+    )
+
+    try {
+        $request = [Net.WebRequest]::Create("http://${HostAddress}:$Port/health")
+        $request.Proxy = $null
+        $request.Timeout = $TimeoutSeconds * 1000
+        $request.ReadWriteTimeout = $TimeoutSeconds * 1000
+        $response = $request.GetResponse()
+        try {
+            return ([int]$response.StatusCode -eq 200)
+        } finally {
+            $response.Close()
+        }
+    } catch {
+        return $false
+    }
+}
+
 function Test-CommandLineContainsPath {
     param(
         [string]$CommandLine,
-        [Parameter(Mandatory = $true)][string]$ExpectedPath
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [switch]$AllowRelativeTail
     )
 
     if ([string]::IsNullOrWhiteSpace($CommandLine)) {
@@ -253,7 +277,29 @@ function Test-CommandLineContainsPath {
     }
     $normalizedExpected = [IO.Path]::GetFullPath($ExpectedPath).Replace("/", "\").ToLowerInvariant()
     $normalizedCommandLine = $CommandLine.Replace("/", "\").ToLowerInvariant()
-    return $normalizedCommandLine.Contains($normalizedExpected)
+    if ($normalizedCommandLine.Contains($normalizedExpected)) {
+        return $true
+    }
+
+    if (-not $AllowRelativeTail) {
+        return $false
+    }
+
+    $pathParts = @($normalizedExpected -split "\\" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($pathParts.Count -lt 2) {
+        return $false
+    }
+
+    $maxTailParts = [Math]::Min(4, $pathParts.Count)
+    for ($tailParts = $maxTailParts; $tailParts -ge 2; $tailParts--) {
+        $tailStart = $pathParts.Count - $tailParts
+        $tail = ($pathParts[$tailStart..($pathParts.Count - 1)] -join "\")
+        if ($normalizedCommandLine.Contains($tail)) {
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-ScheduleServerPortState {
@@ -281,7 +327,7 @@ function Get-ScheduleServerPortState {
     $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.ParentProcessId)" -ErrorAction SilentlyContinue
     $serverMatches = Test-CommandLineContainsPath -CommandLine $process.CommandLine -ExpectedPath $ServerScript
     $launcherMatches = ($null -ne $parent) -and `
-        (Test-CommandLineContainsPath -CommandLine $parent.CommandLine -ExpectedPath $LauncherScript)
+        (Test-CommandLineContainsPath -CommandLine $parent.CommandLine -ExpectedPath $LauncherScript -AllowRelativeTail)
     if (-not $serverMatches -or -not $launcherMatches) {
         return [PSCustomObject]@{ Kind = "foreign"; ProcessId = $processId; Healthy = $false }
     }
@@ -660,6 +706,10 @@ function Invoke-Launcher {
         if ($portState.Kind -eq "project_server" -and -not $portState.Healthy) {
             throw "The managed schedule server is listening on port $serverPort but its health check failed."
         }
+        if ($portState.Kind -eq "project_server" -and
+            -not (Test-ScheduleServerHealth -HostAddress $displayAddress -Port $serverPort)) {
+            throw "The schedule server is healthy on localhost but not reachable at http://${displayAddress}:$serverPort. Allow TCP port $serverPort in Windows Firewall or connect the ESP32 and PC to the same network."
+        }
         Write-Host "Status:   checks passed; server was not started" -ForegroundColor Green
         return 0
     }
@@ -689,6 +739,9 @@ function Invoke-Launcher {
         } else {
             if (-not $portState.Healthy) {
                 throw "The managed schedule server is listening on port $serverPort but its health check failed."
+            }
+            if (-not (Test-ScheduleServerHealth -HostAddress $displayAddress -Port $serverPort)) {
+                throw "The schedule server is healthy on localhost but not reachable at http://${displayAddress}:$serverPort. Allow TCP port $serverPort in Windows Firewall or connect the ESP32 and PC to the same network."
             }
             Write-Host "Status:   server is already running on port $serverPort" -ForegroundColor Green
             return 0

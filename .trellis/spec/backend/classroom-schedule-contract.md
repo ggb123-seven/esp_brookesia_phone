@@ -61,8 +61,25 @@ A schedule HTTP 200 contains matching `classroom` and `date`, a
 `classroom_name` for the same target, `updated_at`, and `courses`. Each course
 contains `start`, `end`, `name`, `teacher`, and `group`. The EAMS provider must
 resolve the complete room name through the current catalog before querying;
+when room occupancy data has no matching syllabus/detail row, emit an
+occupancy-only course with `name` like `仅占用：第1-2节`, `teacher` set to
+`教室占用`, and `group` set to `EAMS未匹配课程信息` so the firmware does not display
+it as a fully identified lesson.
 after one forced catalog refresh, a missing room is HTTP 400 rather than an
 empty successful schedule.
+Values that are not already in the room-to-building index and do not start
+with a known building name, such as old fixture rooms like `A101`, must fail
+fast with HTTP 400. Do not scan every building for these values because one
+slow EAMS room-catalog request can turn an invalid room into a long device
+timeout.
+For a valid room/date that already has a fresh successful server cache entry,
+the middleware may return the cached schedule before re-querying the slow EAMS
+syllabus/occupancy pages, but it must first validate that the room still maps
+to the current catalog target. Provider 4xx/`BadRequest` results must not be
+hidden by cache; provider unavailable/upstream failures may still use the
+matching cache entry. When no cache entry exists, the EAMS syllabus and room
+occupancy pages should be fetched in parallel after classroom resolution so a
+single device request is not delayed by two serial upstream paths.
 
 The firmware stores building and classroom in one NVS commit. It keeps saved
 configuration, dropdown drafts, and received schedule data separate. Every
