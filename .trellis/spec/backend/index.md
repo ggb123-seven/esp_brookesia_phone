@@ -20,6 +20,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | Filled |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | Filled |
 | [Classroom Schedule Contract](./classroom-schedule-contract.md) | Firmware/middleware API, EAMS session, and building routing | Filled |
+| [OneNET Cloud Contract](./onenet-cloud-contract.md) | MQTT auth, SNTP ownership, property and photo upload validation | Filled |
 
 ---
 

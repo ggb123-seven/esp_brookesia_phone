@@ -13,12 +13,17 @@
 #include <time.h>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
 #include "esp_netif.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+
+#if CONFIG_EXAMPLE_ENABLE_ONENET_CLOUD
+#include "onenet_cloud_service.h"
+#endif
 
 #define CLASSROOM_SCHEDULE_WORKER_STACK_SIZE       (20480)
 #define CLASSROOM_SCHEDULE_WORKER_PRIORITY         (5)
@@ -39,8 +44,13 @@
 #define CLASSROOM_SCHEDULE_CACHE_PATH              "/spiffs/class_schedule.json"
 #define CLASSROOM_SCHEDULE_DEFAULT_HOST_CAMPUS     "10.96.111.246"
 #define CLASSROOM_SCHEDULE_DEFAULT_HOST_HOME       "192.168.1.5"
+#define CLASSROOM_SCHEDULE_MIN_VALID_YEAR          (2026)
+#define CLASSROOM_SCHEDULE_FALLBACK_DATE           "2026-07-26"
 #define CLASSROOM_SCHEDULE_MAX_BUILDINGS           (64)
 #define CLASSROOM_SCHEDULE_MAX_ROOMS               (512)
+#define CLASSROOM_SCHEDULE_ONENET_HTTP_PAUSE_MS    (CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_REQUEST_TIMEOUT_MS + 15000U)
+#define CLASSROOM_SCHEDULE_ONENET_AFTER_HTTP_MS    (15000U)
+#define CLASSROOM_SCHEDULE_ONENET_SETTLE_MS        (1200U)
 
 #define CLASSROOM_SCHEDULE_COLOR_BG                0x111827
 #define CLASSROOM_SCHEDULE_COLOR_PANEL             0x1F2937
@@ -71,6 +81,28 @@ static bool hasNetworkIp(void)
     esp_netif_ip_info_t ip_info = {};
     esp_err_t err = esp_netif_get_ip_info(sta_netif, &ip_info);
     return err == ESP_OK && ip_info.ip.addr != 0;
+}
+
+static void pauseOnenetForClassroomHttp(uint32_t pause_ms, uint32_t settle_ms)
+{
+#if CONFIG_EXAMPLE_ENABLE_ONENET_CLOUD
+    esp_err_t err = onenet_cloud_service_pause_network(pause_ms);
+    if (err == ESP_OK)
+    {
+        if (settle_ms > 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(settle_ms));
+        }
+    }
+    else if (err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGW(TAG, "Failed to pause OneNET network before classroom HTTP: %s",
+                 esp_err_to_name(err));
+    }
+#else
+    (void)pause_ms;
+    (void)settle_ms;
+#endif
 }
 
 static bool isKnownDefaultServerHost(const char *host)
@@ -114,6 +146,19 @@ static bool copy_json_string(cJSON *object, const char *key, char *dest, size_t 
 
     copy_string(dest, dest_size, item->valuestring);
     return true;
+}
+
+static void *classroom_calloc_prefer_psram(size_t size)
+{
+#if CONFIG_SPIRAM
+    void *buffer = heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer != NULL)
+    {
+        return buffer;
+    }
+#endif
+
+    return heap_caps_calloc(1, size, MALLOC_CAP_8BIT);
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
@@ -217,7 +262,7 @@ bool ClassroomScheduleApp::run(void)
     _draft_classroom[0] = '\0';
     _catalog_server_host[0] = '\0';
     if (!getToday(_selected_date, sizeof(_selected_date))) {
-        copy_string(_selected_date, sizeof(_selected_date), "1970-01-01");
+        copy_string(_selected_date, sizeof(_selected_date), CLASSROOM_SCHEDULE_FALLBACK_DATE);
     }
     loadBuilding();
     loadClassroom();
@@ -717,14 +762,18 @@ esp_err_t ClassroomScheduleApp::fetchScheduleJson(const QuerySnapshot &query, ch
     config.user_data = &response;
     config.buffer_size = 1024;
 
+    pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_HTTP_PAUSE_MS,
+                                CLASSROOM_SCHEDULE_ONENET_SETTLE_MS);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_AFTER_HTTP_MS, 0);
         return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = esp_http_client_perform(client);
     *http_status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_AFTER_HTTP_MS, 0);
 
     ESP_LOGI(TAG, "Schedule HTTP result: host=%s port=%d classroom=%s date=%s err=%s status=%d bytes=%u overflow=%d",
              query.server_host, CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_SERVER_PORT, query.classroom, query.date,
@@ -800,13 +849,17 @@ esp_err_t ClassroomScheduleApp::fetchCatalogJson(const CatalogRequest &request, 
     config.user_data = &response;
     config.buffer_size = 1024;
 
+    pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_HTTP_PAUSE_MS,
+                                CLASSROOM_SCHEDULE_ONENET_SETTLE_MS);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
+        pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_AFTER_HTTP_MS, 0);
         return ESP_ERR_NO_MEM;
     }
     esp_err_t err = esp_http_client_perform(client);
     *http_status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    pauseOnenetForClassroomHttp(CLASSROOM_SCHEDULE_ONENET_AFTER_HTTP_MS, 0);
 
     ESP_LOGI(TAG, "Catalog HTTP result: host=%s path=%s building=%s err=%s status=%d bytes=%u overflow=%d",
              request.server_host, path, building != NULL ? building : "<all>", esp_err_to_name(err),
@@ -994,7 +1047,7 @@ esp_err_t ClassroomScheduleApp::loadCachedSchedule(const QuerySnapshot &query, S
         return ESP_ERR_INVALID_ARG;
     }
 
-    char *json = static_cast<char *>(calloc(CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1, 1));
+    char *json = static_cast<char *>(classroom_calloc_prefer_psram(CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1));
     if (json == NULL) {
         return ESP_ERR_NO_MEM;
     }
@@ -1059,9 +1112,14 @@ bool ClassroomScheduleApp::getToday(char *date, size_t date_size) const
     tzset();
 
     time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    struct tm timeinfo = {};
+    if (time(&now) == (time_t)-1 || localtime_r(&now, &timeinfo) == NULL ||
+        timeinfo.tm_year + 1900 < CLASSROOM_SCHEDULE_MIN_VALID_YEAR)
+    {
+        const int fallback_written = snprintf(date, date_size, "%s", CLASSROOM_SCHEDULE_FALLBACK_DATE);
+        return fallback_written > 0 && (size_t)fallback_written < date_size;
+    }
+
     const int written = snprintf(date, date_size, "%04d-%02d-%02d",
                                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
     return written > 0 && (size_t)written < date_size;
@@ -1077,9 +1135,14 @@ void ClassroomScheduleApp::getNowText(char *text, size_t text_size) const
     tzset();
 
     time_t now;
-    struct tm timeinfo;
-    time(&now);
-    localtime_r(&now, &timeinfo);
+    struct tm timeinfo = {};
+    if (time(&now) == (time_t)-1 || localtime_r(&now, &timeinfo) == NULL ||
+        timeinfo.tm_year + 1900 < CLASSROOM_SCHEDULE_MIN_VALID_YEAR)
+    {
+        snprintf(text, text_size, "%s 00:00", CLASSROOM_SCHEDULE_FALLBACK_DATE);
+        return;
+    }
+
     snprintf(text, text_size, "%04d-%02d-%02d %02d:%02d",
              timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
              timeinfo.tm_hour, timeinfo.tm_min);
@@ -1945,7 +2008,7 @@ void ClassroomScheduleApp::catalogTask(void *arg)
     }
     result->err = ESP_FAIL;
     result->request = app->_active_catalog_request;
-    char *json = static_cast<char *>(calloc(CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN + 1, 1));
+    char *json = static_cast<char *>(classroom_calloc_prefer_psram(CLASSROOM_SCHEDULE_CATALOG_JSON_MAX_LEN + 1));
     if (json == NULL) {
         result->err = ESP_ERR_NO_MEM;
         copy_string(result->detail, sizeof(result->detail), "内存不足，无法加载教室目录。");
@@ -2178,7 +2241,7 @@ void ClassroomScheduleApp::updateCatalogDropdown(lv_obj_t *dropdown, const Catal
         return;
     }
     const size_t capacity = count * (sizeof(CatalogName) + 1) + 1;
-    char *options = static_cast<char *>(calloc(capacity, 1));
+    char *options = static_cast<char *>(classroom_calloc_prefer_psram(capacity));
     if (options == NULL) {
         lv_dropdown_set_options(dropdown, "内存不足");
         return;
@@ -2383,7 +2446,7 @@ void ClassroomScheduleApp::refreshTask(void *arg)
     result->err = ESP_FAIL;
     result->query = query;
 
-    char *json = static_cast<char *>(calloc(CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1, 1));
+    char *json = static_cast<char *>(classroom_calloc_prefer_psram(CLASSROOM_SCHEDULE_JSON_MAX_LEN + 1));
     if (json == NULL) {
         result->err = ESP_ERR_NO_MEM;
         copy_string(result->detail, sizeof(result->detail), "内存不足，无法创建课表接收缓冲区。");

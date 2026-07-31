@@ -115,11 +115,12 @@ menu "Example Configurations"
     config EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
         bool "Enable parent call alert service"
         depends on EXAMPLE_ENABLE_APP_ENVIRONMENT_MONITOR && EXAMPLE_ENABLE_MQ2_SERVICE
-        default y
+        default n
         help
             Enabling this option starts the parent call alert service.
-            Keep Mock selected until the real phone module, SIM, antenna,
-            power supply, and UART wiring are ready.
+            Keep this disabled in the memory-constrained cloud demo unless the
+            real phone module, SIM, antenna, power supply, and UART wiring are
+            ready.
 
     if EXAMPLE_ENABLE_PARENT_CALL_ALERT_SERVICE
         config EXAMPLE_PARENT_CALL_ALERT_SERVER_HOST
@@ -272,21 +273,21 @@ menu "Example Configurations"
         config EXAMPLE_PARENT_CALL_ALERT_TASK_STACK_SIZE
             int "Parent call alert task stack size"
             range 4096 16384
-            default 6144
+            default 4096
             help
                 Stack size for the alert worker task.
 
         config EXAMPLE_PARENT_CALL_ALERT_TASK_PRIORITY
             int "Parent call alert task priority"
             range 1 10
-            default 5
+            default 3
             help
                 FreeRTOS priority for the alert worker task.
 
         config EXAMPLE_PARENT_CALL_ALERT_QUEUE_LENGTH
             int "Parent call alert queue length"
             range 1 16
-            default 4
+            default 1
             help
                 Maximum pending alert events waiting for the worker task.
     endif
@@ -319,25 +320,29 @@ menu "Example Configurations"
             default ""
             help
                 Generated OneNET device token used as the MQTT password and HTTP
-                Authorization header. Keep real values local and out of Git.
+                Authorization header. This is not the raw device key; generate it
+                from the product ID, device name, device key, and expiration time.
+                Keep real values local and out of Git.
 
         config EXAMPLE_ONENET_MQTT_HOST
             string "OneNET MQTT host"
-            default "mqtts.heclouds.com"
+            default "studio-mqtts.heclouds.com"
             help
                 MQTT host for OneNET device access. Do not include a product/device
-                path. A full mqtt:// URI is also accepted.
+                path. Use studio-mqtt.heclouds.com for plaintext or
+                studio-mqtts.heclouds.com for TLS. A full mqtt:// or mqtts:// URI
+                is also accepted.
 
         config EXAMPLE_ONENET_MQTT_PORT
             int "OneNET MQTT port"
             range 1 65535
-            default 1883
+            default 8883
             help
                 MQTT port for OneNET device access.
 
         config EXAMPLE_ONENET_API_HOST
             string "OneNET HTTP API host"
-            default "iot-api.heclouds.com"
+            default "studio-file.heclouds.com"
             help
                 HTTP API host used for OneNET file upload. Do not include the
                 /studio path. A full http:// or https:// base URL is also accepted.

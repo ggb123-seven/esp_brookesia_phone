@@ -125,6 +125,12 @@ static void obtain_time(void)
 
 static void initialize_sntp(void)
 {
+    if (esp_sntp_enabled())
+    {
+        ESP_LOGI(TAG, "SNTP is already running");
+        return;
+    }
+
     ESP_LOGI(TAG, "Initializing SNTP");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, SERVER_NAME_0);

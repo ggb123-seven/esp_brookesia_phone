@@ -35,6 +35,8 @@ typedef enum
     ONENET_CLOUD_STATUS_DISABLED = 0,
     ONENET_CLOUD_STATUS_NOT_CONFIGURED,
     ONENET_CLOUD_STATUS_NO_IP,
+    ONENET_CLOUD_STATUS_TIME_SYNC,
+    ONENET_CLOUD_STATUS_NETWORK_PAUSED,
     ONENET_CLOUD_STATUS_CONNECTING,
     ONENET_CLOUD_STATUS_CONNECTED,
     ONENET_CLOUD_STATUS_PUBLISHING,
@@ -99,6 +101,7 @@ typedef struct
 
 esp_err_t onenet_cloud_service_init(const onenet_cloud_config_t *config);
 esp_err_t onenet_cloud_service_deinit(void);
+esp_err_t onenet_cloud_service_pause_network(uint32_t pause_ms);
 esp_err_t onenet_cloud_service_request_photo_upload(void);
 esp_err_t onenet_cloud_service_get_snapshot(onenet_cloud_snapshot_t *snapshot);
 const char *onenet_cloud_service_status_name(onenet_cloud_status_t status);

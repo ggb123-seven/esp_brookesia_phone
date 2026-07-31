@@ -96,6 +96,19 @@ through the owning component:
   the NVS load/set helpers.
 - Holding LVGL locks across state waits, file scans, or Wi-Fi operations.
 
+## Schedule Date Defaults
+
+The classroom schedule app must not treat the ESP32 RTC epoch as a valid query
+date before SNTP or another time source has synchronized. If `time()` /
+`localtime_r()` resolves to a year earlier than the supported schedule year,
+derive the UI date from the app's explicit fallback date instead of displaying
+or querying `1970-01-01`.
+
+This keeps the date button, "today" shortcut, calendar highlight, cache update
+labels, and schedule request snapshot in one app-owned date state. Do not add a
+second date default in a callback; update `getToday()` / `getNowText()` and the
+single fallback constant together.
+
 ## Hosted Wi-Fi Connection Contract
 
 ### 1. Scope / Trigger

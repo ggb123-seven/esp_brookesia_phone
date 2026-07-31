@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include "cJSON.h"
 #include "dht11_service.h"
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -36,6 +38,15 @@
 #define ONENET_CLOUD_MQTT_RETRY_MIN_MS     (15000U)
 #define ONENET_CLOUD_MQTT_RETRY_MAX_MS     (120000U)
 #define ONENET_CLOUD_MQTT_NETWORK_TIMEOUT_MS (5000)
+#define ONENET_CLOUD_MQTT_BEFORE_HTTP_SETTLE_MS (1500U)
+#define ONENET_CLOUD_MQTT_AFTER_HTTP_SETTLE_MS (15000U)
+#define ONENET_CLOUD_NETWORK_PAUSE_MAX_MS  (120000U)
+#define ONENET_CLOUD_TIME_VALID_YEAR       (2024)
+#define ONENET_CLOUD_TIME_WAIT_LOG_MS      (30000)
+#define ONENET_CLOUD_NO_IP_LOG_MS          (30000)
+#define ONENET_CLOUD_NETWORK_PAUSE_LOG_MS  (30000)
+#define ONENET_CLOUD_MQTT_HOST_SUFFIX      "heclouds.com"
+#define ONENET_CLOUD_MQTT_CERT_COMMON_NAME "OneNET MQTTS"
 #define ONENET_CLOUD_TOPIC_MAX_LEN         (192U)
 #define ONENET_CLOUD_URL_MAX_LEN           (256U)
 #define ONENET_CLOUD_MD5_HEX_LEN           (33U)
@@ -44,6 +55,9 @@
 #define ONENET_CLOUD_HTTP_TIMEOUT_MS       (15000)
 #define ONENET_CLOUD_MULTIPART_BOUNDARY    "----esp32p4-onenet-boundary"
 #define ONENET_CLOUD_ONEJSON_VERSION       "1.0"
+#define ONENET_CLOUD_MESSAGE_ID_BUF_LEN    (11U)
+#define ONENET_CLOUD_PROPERTY_REPLY_SUCCESS_CODE (200)
+#define ONENET_CLOUD_REPLY_MESSAGE_LOG_MAX_LEN (96)
 
 #if CONFIG_EXAMPLE_ENABLE_SD_CARD
 #define ONENET_CLOUD_PHOTO_DIR CONFIG_BSP_SD_MOUNT_POINT "/camera"
@@ -54,6 +68,8 @@
 #define ONENET_CLOUD_PHOTO_PATH_MAX_LEN    (sizeof(ONENET_CLOUD_PHOTO_DIR) + ONENET_CLOUD_PHOTO_NAME_MAX_LEN)
 
 static const char *TAG = "OneNETCloud";
+
+extern const uint8_t onenet_mqtt_root_pem_start[] asm("_binary_onenet_mqtt_root_pem_start");
 
 typedef struct
 {
@@ -100,6 +116,13 @@ static bool s_initialized;
 static bool s_mqtt_started;
 static uint32_t s_mqtt_retry_delay_ms;
 static int64_t s_next_mqtt_start_ms;
+static int64_t s_last_time_wait_log_ms;
+static int64_t s_last_no_ip_log_ms;
+static int64_t s_last_network_pause_log_ms;
+static volatile uint32_t s_network_pause_until_ms;
+static uint32_t s_property_message_id;
+
+static void destroy_mqtt_client(void);
 
 static void copy_string(char *dest, size_t dest_size, const char *src)
 {
@@ -145,6 +168,14 @@ static bool config_is_complete(void)
            string_has_value(s_config.api_host);
 }
 
+static bool endpoint_uses_onenet_mqtt_ca(const onenet_cloud_mqtt_endpoint_t *endpoint)
+{
+    return endpoint != NULL &&
+           strstr(endpoint->hostname, ONENET_CLOUD_MQTT_HOST_SUFFIX) != NULL;
+}
+
+static void update_status(onenet_cloud_status_t status, esp_err_t err, const char *reason);
+
 static void reset_runtime_state(void)
 {
     s_done_sem = NULL;
@@ -157,8 +188,62 @@ static void reset_runtime_state(void)
     s_mqtt_started = false;
     s_mqtt_retry_delay_ms = ONENET_CLOUD_MQTT_RETRY_MIN_MS;
     s_next_mqtt_start_ms = 0;
+    s_last_time_wait_log_ms = 0;
+    s_last_no_ip_log_ms = 0;
+    s_last_network_pause_log_ms = 0;
+    s_network_pause_until_ms = 0;
+    s_property_message_id = 0;
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_snapshot, 0, sizeof(s_snapshot));
+}
+
+static uint32_t now_millis32(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static bool network_pause_active(uint32_t now_ms)
+{
+    return (int32_t)(s_network_pause_until_ms - now_ms) > 0;
+}
+
+static uint32_t network_pause_remaining_ms(uint32_t now_ms)
+{
+    if (!network_pause_active(now_ms))
+    {
+        return 0;
+    }
+
+    return (uint32_t)(s_network_pause_until_ms - now_ms);
+}
+
+static bool system_time_is_valid(void)
+{
+    time_t now = 0;
+    struct tm timeinfo = {};
+
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    return timeinfo.tm_year >= (ONENET_CLOUD_TIME_VALID_YEAR - 1900);
+}
+
+static bool ensure_time_ready_for_tls(int64_t now_ms)
+{
+    if (system_time_is_valid())
+    {
+        return true;
+    }
+
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    update_status(ONENET_CLOUD_STATUS_TIME_SYNC, ESP_ERR_INVALID_STATE, "time_not_set");
+    if (s_last_time_wait_log_ms == 0 ||
+        now_ms - s_last_time_wait_log_ms >= ONENET_CLOUD_TIME_WAIT_LOG_MS)
+    {
+        ESP_LOGW(TAG, "Waiting for system time before OneNET TLS connection");
+        s_last_time_wait_log_ms = now_ms;
+    }
+    return false;
 }
 
 static void update_status(onenet_cloud_status_t status, esp_err_t err, const char *reason)
@@ -379,13 +464,25 @@ static esp_err_t build_property_payload(char **payload)
     onenet_cloud_snapshot_t snapshot = {};
     (void)onenet_cloud_service_get_snapshot(&snapshot);
 
+    s_property_message_id++;
+    if (s_property_message_id == 0)
+    {
+        s_property_message_id = 1;
+    }
+
+    char message_id[ONENET_CLOUD_MESSAGE_ID_BUF_LEN];
+    int message_id_len = snprintf(message_id, sizeof(message_id), "%" PRIu32,
+                                  s_property_message_id);
+    ESP_RETURN_ON_FALSE(message_id_len > 0 && (size_t)message_id_len < sizeof(message_id),
+                        ESP_ERR_INVALID_SIZE, TAG, "Failed to format OneJSON message ID");
+
     cJSON *root = cJSON_CreateObject();
     cJSON *params_obj = cJSON_CreateObject();
     cJSON *params = NULL;
     ESP_GOTO_ON_FALSE(root != NULL && params_obj != NULL, ESP_ERR_NO_MEM, err, TAG,
                       "Failed to create OneJSON root");
 
-    ESP_GOTO_ON_FALSE(cJSON_AddStringToObject(root, "id", "esp32p4") != NULL &&
+    ESP_GOTO_ON_FALSE(cJSON_AddStringToObject(root, "id", message_id) != NULL &&
                           cJSON_AddStringToObject(root, "version", ONENET_CLOUD_ONEJSON_VERSION) != NULL &&
                           cJSON_AddItemToObject(root, "params", params_obj),
                       ESP_ERR_NO_MEM, err, TAG, "Failed to create OneJSON header");
@@ -718,11 +815,13 @@ static esp_err_t upload_latest_photo(void)
 
     if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_NOT_SUPPORTED)
     {
+        ESP_LOGI(TAG, "No photo available for OneNET upload");
         update_status(ONENET_CLOUD_STATUS_NO_PHOTO, err, "no_photo");
         return err;
     }
     if (err != ESP_OK)
     {
+        ESP_LOGE(TAG, "Failed to scan photos for OneNET upload: %s", esp_err_to_name(err));
         update_status(ONENET_CLOUD_STATUS_INTERNAL_ERROR, err, "photo_scan_failed");
         return err;
     }
@@ -734,6 +833,8 @@ static esp_err_t upload_latest_photo(void)
         s_snapshot.last_photo_size = photo.size;
         copy_string(s_snapshot.last_photo_name, sizeof(s_snapshot.last_photo_name), photo.name);
         snapshot_unlock();
+        ESP_LOGW(TAG, "OneNET photo exceeds upload limit: size=%u limit=%u",
+                 (unsigned)photo.size, (unsigned)s_config.photo_max_bytes);
         update_status(ONENET_CLOUD_STATUS_FILE_TOO_LARGE, ESP_ERR_INVALID_SIZE, "file_too_large");
         return ESP_ERR_INVALID_SIZE;
     }
@@ -750,15 +851,23 @@ static esp_err_t upload_latest_photo(void)
     err = calculate_file_md5(photo.path, md5_hex);
     if (err != ESP_OK)
     {
+        ESP_LOGE(TAG, "Failed to calculate photo MD5 for OneNET upload: %s",
+                 esp_err_to_name(err));
         update_status(ONENET_CLOUD_STATUS_INTERNAL_ERROR, err, "md5_failed");
         return err;
     }
+
+    ESP_LOGI(TAG, "Pausing OneNET MQTT before photo HTTP upload");
+    destroy_mqtt_client();
+    vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_MQTT_BEFORE_HTTP_SETTLE_MS));
 
     update_status(ONENET_CLOUD_STATUS_UPLOADING_PHOTO, ESP_OK, NULL);
 
     char uuid[ONENET_CLOUD_PHOTO_UUID_MAX_LEN] = {};
     int http_status = 0;
     err = upload_photo_http(&photo, md5_hex, uuid, sizeof(uuid), &http_status);
+    s_next_mqtt_start_ms = esp_timer_get_time() / 1000 +
+                           ONENET_CLOUD_MQTT_AFTER_HTTP_SETTLE_MS;
 
     snapshot_lock();
     s_snapshot.last_http_status = http_status;
@@ -778,6 +887,16 @@ static esp_err_t upload_latest_photo(void)
     snapshot_unlock();
 
     s_photo_upload_requested = false;
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "OneNET photo upload succeeded: size=%u http_status=%d uuid_present=1",
+                 (unsigned)photo.size, http_status);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "OneNET photo upload failed: size=%u http_status=%d err=%s",
+                 (unsigned)photo.size, http_status, esp_err_to_name(err));
+    }
     update_status(err == ESP_OK ? ONENET_CLOUD_STATUS_UPLOAD_OK : ONENET_CLOUD_STATUS_HTTP_ERROR,
                   err, err == ESP_OK ? NULL : "photo_upload_failed");
     return err;
@@ -888,6 +1007,89 @@ static void schedule_mqtt_retry(const char *reason)
     update_status(ONENET_CLOUD_STATUS_MQTT_ERROR, ESP_FAIL, reason);
 }
 
+static bool mqtt_event_topic_matches(esp_mqtt_event_handle_t event, const char *topic_suffix)
+{
+    if (event == NULL || event->topic == NULL || topic_suffix == NULL)
+    {
+        return false;
+    }
+
+    char expected_topic[ONENET_CLOUD_TOPIC_MAX_LEN];
+    int written = snprintf(expected_topic, sizeof(expected_topic), "$sys/%s/%s/%s",
+                           s_config.product_id, s_config.device_name, topic_suffix);
+    return written > 0 && (size_t)written < sizeof(expected_topic) &&
+           event->topic_len == written && memcmp(event->topic, expected_topic, (size_t)written) == 0;
+}
+
+static void handle_property_post_reply(esp_mqtt_event_handle_t event)
+{
+    if (event->data == NULL || event->data_len <= 0 || event->current_data_offset != 0 ||
+        event->data_len != event->total_data_len)
+    {
+        ESP_LOGW(TAG, "Ignored fragmented OneNET property report reply: offset=%d len=%d total=%d",
+                 event->current_data_offset, event->data_len, event->total_data_len);
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(event->data, (size_t)event->data_len);
+    if (root == NULL)
+    {
+        ESP_LOGW(TAG, "Invalid OneNET property report reply JSON: data_len=%d", event->data_len);
+        return;
+    }
+
+    bool code_valid = false;
+    int reply_code = 0;
+    const cJSON *code = cJSON_GetObjectItemCaseSensitive(root, "code");
+    if (cJSON_IsNumber(code))
+    {
+        reply_code = code->valueint;
+        code_valid = true;
+    }
+    else if (cJSON_IsString(code) && code->valuestring != NULL)
+    {
+        char *end = NULL;
+        long parsed = strtol(code->valuestring, &end, 10);
+        if (end != code->valuestring && *end == '\0' && parsed >= INT_MIN && parsed <= INT_MAX)
+        {
+            reply_code = (int)parsed;
+            code_valid = true;
+        }
+    }
+
+    const cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "msg");
+    if (!cJSON_IsString(message))
+    {
+        message = cJSON_GetObjectItemCaseSensitive(root, "message");
+    }
+    const char *message_text = cJSON_IsString(message) && message->valuestring != NULL
+                                   ? message->valuestring
+                                   : "";
+    int message_len = (int)strlen(message_text);
+    if (message_len > ONENET_CLOUD_REPLY_MESSAGE_LOG_MAX_LEN)
+    {
+        message_len = ONENET_CLOUD_REPLY_MESSAGE_LOG_MAX_LEN;
+    }
+
+    if (!code_valid)
+    {
+        ESP_LOGW(TAG, "OneNET property report reply has no valid code: msg=%.*s",
+                 message_len, message_text);
+    }
+    else if (reply_code == ONENET_CLOUD_PROPERTY_REPLY_SUCCESS_CODE)
+    {
+        ESP_LOGI(TAG, "OneNET property report accepted: code=%d msg=%.*s",
+                 reply_code, message_len, message_text);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "OneNET property report rejected: code=%d msg=%.*s",
+                 reply_code, message_len, message_text);
+    }
+
+    cJSON_Delete(root);
+}
+
 static void mqtt_event_handler(void *handler_args,
                                esp_event_base_t base,
                                int32_t event_id,
@@ -909,6 +1111,13 @@ static void mqtt_event_handler(void *handler_args,
             (void)esp_mqtt_client_subscribe(event->client, topic, 1);
         }
 
+        written = snprintf(topic, sizeof(topic), "$sys/%s/%s/thing/property/post/reply",
+                           s_config.product_id, s_config.device_name);
+        if (written > 0 && (size_t)written < sizeof(topic))
+        {
+            (void)esp_mqtt_client_subscribe(event->client, topic, 1);
+        }
+
         snapshot_lock();
         s_snapshot.mqtt_connected = true;
         snapshot_unlock();
@@ -916,6 +1125,7 @@ static void mqtt_event_handler(void *handler_args,
         s_next_mqtt_start_ms = 0;
         s_mqtt_restart_requested = false;
         update_status(ONENET_CLOUD_STATUS_CONNECTED, ESP_OK, NULL);
+        ESP_LOGI(TAG, "OneNET MQTT connected");
         break;
     }
     case MQTT_EVENT_DISCONNECTED:
@@ -924,10 +1134,21 @@ static void mqtt_event_handler(void *handler_args,
         snapshot_unlock();
         s_mqtt_restart_requested = true;
         update_status(ONENET_CLOUD_STATUS_MQTT_ERROR, ESP_FAIL, "mqtt_disconnected");
+        ESP_LOGW(TAG, "OneNET MQTT disconnected");
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "OneNET MQTT publish acknowledged: msg_id=%d", event->msg_id);
         break;
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "Ignored OneNET property set payload: topic_len=%d data_len=%d",
-                 event->topic_len, event->data_len);
+        if (mqtt_event_topic_matches(event, "thing/property/post/reply"))
+        {
+            handle_property_post_reply(event);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Ignored OneNET property set payload: topic_len=%d data_len=%d",
+                     event->topic_len, event->data_len);
+        }
         break;
     case MQTT_EVENT_ERROR:
         snapshot_lock();
@@ -936,6 +1157,7 @@ static void mqtt_event_handler(void *handler_args,
         snapshot_unlock();
         s_mqtt_restart_requested = true;
         update_status(ONENET_CLOUD_STATUS_MQTT_ERROR, ESP_FAIL, "mqtt_error");
+        ESP_LOGE(TAG, "OneNET MQTT error event");
         break;
     default:
         break;
@@ -961,6 +1183,18 @@ static esp_err_t ensure_mqtt_started(void)
     mqtt_config.broker.address.hostname = endpoint.hostname;
     mqtt_config.broker.address.port = endpoint.port;
     mqtt_config.broker.address.transport = endpoint.transport;
+    if (endpoint.transport == MQTT_TRANSPORT_OVER_SSL)
+    {
+        if (endpoint_uses_onenet_mqtt_ca(&endpoint))
+        {
+            mqtt_config.broker.verification.certificate = (const char *)onenet_mqtt_root_pem_start;
+            mqtt_config.broker.verification.common_name = ONENET_CLOUD_MQTT_CERT_COMMON_NAME;
+        }
+        else
+        {
+            mqtt_config.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+        }
+    }
     mqtt_config.credentials.client_id = s_config.device_name;
     mqtt_config.credentials.username = s_config.product_id;
     mqtt_config.credentials.authentication.password = s_config.auth_token;
@@ -1036,15 +1270,50 @@ static void onenet_cloud_task(void *arg)
             continue;
         }
 
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        const uint32_t now32_ms = (uint32_t)now_ms;
+        const uint32_t pause_remaining_ms = network_pause_remaining_ms(now32_ms);
+        if (pause_remaining_ms > 0)
+        {
+            if (s_last_network_pause_log_ms == 0 ||
+                now_ms - s_last_network_pause_log_ms >= ONENET_CLOUD_NETWORK_PAUSE_LOG_MS)
+            {
+                ESP_LOGW(TAG, "OneNET network paused for another %" PRIu32 " ms",
+                         pause_remaining_ms);
+                s_last_network_pause_log_ms = now_ms;
+            }
+            if (s_mqtt_client != NULL || s_mqtt_started || s_mqtt_restart_requested)
+            {
+                destroy_mqtt_client();
+            }
+            s_next_mqtt_start_ms = now_ms + pause_remaining_ms;
+            update_status(ONENET_CLOUD_STATUS_NETWORK_PAUSED, ESP_OK, "network_pause");
+            vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_LOOP_PERIOD_MS));
+            continue;
+        }
+        s_last_network_pause_log_ms = 0;
+
         char ip[24] = {};
         if (!get_station_ip(ip, sizeof(ip)))
         {
             update_status(ONENET_CLOUD_STATUS_NO_IP, ESP_ERR_INVALID_STATE, "wifi_no_ip");
+            if (s_last_no_ip_log_ms == 0 ||
+                now_ms - s_last_no_ip_log_ms >= ONENET_CLOUD_NO_IP_LOG_MS)
+            {
+                ESP_LOGW(TAG, "Waiting for Wi-Fi IP before OneNET connection");
+                s_last_no_ip_log_ms = now_ms;
+            }
+            vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_LOOP_PERIOD_MS));
+            continue;
+        }
+        s_last_no_ip_log_ms = 0;
+
+        if (!ensure_time_ready_for_tls(now_ms))
+        {
             vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_LOOP_PERIOD_MS));
             continue;
         }
 
-        const int64_t now_ms = esp_timer_get_time() / 1000;
         if (s_mqtt_restart_requested)
         {
             destroy_mqtt_client();
@@ -1061,20 +1330,22 @@ static void onenet_cloud_task(void *arg)
             }
         }
 
-        if (snapshot_mqtt_connected() && now_ms - last_publish_ms >= s_config.upload_interval_ms)
-        {
-            if (publish_properties() == ESP_OK)
-            {
-                last_publish_ms = now_ms;
-            }
-        }
-
         if (s_config.photo_upload_enabled && snapshot_mqtt_connected() &&
             (s_photo_upload_requested ||
              now_ms - last_photo_attempt_ms >= s_config.photo_upload_cooldown_ms))
         {
             last_photo_attempt_ms = now_ms;
             (void)upload_latest_photo();
+            vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_LOOP_PERIOD_MS));
+            continue;
+        }
+
+        if (snapshot_mqtt_connected() && now_ms - last_publish_ms >= s_config.upload_interval_ms)
+        {
+            if (publish_properties() == ESP_OK)
+            {
+                last_publish_ms = now_ms;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(ONENET_CLOUD_LOOP_PERIOD_MS));
@@ -1138,6 +1409,12 @@ esp_err_t onenet_cloud_service_init(const onenet_cloud_config_t *config)
     copy_string(s_snapshot.last_failure_reason, sizeof(s_snapshot.last_failure_reason),
                 onenet_cloud_service_status_name(s_snapshot.status));
     snapshot_unlock();
+
+    ESP_LOGI(TAG,
+             "OneNET cloud service initialized: enabled=%d configured=%d product=%s device=%s mqtt=%s:%u api=%s photo_upload=%d interval_ms=%" PRIu32,
+             s_config.enabled, config_is_complete(), s_config.product_id, s_config.device_name,
+             s_config.mqtt_host, (unsigned)s_config.mqtt_port, s_config.api_host,
+             s_config.photo_upload_enabled, s_config.upload_interval_ms);
 
     s_initialized = true;
     s_stop_requested = false;
@@ -1211,6 +1488,37 @@ esp_err_t onenet_cloud_service_deinit(void)
     return ESP_OK;
 }
 
+esp_err_t onenet_cloud_service_pause_network(uint32_t pause_ms)
+{
+    if (!s_initialized || !s_config.enabled)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (pause_ms == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (pause_ms > ONENET_CLOUD_NETWORK_PAUSE_MAX_MS)
+    {
+        pause_ms = ONENET_CLOUD_NETWORK_PAUSE_MAX_MS;
+    }
+
+    const uint32_t now_ms = now_millis32();
+    const uint32_t pause_until_ms = now_ms + pause_ms;
+    const uint32_t current_until_ms = s_network_pause_until_ms;
+    if (!network_pause_active(now_ms) ||
+        (int32_t)(pause_until_ms - current_until_ms) > 0)
+    {
+        s_network_pause_until_ms = pause_until_ms;
+    }
+
+    s_mqtt_restart_requested = true;
+    update_status(ONENET_CLOUD_STATUS_NETWORK_PAUSED, ESP_OK, "network_pause_requested");
+    return ESP_OK;
+}
+
 esp_err_t onenet_cloud_service_request_photo_upload(void)
 {
     if (!s_initialized || !s_config.enabled)
@@ -1252,6 +1560,10 @@ const char *onenet_cloud_service_status_name(onenet_cloud_status_t status)
         return "not_configured";
     case ONENET_CLOUD_STATUS_NO_IP:
         return "no_ip";
+    case ONENET_CLOUD_STATUS_TIME_SYNC:
+        return "time_sync";
+    case ONENET_CLOUD_STATUS_NETWORK_PAUSED:
+        return "network_paused";
     case ONENET_CLOUD_STATUS_CONNECTING:
         return "connecting";
     case ONENET_CLOUD_STATUS_CONNECTED:
@@ -1291,6 +1603,10 @@ const char *onenet_cloud_service_status_text(onenet_cloud_status_t status)
         return "OneNET 未配置";
     case ONENET_CLOUD_STATUS_NO_IP:
         return "等待 Wi-Fi IP";
+    case ONENET_CLOUD_STATUS_TIME_SYNC:
+        return "等待系统时间";
+    case ONENET_CLOUD_STATUS_NETWORK_PAUSED:
+        return "OneNET network paused";
     case ONENET_CLOUD_STATUS_CONNECTING:
         return "OneNET 连接中";
     case ONENET_CLOUD_STATUS_CONNECTED:
