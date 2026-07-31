@@ -549,7 +549,7 @@ function Show-AutoStartError {
 
 function Invoke-Launcher {
     $scriptDirectory = Split-Path -Parent $PSCommandPath
-    $defaultProjectDirectory = [IO.Path]::GetFullPath((Join-Path $scriptDirectory "..\.."))
+    $defaultProjectDirectory = [IO.Path]::GetFullPath((Join-Path $scriptDirectory ".."))
     $projectDirectory = Get-ProcessSetting -Name "PROJECT_DIR" -Default $defaultProjectDirectory
     $projectDirectory = [IO.Path]::GetFullPath($projectDirectory)
     if (-not (Test-Path -LiteralPath $projectDirectory -PathType Container)) {

@@ -1,8 +1,7 @@
 @echo off
-rem Copy this file beside start_classroom_schedule_server.bat and remove .example.
-rem Keep real tokens in the local copy only. Never commit them.
+rem Copy this file to .local-secrets\classroom_schedule_server_config.bat.
+rem The launcher detects PROJECT_DIR automatically. Keep real tokens local only.
 
-set "PROJECT_DIR=F:\ESP32\esp32p4-demo\esp-dev-kits-a88faa6\examples\esp32-p4-function-ev-board\examples\esp_brookesia_phone"
 set "SERVER_HOST=0.0.0.0"
 set "SERVER_PORT=8080"
 

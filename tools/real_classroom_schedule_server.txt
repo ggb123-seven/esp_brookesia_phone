@@ -79,13 +79,13 @@ curl -i -X POST "http://127.0.0.1:8080/parent-call-alert/trigger" \
 
 ## Windows 双击启动与登录自启动
 
-Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服务器。相关脚本位于 `tools/windows/`：
+Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服务器。相关脚本位于 `classroom_schedule_server_scripts/`：
 
 - `start_classroom_schedule_server.ps1`：统一处理 Python 检查、物理网卡 IPv4 自动识别、EAMS 会话探测、浏览器会话续期、端口占用检查和服务启动。
 - `start_classroom_schedule_server.bat`：桌面双击入口，不在窗口中打印 token。
 - `classroom_schedule_server_config.example.bat`：不含真实凭据的配置模板。
 - `set_classroom_schedule_autostart.ps1`：安装或移除 Windows 登录自启动快捷方式。
-- `../eams_session_refresh.py`：由启动器内部调用的可见 Edge 会话更新辅助程序，不是第二个用户入口。
+- `../tools/eams_session_refresh.py`：由启动器内部调用的可见 Edge 会话更新辅助程序，不是第二个用户入口。
 
 会话自动更新需要 Python Playwright；浏览器使用系统已安装的 Microsoft Edge，不需要下载 Playwright 自带浏览器：
 
@@ -93,7 +93,7 @@ Windows 本机可作为 ESP32 所在局域网内的中间层，不需要云服�
 python -m pip install playwright
 ```
 
-把 `.bat` 和本地配置放在同一目录。配置中的 `DISPLAY_IP` 留空时，启动器会选择带默认路由的已连接物理网卡，排除隧道、VMware 和 Wi-Fi Direct 等虚拟接口。真实课表模式使用：
+把配置模板复制到 `.local-secrets/classroom_schedule_server_config.bat` 后填写本地值，不要把真实凭据放进启动脚本目录。配置中的 `DISPLAY_IP` 留空时，启动器会选择带默认路由的已连接物理网卡，排除隧道、VMware 和 Wi-Fi Direct 等虚拟接口。真实课表模式使用：
 
 ```bat
 set "SCHEDULE_PROVIDER=eams-room-occupancy"
@@ -127,14 +127,14 @@ start_classroom_schedule_server.bat --check-only
 安装 Windows 登录自启动，`LauncherPath` 替换为本机桌面入口：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/set_classroom_schedule_autostart.ps1 `
+powershell -NoProfile -ExecutionPolicy Bypass -File classroom_schedule_server_scripts/set_classroom_schedule_autostart.ps1 `
   -LauncherPath "$env:USERPROFILE\OneDrive\Desktop\start_classroom_schedule_server.bat"
 ```
 
 自启动窗口保持最小化；启动失败时会显示诊断对话框。移除自启动：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools/windows/set_classroom_schedule_autostart.ps1 -Remove
+powershell -NoProfile -ExecutionPolicy Bypass -File classroom_schedule_server_scripts/set_classroom_schedule_autostart.ps1 -Remove
 ```
 
 第一次以 `0.0.0.0:8080` 启动时，Windows 防火墙可能询问是否允许 Python 访问网络；只需允许当前专用网络。ESP32 与电脑必须连接同一个局域网，电脑关机或休眠后设备会回退到离线缓存。

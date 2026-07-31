@@ -188,9 +188,10 @@ entry even when internal helpers are separate modules.
 
 ### 2. Signatures
 
-- Desktop entry: `start_classroom_schedule_server.bat [--check-only|--autostart]`
+- Repository entry:
+  `classroom_schedule_server_scripts/start_classroom_schedule_server.bat [--check-only|--autostart]`
 - PowerShell orchestrator:
-  `tools/windows/start_classroom_schedule_server.ps1 [-CheckOnly] [-AutoStart] [-SkipSessionCheck]`
+  `classroom_schedule_server_scripts/start_classroom_schedule_server.ps1 [-CheckOnly] [-AutoStart] [-SkipSessionCheck]`
 - Browser helper:
   `python tools/eams_session_refresh.py --session-file <path> --login-file <path> --profile-dir <path> --timeout-seconds <30..3600>`
 - Refresh settings: `EAMS_BROWSER_PROFILE`, `EAMS_LOGIN_TIMEOUT_SECONDS`,
@@ -198,6 +199,9 @@ entry even when internal helpers are separate modules.
 - The desktop `SCHEDULE_API_TOKEN` must equal firmware
   `CONFIG_EXAMPLE_CLASSROOM_SCHEDULE_TOKEN`; compare values without logging
   either value.
+- Real launcher configuration lives only in
+  `.local-secrets/classroom_schedule_server_config.bat`; the tracked example
+  beside the launcher contains placeholders only.
 
 ### 3. Contracts
 
