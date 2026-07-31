@@ -23,9 +23,6 @@
 #include "esp_heap_caps.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
-#include "esp_check.h"
-#include "esp_heap_caps.h"
-#include "driver/ppa.h"
 #include "sdkconfig.h"
 
 #include "bsp/esp-bsp.h"
@@ -36,16 +33,14 @@
 #include "app_video.h"
 #include "app_pedestrian_detect.h"
 #include "app_humanface_detect.h"
-#include "app_camera_pipeline.hpp"
 #include "Camera.hpp"
 #include "ui/ui.h"
-#include "esp_lv_adapter.h"
 
-#define ALIGN_UP_BY(num, align) (((num) + ((align) - 1)) & ~((align) - 1))
-
-#define CAMERA_INIT_TASK_WAIT_MS            (1000)
-#define DETECT_NUM_MAX                      (10)
-#define FPS_PRINT                           (1)
+#define CAMERA_INIT_TASK_WAIT_MS            (5000)
+#define CAMERA_DETECT_TASK_STACK_SIZE       (8 * 1024)
+#define CAMERA_DETECT_TASK_PRIORITY         (5)
+#define CAMERA_DETECT_RESULT_MAX            (10)
+#define CAMERA_DETECT_TASK_STOP_WAIT_MS     (10000)
 #define CAMERA_BMP_HEADER_SIZE              (54)
 #define CAMERA_BMP_BYTES_PER_PIXEL          (3)
 #define CAMERA_PHOTO_PATH_MAX               (128)
@@ -53,8 +48,6 @@
 #if CONFIG_EXAMPLE_ENABLE_SD_CARD
 #define CAMERA_PHOTO_DIR                    CONFIG_BSP_SD_MOUNT_POINT "/camera"
 #endif
-
-using namespace std;
 
 typedef enum {
     CAMERA_EVENT_TASK_RUN = BIT(0),
@@ -67,27 +60,10 @@ LV_IMG_DECLARE(img_app_camera);
 
 static const char *TAG = "Camera";
 
-// AI detection variables
-// static void **detect_buf;
-static vector<vector<int>> detect_bound;
-static vector<vector<int>> detect_keypoints;
-static std::list<dl::detect::result_t> detect_results;
-static PedestrianDetect *ped_detect = NULL;
-static HumanFaceDetect *hum_detect = NULL;
-static pipeline_handle_t feed_pipeline;
-static pipeline_handle_t detect_pipeline;
-
-// Other variables
-static lv_obj_t *btn_label = NULL;
 static size_t data_cache_line_size = 0;
-static ppa_client_handle_t ppa_client_srm_handle = NULL;
 static EventGroupHandle_t camera_event_group;
 
-static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
-                                       uint32_t camera_buf_hes, uint32_t camera_buf_ves,
-                                       size_t camera_buf_len);
-
-static bool ppa_trans_done_cb(ppa_client_handle_t ppa_client, ppa_event_data_t *event_data, void *user_data);
+Camera *Camera::_active_camera = NULL;
 
 static void camera_put_le16(uint8_t *dst, uint16_t value)
 {
@@ -101,6 +77,31 @@ static void camera_put_le32(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)((value >> 8) & 0xFF);
     dst[2] = (uint8_t)((value >> 16) & 0xFF);
     dst[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static void camera_draw_green_points(uint16_t *buffer, uint32_t width, uint32_t height,
+                                     const int *keypoints)
+{
+    const uint16_t green = 0x07E0;
+
+    for (int point = 0; point < 5; ++point)
+    {
+        const int center_x = keypoints[point * 2];
+        const int center_y = keypoints[point * 2 + 1];
+
+        for (int offset_x = -3; offset_x <= 3; ++offset_x)
+        {
+            for (int offset_y = -3; offset_y <= 3; ++offset_y)
+            {
+                const int x = center_x + offset_x;
+                const int y = center_y + offset_y;
+                if (x >= 0 && y >= 0 && x < (int)width && y < (int)height)
+                {
+                    buffer[(size_t)y * width + x] = green;
+                }
+            }
+        }
+    }
 }
 
 static esp_err_t camera_write_all(FILE *file, const void *data, size_t size)
@@ -240,15 +241,28 @@ static esp_err_t camera_save_rgb565_bmp_to_sd(const uint8_t *frame, uint32_t wid
 
 Camera::Camera(uint16_t hor_res, uint16_t ver_res):
     ESP_Brookesia_PhoneApp("Camera", &img_app_camera, false),  // auto_resize_visual_area
-    _screen_index(SCREEN_CAMERA_SHOT),
     _hor_res(hor_res),
     _ver_res(ver_res),
-    _img_album_dsc_size(hor_res > ver_res ? ver_res : hor_res),
     _img_album_buffer(NULL),
     _camera_init_sem(NULL),
-    _camera_ctlr_handle(0)
+    _camera_init_result(ESP_FAIL),
+    _camera_ctlr_handle(-1),
+    _camera_stream_running(false),
+    _img_album(NULL),
+    _mode_switch_label(NULL),
+    _detect_frame_buffer(NULL),
+    _detect_frame_size(0),
+    _detect_frame_free_sem(NULL),
+    _detect_frame_ready_sem(NULL),
+    _detect_results_mutex(NULL),
+    _detect_task_done_sem(NULL),
+    _detect_task_handle(NULL),
+    _detect_results{},
+    _detect_result_count(0),
+    _detect_result_mode(DETECT_MODE_NORMAL),
+    _cam_buffer{},
+    _cam_buffer_size{}
 {
-    _img_album_buf_bytes = _img_album_dsc_size * _img_album_dsc_size * sizeof(lv_color_t);
 }
 
 Camera::~Camera()
@@ -257,39 +271,21 @@ Camera::~Camera()
 
 bool Camera::run(void)
 {
-    if (_camera_init_sem == NULL) {
-        _camera_init_sem = xSemaphoreCreateBinary();
-        assert(_camera_init_sem != NULL);
+    xEventGroupClearBits(camera_event_group,
+                         CAMERA_EVENT_TASK_RUN | CAMERA_EVENT_DELETE |
+                         CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
 
-        xTaskCreatePinnedToCore((TaskFunction_t)taskCameraInit, "Camera Init", 4096, this, 2, NULL, 0);
-        if (xSemaphoreTake(_camera_init_sem, pdMS_TO_TICKS(CAMERA_INIT_TASK_WAIT_MS)) != pdTRUE) {
-            ESP_LOGE(TAG, "Camera init timeout");
-            return false;
-        }
-        free(_camera_init_sem);
-        _camera_init_sem = NULL;
-    }
-
-    ped_detect = get_pedestrian_detect();
-    assert(ped_detect != NULL);
-
-    hum_detect = get_humanface_detect();
-    assert(hum_detect != NULL);
-
-    xTaskCreatePinnedToCore((TaskFunction_t)camera_dectect_task, "Camera Detect", 1024 * 8, this, 5, &_detect_task_handle, 1);
-
-    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_DELETE);
-
-    // UI initialization
+    // Build the LVGL object tree before camera frames are allowed to update it.
     ui_camera_init();
 
-    // The following is the additional UI initialization
-    _img_album_buffer = (uint8_t *)heap_caps_aligned_alloc(128, _img_refresh_dsc.data_size, MALLOC_CAP_SPIRAM);
-    if (_img_album_buffer == NULL) {
+    _img_album_buffer = (uint8_t *)heap_caps_aligned_alloc(
+        128, _img_refresh_dsc.data_size, MALLOC_CAP_SPIRAM);
+    if (_img_album_buffer == NULL)
+    {
         ESP_LOGE(TAG, "Allocate memory for album buffer failed");
         return false;
     }
+
     lv_img_dsc_t img_dsc = {
         .header = {
             .cf = LV_IMG_CF_TRUE_COLOR,
@@ -298,7 +294,7 @@ bool Camera::run(void)
             .w = _hor_res,
             .h = _ver_res,
         },
-        .data_size = _img_album_buf_bytes,
+        .data_size = _img_refresh_dsc.data_size,
         .data = (const uint8_t *)_img_album_buffer,
     };
     memcpy(&_img_album_dsc, &img_dsc, sizeof(lv_img_dsc_t));
@@ -312,9 +308,6 @@ bool Camera::run(void)
     lv_obj_center(_img_album);
     lv_obj_add_event_cb(_img_album, onScreenCameraShotAlbumClick, LV_EVENT_CLICKED, this);
 
-    img_dsc.header.w = _hor_res;
-    img_dsc.header.h = _ver_res;
-    img_dsc.data_size = _img_refresh_dsc.data_size;
     memcpy(&_img_photo_dsc, &img_dsc, sizeof(lv_img_dsc_t));
     memcpy(_img_album_buffer, _img_refresh_dsc.data, _img_refresh_dsc.data_size);
     lv_obj_set_width(ui_ImageCameraPhotoImage, _hor_res);
@@ -322,49 +315,83 @@ bool Camera::run(void)
     lv_img_set_src(ui_ImageCameraPhotoImage, &_img_photo_dsc);
 
     lv_obj_add_event_cb(ui_ButtonCameraShotBtn, onScreenCameraShotBtnClick, LV_EVENT_CLICKED, this);
-
     lv_obj_add_flag(ui_PanelCameraShotTitle, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *mode_switch_btn = lv_btn_create(ui_ImageCameraShotImage);
     lv_obj_set_style_bg_color(mode_switch_btn, lv_color_hex(0x808080), LV_PART_MAIN);
     lv_obj_set_size(mode_switch_btn, 130, 50);
-    btn_label = lv_label_create(mode_switch_btn);
-    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_label_set_text(btn_label, "  Normal \n   Detect");
-    lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_align(mode_switch_btn, LV_ALIGN_TOP_RIGHT, -150, 0);
-    lv_obj_add_event_cb(mode_switch_btn, [](lv_event_t *e) {
-        Camera *camera = (Camera *)e->user_data;
+    lv_obj_add_event_cb(mode_switch_btn, onModeSwitchClick, LV_EVENT_CLICKED, this);
 
-        if (xEventGroupGetBits(camera_event_group) & CAMERA_EVENT_PED_DETECT) {
-            xEventGroupClearBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
-            xEventGroupSetBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
-            lv_label_set_text(btn_label, "    Face \n   Detect");
+    _mode_switch_label = lv_label_create(mode_switch_btn);
+    lv_obj_set_style_text_font(_mode_switch_label, &lv_font_montserrat_16,
+                               LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(_mode_switch_label, lv_color_hex(0xFFFFFF),
+                                LV_PART_MAIN | LV_STATE_DEFAULT);
+    setModeUi(DETECT_MODE_NORMAL);
 
-            lv_obj_add_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(ui_PanelCameraShotControlBg, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(camera->_img_album, LV_OBJ_FLAG_HIDDEN);
-            camera->_screen_index = SCREEN_CAMERA_AI;
-        } else if (xEventGroupGetBits(camera_event_group) & CAMERA_EVENT_HUMAN_DETECT) {
-            xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
-            lv_label_set_text(btn_label, "  Normal \n   Detect");
-
-            lv_obj_clear_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(ui_PanelCameraShotControlBg, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(camera->_img_album, LV_OBJ_FLAG_HIDDEN);
-            camera->_screen_index = SCREEN_CAMERA_SHOT;
-        } else {
-            xEventGroupSetBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
-            lv_label_set_text(btn_label, "Pedestrian \n   Detect");
-
-            lv_obj_add_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(ui_PanelCameraShotControlBg, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(camera->_img_album, LV_OBJ_FLAG_HIDDEN);
-            camera->_screen_index = SCREEN_CAMERA_AI;
+    _active_camera = this;
+    if (_camera_init_sem == NULL)
+    {
+        _camera_init_sem = xSemaphoreCreateBinary();
+        if (_camera_init_sem == NULL)
+        {
+            ESP_LOGE(TAG, "Create camera init semaphore failed");
+            _active_camera = NULL;
+            heap_caps_free(_img_album_buffer);
+            _img_album_buffer = NULL;
+            return false;
         }
 
-    }, LV_EVENT_CLICKED, this);
+        _camera_init_result = ESP_FAIL;
+        BaseType_t created = xTaskCreatePinnedToCore(
+            taskCameraInit, "Camera Init", 4096, this, 2, NULL, 0);
+        if (created != pdPASS)
+        {
+            ESP_LOGE(TAG, "Create camera init task failed");
+            vSemaphoreDelete(_camera_init_sem);
+            _camera_init_sem = NULL;
+            _active_camera = NULL;
+            heap_caps_free(_img_album_buffer);
+            _img_album_buffer = NULL;
+            return false;
+        }
+    }
 
+    if (xSemaphoreTake(_camera_init_sem, pdMS_TO_TICKS(CAMERA_INIT_TASK_WAIT_MS)) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "Camera init timeout");
+        _active_camera = NULL;
+        heap_caps_free(_img_album_buffer);
+        _img_album_buffer = NULL;
+        return false;
+    }
+
+    vSemaphoreDelete(_camera_init_sem);
+    _camera_init_sem = NULL;
+
+    if (_camera_init_result != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Camera stream init failed: %s", esp_err_to_name(_camera_init_result));
+        _active_camera = NULL;
+        heap_caps_free(_img_album_buffer);
+        _img_album_buffer = NULL;
+        return false;
+    }
+
+    _camera_stream_running = true;
+    if (!startDetectTask())
+    {
+        app_video_stream_task_stop(_camera_ctlr_handle);
+        app_video_stream_wait_stop();
+        _camera_stream_running = false;
+        _active_camera = NULL;
+        heap_caps_free(_img_album_buffer);
+        _img_album_buffer = NULL;
+        return false;
+    }
+
+    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
     return true;
 }
 
@@ -391,15 +418,36 @@ bool Camera::back(void)
 
 bool Camera::close(void)
 {
-    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
     xEventGroupSetBits(camera_event_group, CAMERA_EVENT_DELETE);
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
+    xEventGroupSetBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
+    xEventGroupClearBits(camera_event_group,
+                         CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
 
-    app_video_stream_task_stop(_camera_ctlr_handle);
-    app_video_stream_wait_stop();
+    if (_detect_frame_ready_sem != NULL)
+    {
+        xSemaphoreGive(_detect_frame_ready_sem);
+    }
 
-    if (_img_album_buffer) {
+    if (_camera_stream_running)
+    {
+        esp_err_t err = app_video_stream_task_stop(_camera_ctlr_handle);
+        if (err == ESP_OK)
+        {
+            err = app_video_stream_wait_stop();
+        }
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Stop camera stream failed: %s", esp_err_to_name(err));
+        }
+        _camera_stream_running = false;
+    }
+
+    stopDetectTask();
+    _active_camera = NULL;
+
+    if (_img_album_buffer != NULL)
+    {
         heap_caps_free(_img_album_buffer);
         _img_album_buffer = NULL;
     }
@@ -407,40 +455,217 @@ bool Camera::close(void)
     return true;
 }
 
+bool Camera::startDetectTask(void)
+{
+    _detect_frame_free_sem = xSemaphoreCreateBinary();
+    _detect_frame_ready_sem = xSemaphoreCreateBinary();
+    _detect_results_mutex = xSemaphoreCreateMutex();
+    _detect_task_done_sem = xSemaphoreCreateBinary();
+    if (_detect_frame_free_sem == NULL || _detect_frame_ready_sem == NULL ||
+        _detect_results_mutex == NULL || _detect_task_done_sem == NULL)
+    {
+        ESP_LOGE(TAG, "Create camera detection synchronization objects failed");
+        stopDetectTask();
+        return false;
+    }
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        cameraDetectTask, "Camera Detect", CAMERA_DETECT_TASK_STACK_SIZE, this,
+        CAMERA_DETECT_TASK_PRIORITY, &_detect_task_handle, 1);
+    if (created != pdPASS)
+    {
+        ESP_LOGE(TAG, "Create camera detection task failed");
+        _detect_task_handle = NULL;
+        stopDetectTask();
+        return false;
+    }
+
+    return true;
+}
+
+void Camera::stopDetectTask(void)
+{
+    if (_detect_task_handle != NULL)
+    {
+        xEventGroupSetBits(camera_event_group, CAMERA_EVENT_DELETE | CAMERA_EVENT_TASK_RUN);
+        if (_detect_frame_ready_sem != NULL)
+        {
+            xSemaphoreGive(_detect_frame_ready_sem);
+        }
+
+        if (_detect_task_done_sem == NULL ||
+            xSemaphoreTake(_detect_task_done_sem,
+                           pdMS_TO_TICKS(CAMERA_DETECT_TASK_STOP_WAIT_MS)) != pdTRUE)
+        {
+            ESP_LOGE(TAG, "Camera detection task stop timeout");
+            vTaskDelete(_detect_task_handle);
+            delete_pedestrian_detect();
+            delete_humanface_detect();
+        }
+        _detect_task_handle = NULL;
+    }
+
+    if (_detect_frame_buffer != NULL)
+    {
+        heap_caps_free(_detect_frame_buffer);
+        _detect_frame_buffer = NULL;
+        _detect_frame_size = 0;
+    }
+
+    if (_detect_frame_free_sem != NULL)
+    {
+        vSemaphoreDelete(_detect_frame_free_sem);
+        _detect_frame_free_sem = NULL;
+    }
+    if (_detect_frame_ready_sem != NULL)
+    {
+        vSemaphoreDelete(_detect_frame_ready_sem);
+        _detect_frame_ready_sem = NULL;
+    }
+    if (_detect_results_mutex != NULL)
+    {
+        vSemaphoreDelete(_detect_results_mutex);
+        _detect_results_mutex = NULL;
+    }
+    if (_detect_task_done_sem != NULL)
+    {
+        vSemaphoreDelete(_detect_task_done_sem);
+        _detect_task_done_sem = NULL;
+    }
+
+    _detect_result_count = 0;
+    _detect_result_mode = DETECT_MODE_NORMAL;
+}
+
+void Camera::setModeUi(camera_detect_mode_t mode, const char *status_text)
+{
+    if (_mode_switch_label == NULL)
+    {
+        return;
+    }
+
+    if (status_text != NULL)
+    {
+        lv_label_set_text(_mode_switch_label, status_text);
+    }
+    else if (mode == DETECT_MODE_PEDESTRIAN)
+    {
+        lv_label_set_text(_mode_switch_label, "Pedestrian\n   Detect");
+    }
+    else if (mode == DETECT_MODE_FACE)
+    {
+        lv_label_set_text(_mode_switch_label, "    Face\n   Detect");
+    }
+    else
+    {
+        lv_label_set_text(_mode_switch_label, "  Normal\n   Detect");
+    }
+
+    if (mode == DETECT_MODE_NORMAL)
+    {
+        lv_obj_clear_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(ui_PanelCameraShotControlBg, LV_OBJ_FLAG_HIDDEN);
+        if (_img_album != NULL)
+        {
+            lv_obj_clear_flag(_img_album, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    else
+    {
+        lv_obj_add_flag(ui_ButtonCameraShotBtn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ui_PanelCameraShotControlBg, LV_OBJ_FLAG_HIDDEN);
+        if (_img_album != NULL)
+        {
+            lv_obj_add_flag(_img_album, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+void Camera::clearDetectResults(void)
+{
+    if (_detect_results_mutex != NULL &&
+        xSemaphoreTake(_detect_results_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+    {
+        _detect_result_count = 0;
+        _detect_result_mode = DETECT_MODE_NORMAL;
+        xSemaphoreGive(_detect_results_mutex);
+    }
+}
+
 bool Camera::init(void)
 {
     camera_event_group = xEventGroupCreate();
+    if (camera_event_group == NULL)
+    {
+        ESP_LOGE(TAG, "Create camera event group failed");
+        return false;
+    }
+
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_TASK_RUN);
     xEventGroupClearBits(camera_event_group, CAMERA_EVENT_DELETE);
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
-    xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
 
     i2c_master_bus_handle_t i2c_bus_handle = bsp_i2c_get_handle();
     esp_err_t ret = app_video_main(i2c_bus_handle);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK)
+    {
         ESP_LOGE(TAG, "video main init failed with error 0x%x", ret);
+        return false;
     }
 
     // Open the video device
     _camera_ctlr_handle = app_video_open(EXAMPLE_CAM_DEV_PATH, APP_VIDEO_FMT_RGB565);
-    if (_camera_ctlr_handle < 0) {
+    if (_camera_ctlr_handle < 0)
+    {
         ESP_LOGE(TAG, "video cam open failed");
 
-        if (ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, 100) || ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP, 100)) {
+        if (ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, 100) ||
+            ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP, 100))
+        {
             ESP_LOGI(TAG, "gt911 touch found");
-        } else {
+        }
+        else
+        {
             ESP_LOGE(TAG, "Touch not found");
         }
+
+        return false;
     }
 
-    ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size));
-    for (int i = 0; i < EXAMPLE_CAM_BUF_NUM; i++) {
-        _cam_buffer[i] = (uint8_t *)heap_caps_aligned_alloc(data_cache_line_size, _hor_res * _ver_res * BSP_LCD_BITS_PER_PIXEL / 8, MALLOC_CAP_SPIRAM);
-        _cam_buffer_size[i] = _hor_res * _ver_res * BSP_LCD_BITS_PER_PIXEL / 8;
+    ret = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &data_cache_line_size);
+    if (ret != ESP_OK || data_cache_line_size == 0)
+    {
+        ESP_LOGE(TAG, "Get camera buffer alignment failed: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    const size_t camera_buffer_size =
+        (size_t)_hor_res * _ver_res * BSP_LCD_BITS_PER_PIXEL / 8;
+    for (int i = 0; i < EXAMPLE_CAM_BUF_NUM; i++)
+    {
+        _cam_buffer[i] = (uint8_t *)heap_caps_aligned_alloc(
+            data_cache_line_size, camera_buffer_size, MALLOC_CAP_SPIRAM);
+        if (_cam_buffer[i] == NULL)
+        {
+            ESP_LOGE(TAG, "Allocate camera buffer %d failed", i);
+            for (int allocated = 0; allocated < i; ++allocated)
+            {
+                heap_caps_free(_cam_buffer[allocated]);
+                _cam_buffer[allocated] = NULL;
+                _cam_buffer_size[allocated] = 0;
+            }
+            return false;
+        }
+
+        _cam_buffer_size[i] = camera_buffer_size;
     }
 
     // Register the video frame operation callback
-    ESP_ERROR_CHECK(app_video_register_frame_operation_cb(camera_video_frame_operation));
+    ret = app_video_register_frame_operation_cb(cameraVideoFrameOperation);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Register camera frame callback failed: %s", esp_err_to_name(ret));
+        return false;
+    }
 
     lv_img_dsc_t img_dsc = {
         .header = {
@@ -456,45 +681,19 @@ bool Camera::init(void)
 
     memcpy(&_img_refresh_dsc, &img_dsc, sizeof(lv_img_dsc_t));
 
-    size_t detect_buf_size = ALIGN_UP_BY(_hor_res * _ver_res * BSP_LCD_BITS_PER_PIXEL / 8, data_cache_line_size);
-
-    ppa_client_config_t srm_config =  {
-        .oper_type = PPA_OPERATION_SRM,
-    };
-    ESP_ERROR_CHECK(ppa_register_client(&srm_config, &ppa_client_srm_handle));
-
-    ppa_event_callbacks_t cbs = {
-        .on_trans_done = ppa_trans_done_cb,
-    };
-    ppa_client_register_event_callbacks(ppa_client_srm_handle, &cbs);
-
-    camera_pipeline_cfg_t PPA_feed_cfg = {
-        .elem_num = 4,
-        .elements = NULL,
-        .align_size = 1,
-        .caps = MALLOC_CAP_SPIRAM,
-        .buffer_size = detect_buf_size,
-    };
-
-    camera_element_pipeline_new(&PPA_feed_cfg, &feed_pipeline);
-
-    camera_pipeline_cfg_t detect_feed_cfg = {
-        .elem_num = 4,
-        .elements = NULL,
-        .align_size = 1,
-        .caps = MALLOC_CAP_SPIRAM,
-        .buffer_size = 20 * sizeof(int),
-    };
-    camera_element_pipeline_new(&detect_feed_cfg, &detect_pipeline);
-
     return true;
 }
 
-void Camera::taskCameraInit(Camera *app)
+void Camera::taskCameraInit(void *arg)
 {
-    ESP_ERROR_CHECK(app_video_set_bufs(app->_camera_ctlr_handle, EXAMPLE_CAM_BUF_NUM, (const void **)app->_cam_buffer));
+    Camera *app = static_cast<Camera *>(arg);
+    app->_camera_init_result = app_video_set_bufs(
+        app->_camera_ctlr_handle, EXAMPLE_CAM_BUF_NUM, (const void **)app->_cam_buffer);
 
-    ESP_ERROR_CHECK(app_video_stream_task_start(app->_camera_ctlr_handle, 0));
+    if (app->_camera_init_result == ESP_OK)
+    {
+        app->_camera_init_result = app_video_stream_task_start(app->_camera_ctlr_handle, 0);
+    }
 
     xSemaphoreGive(app->_camera_init_sem);
 
@@ -542,154 +741,278 @@ void Camera::onScreenCameraShotBtnClick(lv_event_t *e)
     }
 }
 
-static bool ppa_trans_done_cb(ppa_client_handle_t ppa_client, ppa_event_data_t *event_data, void *user_data)
+void Camera::onModeSwitchClick(lv_event_t *e)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    Camera *camera = static_cast<Camera *>(lv_event_get_user_data(e));
+    if (camera == NULL)
+    {
+        return;
+    }
 
-    camera_pipeline_buffer_element *p = (camera_pipeline_buffer_element *)user_data;
-    camera_pipeline_done_element(feed_pipeline, p);
+    EventBits_t bits = xEventGroupGetBits(camera_event_group);
+    xEventGroupClearBits(camera_event_group,
+                         CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
 
-    return (xHigherPriorityTaskWoken == pdTRUE);
-}
-
-#if FPS_PRINT
-typedef struct {
-    int64_t start;
-    int64_t acc;
-    char str1[15];
-    char str2[15];
-} PerfCounter;
-static PerfCounter perf_counters[1] = {0};
-
-static void perfmon_start(int ctr, const char *fmt1, const char *fmt2, ...)
-{
-    va_list args;
-    va_start(args, fmt2);
-    vsnprintf(perf_counters[ctr].str1, sizeof(perf_counters[ctr].str1), fmt1, args);
-    vsnprintf(perf_counters[ctr].str2, sizeof(perf_counters[ctr].str2), fmt2, args);
-    va_end(args);
-
-    perf_counters[ctr].start = esp_timer_get_time();
-}
-
-static void perfmon_end(int ctr, int count)
-{
-    int64_t time_diff = esp_timer_get_time() - perf_counters[ctr].start;
-    float time_in_sec = (float)time_diff / 1000000;
-    float frequency = count / time_in_sec;
-
-    printf("Perf ctr[%d], [%15s][%15s]: %.2f FPS (%.2f ms per operation)\n",
-           ctr, perf_counters[ctr].str1, perf_counters[ctr].str2, frequency, time_in_sec * 1000 / count);
-}
-#endif
-
-void Camera::camera_dectect_task(Camera *app)
-{
-    int res = 0;
-    while (1) {
-        xEventGroupWaitBits(camera_event_group, CAMERA_EVENT_TASK_RUN, pdFALSE, pdTRUE, portMAX_DELAY);
-
-        if (xEventGroupGetBits(camera_event_group) & (CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT)) {
-            camera_pipeline_buffer_element *p = camera_pipeline_recv_element(feed_pipeline, portMAX_DELAY);
-            if (p) {
-                if (xEventGroupGetBits(camera_event_group) & CAMERA_EVENT_PED_DETECT) {
-                    detect_results = app_pedestrian_detect((uint16_t *)p->buffer, app->_hor_res, app->_ver_res);
-                }  else {
-                    detect_results = app_humanface_detect((uint16_t *)p->buffer, app->_hor_res, app->_ver_res);
-                }
-
-                camera_pipeline_queue_element_index(feed_pipeline, p->index);
-
-                camera_pipeline_buffer_element *element = camera_pipeline_get_queued_element(detect_pipeline);
-                if (element) {
-                    element->detect_results = &detect_results;
-
-                    camera_pipeline_done_element(detect_pipeline, element);
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(5));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-
-        if (xEventGroupGetBits(camera_event_group) & CAMERA_EVENT_DELETE) {
-            delete_pedestrian_detect();
-            delete_humanface_detect();
-
-            ESP_LOGI(TAG, "Camera detect task exit");
-            vTaskDelete(NULL);
-        }
+    if (bits & CAMERA_EVENT_PED_DETECT)
+    {
+        xEventGroupSetBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
+        camera->setModeUi(DETECT_MODE_FACE);
+    }
+    else if (bits & CAMERA_EVENT_HUMAN_DETECT)
+    {
+        camera->clearDetectResults();
+        camera->setModeUi(DETECT_MODE_NORMAL);
+    }
+    else
+    {
+        xEventGroupSetBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
+        camera->setModeUi(DETECT_MODE_PEDESTRIAN);
     }
 }
 
-static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf_index,
+void Camera::cameraDetectTask(void *arg)
+{
+    Camera *app = static_cast<Camera *>(arg);
+    camera_detect_mode_t loaded_mode = DETECT_MODE_NORMAL;
+
+    while (true)
+    {
+        EventBits_t bits = xEventGroupGetBits(camera_event_group);
+        if (bits & CAMERA_EVENT_DELETE)
+        {
+            break;
+        }
+
+        camera_detect_mode_t requested_mode = DETECT_MODE_NORMAL;
+        if (bits & CAMERA_EVENT_PED_DETECT)
+        {
+            requested_mode = DETECT_MODE_PEDESTRIAN;
+        }
+        else if (bits & CAMERA_EVENT_HUMAN_DETECT)
+        {
+            requested_mode = DETECT_MODE_FACE;
+        }
+
+        if (!(bits & CAMERA_EVENT_TASK_RUN) || requested_mode == DETECT_MODE_NORMAL)
+        {
+            if (loaded_mode != DETECT_MODE_NORMAL)
+            {
+                delete_pedestrian_detect();
+                delete_humanface_detect();
+                loaded_mode = DETECT_MODE_NORMAL;
+                app->clearDetectResults();
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (app->_detect_frame_buffer == NULL)
+        {
+            app->_detect_frame_size = app->_img_refresh_dsc.data_size;
+            app->_detect_frame_buffer = (uint8_t *)heap_caps_aligned_alloc(
+                data_cache_line_size, app->_detect_frame_size, MALLOC_CAP_SPIRAM);
+            if (app->_detect_frame_buffer == NULL)
+            {
+                ESP_LOGE(TAG, "Allocate on-demand detection frame failed");
+                xEventGroupClearBits(camera_event_group,
+                                     CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
+                if (esp_lv_adapter_lock(100) == ESP_OK)
+                {
+                    app->setModeUi(DETECT_MODE_NORMAL, "AI unavailable");
+                    esp_lv_adapter_unlock();
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            xSemaphoreGive(app->_detect_frame_free_sem);
+        }
+
+        if (loaded_mode != requested_mode)
+        {
+            delete_pedestrian_detect();
+            delete_humanface_detect();
+            app->clearDetectResults();
+
+            bool loaded = false;
+            if (requested_mode == DETECT_MODE_PEDESTRIAN)
+            {
+                loaded = get_pedestrian_detect() != NULL;
+            }
+            else
+            {
+                loaded = get_humanface_detect() != NULL;
+            }
+
+            if (!loaded)
+            {
+                ESP_LOGE(TAG, "Load camera detection model failed");
+                xEventGroupClearBits(camera_event_group,
+                                     CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
+                if (esp_lv_adapter_lock(100) == ESP_OK)
+                {
+                    app->setModeUi(DETECT_MODE_NORMAL, "AI unavailable");
+                    esp_lv_adapter_unlock();
+                }
+                loaded_mode = DETECT_MODE_NORMAL;
+                continue;
+            }
+
+            loaded_mode = requested_mode;
+            ESP_LOGI(TAG, "%s detection model loaded on demand",
+                     loaded_mode == DETECT_MODE_FACE ? "Face" : "Pedestrian");
+        }
+
+        if (xSemaphoreTake(app->_detect_frame_ready_sem, pdMS_TO_TICKS(100)) != pdTRUE)
+        {
+            continue;
+        }
+
+        bits = xEventGroupGetBits(camera_event_group);
+        camera_detect_mode_t frame_mode = DETECT_MODE_NORMAL;
+        if (bits & CAMERA_EVENT_PED_DETECT)
+        {
+            frame_mode = DETECT_MODE_PEDESTRIAN;
+        }
+        else if (bits & CAMERA_EVENT_HUMAN_DETECT)
+        {
+            frame_mode = DETECT_MODE_FACE;
+        }
+
+        if ((bits & CAMERA_EVENT_DELETE) || frame_mode != loaded_mode)
+        {
+            xSemaphoreGive(app->_detect_frame_free_sem);
+            continue;
+        }
+
+        std::list<dl::detect::result_t> results;
+        if (loaded_mode == DETECT_MODE_PEDESTRIAN)
+        {
+            results = app_pedestrian_detect((uint16_t *)app->_detect_frame_buffer,
+                                            app->_hor_res, app->_ver_res);
+        }
+        else
+        {
+            results = app_humanface_detect((uint16_t *)app->_detect_frame_buffer,
+                                           app->_hor_res, app->_ver_res);
+        }
+
+        if (xSemaphoreTake(app->_detect_results_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            app->_detect_result_count = 0;
+            app->_detect_result_mode = loaded_mode;
+            for (const auto &result : results)
+            {
+                if (app->_detect_result_count >= CAMERA_DETECT_RESULT_MAX ||
+                    result.box.size() < 4)
+                {
+                    break;
+                }
+
+                camera_detect_result_t &output =
+                    app->_detect_results[app->_detect_result_count];
+                bool valid_box = false;
+                for (int index = 0; index < 4; ++index)
+                {
+                    output.box[index] = result.box[index];
+                    valid_box = valid_box || result.box[index] != 0;
+                }
+                if (!valid_box)
+                {
+                    continue;
+                }
+
+                output.has_keypoints = loaded_mode == DETECT_MODE_FACE &&
+                                       result.keypoint.size() >= 10;
+                bool valid_keypoints = false;
+                if (output.has_keypoints)
+                {
+                    for (int index = 0; index < 10; ++index)
+                    {
+                        output.keypoints[index] = result.keypoint[index];
+                        valid_keypoints = valid_keypoints || result.keypoint[index] != 0;
+                    }
+                    output.has_keypoints = valid_keypoints;
+                }
+
+                ++app->_detect_result_count;
+            }
+            xSemaphoreGive(app->_detect_results_mutex);
+        }
+
+        xSemaphoreGive(app->_detect_frame_free_sem);
+    }
+
+    delete_pedestrian_detect();
+    delete_humanface_detect();
+    app->clearDetectResults();
+    ESP_LOGI(TAG, "Camera detection task exit");
+    xSemaphoreGive(app->_detect_task_done_sem);
+    vTaskDelete(NULL);
+}
+
+void Camera::cameraVideoFrameOperation(uint8_t *camera_buf, uint8_t camera_buf_index,
                                        uint32_t camera_buf_hes, uint32_t camera_buf_ves,
                                        size_t camera_buf_len)
 {
-    // Wait for task run event
-    xEventGroupWaitBits(camera_event_group, CAMERA_EVENT_TASK_RUN, pdFALSE, pdTRUE, portMAX_DELAY);
+    (void)camera_buf_index;
 
-    // Check if AI detection is needed
+    Camera *app = _active_camera;
+    if (app == NULL || camera_event_group == NULL)
+    {
+        return;
+    }
+
+    xEventGroupWaitBits(camera_event_group, CAMERA_EVENT_TASK_RUN,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+
     EventBits_t current_bits = xEventGroupGetBits(camera_event_group);
-    bool is_detect_mode = current_bits & (CAMERA_EVENT_PED_DETECT | CAMERA_EVENT_HUMAN_DETECT);
+    camera_detect_mode_t current_mode = DETECT_MODE_NORMAL;
+    if (current_bits & CAMERA_EVENT_PED_DETECT)
+    {
+        current_mode = DETECT_MODE_PEDESTRIAN;
+    }
+    else if (current_bits & CAMERA_EVENT_HUMAN_DETECT)
+    {
+        current_mode = DETECT_MODE_FACE;
+    }
 
-    if (is_detect_mode) {
-        // Process input frame
-        camera_pipeline_buffer_element *input_element = camera_pipeline_get_queued_element(feed_pipeline);
-        if (input_element) {
-            input_element->buffer = reinterpret_cast<uint16_t*>(camera_buf);
-            camera_pipeline_done_element(feed_pipeline, input_element);
-        }
+    if (current_mode != DETECT_MODE_NORMAL &&
+        app->_detect_frame_buffer != NULL &&
+        camera_buf_len >= app->_detect_frame_size &&
+        xSemaphoreTake(app->_detect_frame_free_sem, 0) == pdTRUE)
+    {
+        memcpy(app->_detect_frame_buffer, camera_buf, app->_detect_frame_size);
+        xSemaphoreGive(app->_detect_frame_ready_sem);
+    }
 
-        // Get detection results
-        camera_pipeline_buffer_element *detect_element = camera_pipeline_recv_element(detect_pipeline, 0);
-        if (detect_element) {
-            // Process detection results
-            detect_keypoints.clear();
-            detect_bound.clear();
-
-            for (const auto& res : *(detect_element->detect_results)) {
-                const auto& box = res.box;
-                // Check if bounding box is valid
-                if (box.size() >= 4 && std::any_of(box.begin(), box.end(), [](int v) { return v != 0; })) {
-                    detect_bound.push_back(box);
-
-                    // Process keypoints only in face detection mode
-                    if ((current_bits & CAMERA_EVENT_HUMAN_DETECT) &&
-                        res.keypoint.size() >= 10 &&
-                        std::any_of(res.keypoint.begin(), res.keypoint.end(), [](int v) { return v != 0; })) {
-                        detect_keypoints.push_back(res.keypoint);
-                    }
-                }
-            }
-
-            camera_pipeline_queue_element_index(detect_pipeline, detect_element->index);
-        }
-
-        // Draw detection results
-        uint16_t *rgb_buf = reinterpret_cast<uint16_t*>(camera_buf);
-        for (size_t i = 0; i < detect_bound.size(); i++) {
-            const auto& bound = detect_bound[i];
-            // Check if current bounding box is valid
-            if (bound.size() >= 4 && std::any_of(bound.begin(), bound.end(), [](int v) { return v != 0; })) {
-                // Draw bounding box
-                draw_rectangle_rgb(rgb_buf, camera_buf_hes, camera_buf_ves,
-                                 bound[0], bound[1], bound[2], bound[3],
-                                 0, 0, 255, 0, 0, 3);
-
-                // Draw keypoints in face detection mode
-                if ((current_bits & CAMERA_EVENT_HUMAN_DETECT) &&
-                    i < detect_keypoints.size() &&
-                    detect_keypoints[i].size() >= 10) {
-                    draw_green_points(rgb_buf, detect_keypoints[i]);
+    if (current_mode != DETECT_MODE_NORMAL &&
+        xSemaphoreTake(app->_detect_results_mutex, 0) == pdTRUE)
+    {
+        if (app->_detect_result_mode == current_mode)
+        {
+            uint16_t *rgb_buffer = reinterpret_cast<uint16_t *>(camera_buf);
+            for (size_t index = 0; index < app->_detect_result_count; ++index)
+            {
+                const camera_detect_result_t &result = app->_detect_results[index];
+                draw_rectangle_rgb(rgb_buffer, camera_buf_hes, camera_buf_ves,
+                                   result.box[0], result.box[1],
+                                   result.box[2], result.box[3],
+                                   0, 0, 255, 0, 0, 3);
+                if (current_mode == DETECT_MODE_FACE && result.has_keypoints)
+                {
+                    camera_draw_green_points(rgb_buffer, camera_buf_hes,
+                                             camera_buf_ves, result.keypoints);
                 }
             }
         }
+        xSemaphoreGive(app->_detect_results_mutex);
     }
 
     // Update display if not in delete state
-    if (!(current_bits & CAMERA_EVENT_DELETE) && (esp_lv_adapter_lock(100) == ESP_OK)) {
-        if (ui_ImageCameraShotImage) {
+    if (!(current_bits & CAMERA_EVENT_DELETE) && (esp_lv_adapter_lock(100) == ESP_OK))
+    {
+        if (ui_ImageCameraShotImage)
+        {
             lv_canvas_set_buffer(ui_ImageCameraShotImage, camera_buf,
                                camera_buf_hes, camera_buf_ves,
                                LV_IMG_CF_TRUE_COLOR);
@@ -697,14 +1020,4 @@ static void camera_video_frame_operation(uint8_t *camera_buf, uint8_t camera_buf
         lv_refr_now(NULL);
         esp_lv_adapter_unlock();
     }
-
-#if FPS_PRINT
-    static int count = 0;
-    if (count % 10 == 0) {
-        perfmon_start(0, "PFS", "camera");
-    } else if (count % 10 == 9) {
-        perfmon_end(0, 10);
-    }
-    count++;
-#endif
 }

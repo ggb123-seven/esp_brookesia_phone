@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "iostream"
+#include <new>
 #include "pedestrian_detect.hpp"
 #include "dl_tool.hpp"
 #include "dl_image_define.hpp"
@@ -18,6 +19,11 @@ static PedestrianDetect *detect = NULL;
 
 std::list<dl::detect::result_t> app_pedestrian_detect(uint16_t *frame, int width, int height)
 {
+    if (detect == NULL || frame == NULL)
+    {
+        return {};
+    }
+
     dl::image::img_t img;
     img.data = frame;
     img.width = width;
@@ -99,8 +105,13 @@ void draw_green_points(uint16_t *buffer, const std::vector<int> &landmarks)
 
 PedestrianDetect *get_pedestrian_detect()
 {
-    if (detect == NULL) {
-        detect = new PedestrianDetect();
+    if (detect == NULL)
+    {
+        detect = new (std::nothrow) PedestrianDetect();
+        if (detect == NULL)
+        {
+            ESP_LOGE("pedestrian_detect", "Failed to allocate detector");
+        }
     }
 
     return detect;
@@ -108,7 +119,8 @@ PedestrianDetect *get_pedestrian_detect()
 
 void delete_pedestrian_detect()
 {
-    if (detect) {
+    if (detect)
+    {
         delete detect;
         detect = NULL;
     }

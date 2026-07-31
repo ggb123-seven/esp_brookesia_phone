@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "iostream"
+#include <new>
 #include "human_face_detect.hpp"
 #include "dl_tool.hpp"
 #include "app_humanface_detect.h"
@@ -14,6 +15,11 @@ static HumanFaceDetect *detect = NULL;
 
 std::list<dl::detect::result_t> app_humanface_detect(uint16_t *frame, int width, int height)
 {
+    if (detect == NULL || frame == NULL)
+    {
+        return {};
+    }
+
     dl::image::img_t img;
     img.data = frame;
     img.width = width;
@@ -27,8 +33,13 @@ std::list<dl::detect::result_t> app_humanface_detect(uint16_t *frame, int width,
 
 HumanFaceDetect *get_humanface_detect()
 {
-    if (detect == NULL) {
-        detect = new HumanFaceDetect();
+    if (detect == NULL)
+    {
+        detect = new (std::nothrow) HumanFaceDetect();
+        if (detect == NULL)
+        {
+            ESP_LOGE("human_face_detect", "Failed to allocate detector");
+        }
     }
 
     return detect;
@@ -36,7 +47,8 @@ HumanFaceDetect *get_humanface_detect()
 
 void delete_humanface_detect()
 {
-    if (detect) {
+    if (detect)
+    {
         delete detect;
         detect = NULL;
     }
